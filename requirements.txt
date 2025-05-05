@@ -1,4 +1,6 @@
 discord.py
-flask
+aiohttp
+requests
 PyGithub
-dotenv
+python-dotenv
+Flask
