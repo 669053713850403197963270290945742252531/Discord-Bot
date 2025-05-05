@@ -11,6 +11,8 @@ import re
 from datetime import datetime
 from functools import wraps
 from discord.ui import View, Button
+from flask import Flask
+from threading import Thread
 from keep_alive import keep_alive
 
 app = Flask('')
@@ -25,7 +27,7 @@ def run():
 def keep_alive():
     t = Thread(target=run)
     t.start()
-    
+
 load_dotenv()
 
 
