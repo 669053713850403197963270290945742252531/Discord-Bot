@@ -11,7 +11,21 @@ import re
 from datetime import datetime
 from functools import wraps
 from discord.ui import View, Button
+from keep_alive import keep_alive
 
+app = Flask('')
+
+@app.route('/')
+def home():
+    return "Bot is alive!"
+
+def run():
+    app.run(host='0.0.0.0', port=8080)
+
+def keep_alive():
+    t = Thread(target=run)
+    t.start()
+    
 load_dotenv()
 
 
@@ -804,4 +818,5 @@ async def createpanel(interaction: discord.Interaction):
 token = os.getenv("DISCORD_TOKEN")
 if not token:
     raise ValueError("DISCORD_TOKEN is not set in environment or .env file.")
+keep_alive()
 client.run(token)
