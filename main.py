@@ -11,22 +11,6 @@ import re
 from datetime import datetime
 from functools import wraps
 from discord.ui import View, Button
-from flask import Flask
-from threading import Thread
-from keep_alive import keep_alive
-
-app = Flask('')
-
-@app.route('/')
-def home():
-    return "Bot is alive!"
-
-def run():
-    app.run(host='0.0.0.0', port=8080)
-
-def keep_alive():
-    t = Thread(target=run)
-    t.start()
 
 load_dotenv()
 
@@ -732,6 +716,51 @@ class HWIDModal(discord.ui.Modal, title="Register HWID"):
         )
 
 
+class RegisterButton(discord.ui.Button):
+    def __init__(self):
+        super().__init__(label="Register", style=discord.ButtonStyle.success)
+
+    async def callback(self, interaction: discord.Interaction):
+        await interaction.response.send_modal(HWIDModal())
+
+
+class GetScriptButton(discord.ui.Button):
+    def __init__(self):
+        super().__init__(label="Get Script", style=discord.ButtonStyle.primary)
+
+    async def callback(self, interaction: discord.Interaction):
+        user_id = str(interaction.user.id)
+        data = await fetch_user_data()
+
+        if not data:
+            await interaction.response.send_message(
+                "⚠️ Failed to fetch your key.", ephemeral=True
+            )
+            return
+
+        user_info = next((u for u in data if u["DiscordId"] == user_id), None)
+        if not user_info:
+            await interaction.response.send_message(
+                "❌ You're not whitelisted.", ephemeral=True
+            )
+            return
+        if user_info.get("Banned", False):
+            await interaction.response.send_message("🚫 You're banned.", ephemeral=True)
+            return
+
+        key = user_info.get("Key")
+        if not key:
+            await interaction.response.send_message(
+                "❌ No key associated with your account.", ephemeral=True
+            )
+            return
+
+        script = f'getgenv().script_key = "{key}";\nloadstring(readfile("..."))()'
+        await interaction.response.send_message(
+            f"Here is your script:\n```lua\n{script}\n```", ephemeral=True
+        )
+
+
 class CreatePanelModal(discord.ui.Modal, title="Create Embed Panel"):
     embed_title = discord.ui.TextInput(label="Embed Title", required=True)
     embed_description = discord.ui.TextInput(
@@ -746,62 +775,9 @@ class CreatePanelModal(discord.ui.Modal, title="Create Embed Panel"):
         )
 
         view = discord.ui.View(timeout=None)
-
-        class RegisterButton(discord.ui.Button):
-            def __init__(self):
-                super().__init__(label="Register", style=discord.ButtonStyle.success)
-
-            async def callback(self, interaction: discord.Interaction):
-                await interaction.response.send_modal(HWIDModal())
-
-        class GetScriptButton(discord.ui.Button):
-            def __init__(self):
-                super().__init__(label="Get Script", style=discord.ButtonStyle.primary)
-
-            async def callback(self, interaction: discord.Interaction):
-                user_id = str(interaction.user.id)
-                data = await fetch_user_data()
-
-                if not data:
-                    await interaction.response.send_message(
-                        "⚠️ Failed to fetch your key.", ephemeral=True
-                    )
-                    return
-
-                user_info = next((u for u in data if u["DiscordId"] == user_id), None)
-
-                if not user_info:
-                    await interaction.response.send_message(
-                        "❌ You're not whitelisted.", ephemeral=True
-                    )
-                    return
-
-                if user_info.get("Banned", False):
-                    await interaction.response.send_message(
-                        "🚫 You're banned.", ephemeral=True
-                    )
-                    return
-
-                key = user_info.get("Key")
-                if not key:
-                    await interaction.response.send_message(
-                        "❌ No key associated with your account.", ephemeral=True
-                    )
-                    return
-
-                script = (
-                    f'getgenv().script_key = "{key}";\n'
-                    'loadstring(readfile("Celestial/Supported Games/Linoria Rewrite/2025 Rewrite/Break In 2 - Game new.lua"))() -- test script for experimental reasons'
-                )
-
-                await interaction.response.send_message(
-                    f"Here is your script:\n```lua\n{script}\n```", ephemeral=True
-                )
-
         view.add_item(RegisterButton())
         view.add_item(GetScriptButton())
 
-        # Send to specific channel
         target_channel = interaction.client.get_channel(1368816321139183647)
         if not target_channel:
             await interaction.response.send_message(
@@ -828,5 +804,4 @@ async def createpanel(interaction: discord.Interaction):
 token = os.getenv("DISCORD_TOKEN")
 if not token:
     raise ValueError("DISCORD_TOKEN is not set in environment or .env file.")
-keep_alive()
 client.run(token)
