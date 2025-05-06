@@ -1662,4 +1662,6 @@ async def edituser(
 token = os.getenv("DISCORD_TOKEN")
 if not token:
     raise ValueError("DISCORD_TOKEN is not set in environment or .env file.")
+
+keep_alive()
 client.run(token)
