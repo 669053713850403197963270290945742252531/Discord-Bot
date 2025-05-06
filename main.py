@@ -38,8 +38,7 @@ def home():
 
 
 def run():
-    port = int(os.environ.get("PORT", 5000))  # Render sets PORT env var
-    app.run(host="0.0.0.0", port=port)
+    app.run(host="0.0.0.0", port=8080)
 
 
 def keep_alive():
@@ -1662,6 +1661,5 @@ async def edituser(
 token = os.getenv("DISCORD_TOKEN")
 if not token:
     raise ValueError("DISCORD_TOKEN is not set in environment or .env file.")
-
 keep_alive()
 client.run(token)
