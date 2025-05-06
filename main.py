@@ -170,69 +170,52 @@ def hash_hwid(hwid):
 
 
 @client.tree.command(
-    name="myinfo", 
+    name="myinfo",
     description="Fetches the non-sensitive information about yourself.",
     guild=GUILD_ID,
 )
 async def myinfo(interaction: discord.Interaction):
-    user_id = str(interaction.user.id)  # User's Discord ID as a string
+    user_id = str(interaction.user.id)
     data = await fetch_user_data()
 
-    try:
-        # Ensure that interaction response is not already done
-        if interaction.response.is_done():
-            await interaction.followup.send(
-                "You have already responded to this interaction.", ephemeral=True
-            )
-            return
+    if data is None:
+        await interaction.response.send_message(
+            "Failed to fetch user data. Please try again later.", ephemeral=True
+        )
+        return
 
-        if not interaction.response.is_done():
-            embed = discord.Embed(title="User Info", description="Info about the user.")
-            await interaction.response.send_message(embed=embed, ephemeral=True)
+    user_info = next((user for user in data if user["DiscordId"] == user_id), None)
+    print(f"Fetched user info: {user_info}")
 
-        if data is None:
-            await interaction.response.send_message(
-                "Failed to fetch user data. Please try again later.", ephemeral=True
-            )
-            return
+    if not user_info:
+        await interaction.response.send_message(
+            "No information found for your user ID.", ephemeral=True
+        )
+        return
 
-        user_info = next((user for user in data if user["DiscordId"] == user_id), None)
-        print(f"Fetched user info: {user_info}")
+    if not user_info.get("HWID"):
+        await interaction.response.send_message(
+            "You are not authorized to use this command.", ephemeral=True
+        )
+        return
 
-        if user_info:
-            # Check if the user is banned or HWID is not set
-            print(f"User Roles: {[role.id for role in interaction.user.roles]}")
-            hashed_hwid = user_info.get("HashedHWID", "N/A")  # Fetch the HashedHWID safely
-            print(f"Hashed HWID: {user_info.get('HWID', 'N/A')}")
+    # Build the embed
+    embed = discord.Embed(
+        title="Your whitelist information",
+        color=discord.Color.blue()
+    )
+    embed.add_field(
+        name="Identifier", value=user_info.get("Identifier", "N/A"), inline=True
+    )
+    embed.add_field(name="Rank", value=user_info.get("Rank", "N/A"), inline=True)
+    embed.add_field(
+        name="JoinDate", value=user_info.get("JoinDate", "N/A"), inline=True
+    )
+    embed.add_field(
+        name="DiscordId", value=user_info.get("DiscordId", "N/A"), inline=True
+    )
 
-            if not user_info.get("HWID"):
-                await interaction.response.send_message(
-                    "You are not authorized to use this command.", ephemeral=True
-                )
-                return
-
-            # Construct embed with non-sensitive data
-            embed = discord.Embed(
-                title="Your whitelist information", color=discord.Color.blue()
-            )
-            embed.add_field(
-                name="Identifier", value=user_info.get("Identifier", "N/A"), inline=True
-            )
-            embed.add_field(name="Rank", value=user_info.get("Rank", "N/A"), inline=True)
-            embed.add_field(
-                name="JoinDate", value=user_info.get("JoinDate", "N/A"), inline=True
-            )
-            embed.add_field(
-                name="DiscordId", value=user_info.get("DiscordId", "N/A"), inline=True
-            )
-
-            await interaction.response.send_message(embed=embed, ephemeral=True)
-        else:
-            await interaction.response.send_message(
-                "No information found for your user ID.", ephemeral=True
-            )
-    except discord.errors.HTTPException as e:
-        await interaction.response.send_message(f"❌ Error: {e}", ephemeral=True)
+    await interaction.response.send_message(embed=embed, ephemeral=True)
 
 
 # Command: fetchinfo
