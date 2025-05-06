@@ -1,6 +1,14 @@
 import discord
 from discord.ext import commands
-from discord import app_commands, ui, Interaction, TextStyle, Embed, ButtonStyle
+from discord import (
+    app_commands,
+    ui,
+    Interaction,
+    TextStyle,
+    Embed,
+    ButtonStyle,
+    Attachment,
+)
 import aiohttp
 import json
 import hashlib
@@ -8,27 +16,44 @@ from github import Github  # Requires `PyGithub` library
 import os
 from dotenv import load_dotenv
 import re
-from datetime import datetime
+from datetime import datetime, timezone, timedelta
+from zoneinfo import ZoneInfo
 from functools import wraps
 from discord.ui import View, Button
+import asyncio
+import io
+import random
+import string
+import base64
 from flask import Flask
 from threading import Thread
 from keep_alive import keep_alive
 
-app = Flask('')
+app = Flask("")
 
-@app.route('/')
+
+@app.route("/")
 def home():
     return "Bot is alive!"
 
+
 def run():
-    app.run(host='0.0.0.0', port=8080)
+    app.run(host="0.0.0.0", port=8080)
+
 
 def keep_alive():
     t = Thread(target=run)
     t.start()
 
-load_dotenv()
+load_dotenv()  # Load environment variables into bot environment
+stored_script_timestamp = datetime.now(ZoneInfo("America/New_York"))
+formatted_time = stored_script_timestamp.strftime("%Y-%m-%d %I:%M:%S %p %Z")
+
+
+print(
+    "System time:",
+    datetime.now(ZoneInfo("America/New_York")).strftime("%I:%M:%S %p %Z"),
+)
 
 
 class Client(commands.Bot):
@@ -64,6 +89,10 @@ client = Client(command_prefix="!", intents=intents)
 
 GUILD_ID = discord.Object(id=1263334150018961559)
 RESTRICTED_ROLE_ID = 1368809009456615434
+
+stored_script_content = None
+stored_script_filename = None
+stored_script_timestamp = None
 
 
 # Fetch user info from the provided GitHub JSON
@@ -121,20 +150,24 @@ def validate_whitelist_entry(entry):
             raise ValueError(f"Missing required key: {key}")
 
 
-# Hash the HWID using SHA-384
+# Hash hwid
+
+
 def hash_hwid(hwid):
     hwid = hwid.strip().lower()
     sha384_pattern = re.compile(r"^[0-9a-f]{96}$")
 
     if not sha384_pattern.match(hwid):
         raise ValueError(
-            "HWID must be a valid SHA-384 hex string (96 lowercase hex characters)"
+            "HWID must be a valid SHA-384 string (96 alphanumeric characters)"
         )
 
     return hwid
 
 
 # Command: myinfo
+
+
 @client.tree.command(
     name="myinfo",
     description="Fetches the non-sensitive information about yourself.",
@@ -170,14 +203,14 @@ async def myinfo(interaction: discord.Interaction):
             title="Your whitelist information", color=discord.Color.blue()
         )
         embed.add_field(
-            name="Identifier", value=user_info.get("Identifier", "N/A"), inline=False
+            name="Identifier", value=user_info.get("Identifier", "N/A"), inline=True
         )
-        embed.add_field(name="Rank", value=user_info.get("Rank", "N/A"), inline=False)
+        embed.add_field(name="Rank", value=user_info.get("Rank", "N/A"), inline=True)
         embed.add_field(
-            name="JoinDate", value=user_info.get("JoinDate", "N/A"), inline=False
+            name="JoinDate", value=user_info.get("JoinDate", "N/A"), inline=True
         )
         embed.add_field(
-            name="DiscordId", value=user_info.get("DiscordId", "N/A"), inline=False
+            name="DiscordId", value=user_info.get("DiscordId", "N/A"), inline=True
         )
 
         await interaction.response.send_message(embed=embed, ephemeral=True)
@@ -185,6 +218,9 @@ async def myinfo(interaction: discord.Interaction):
         await interaction.response.send_message(
             "No information found for your user ID.", ephemeral=True
         )
+
+
+# Command: fetchinfo
 
 
 @client.tree.command(
@@ -228,7 +264,7 @@ async def fetchinfo(interaction: discord.Interaction, user: discord.User):
 
         for key, value in user_info.items():
             display_value = str(value) if value is not None else "N/A"
-            embed.add_field(name=key, value=display_value, inline=False)
+            embed.add_field(name=key, value=display_value, inline=True)
 
         await interaction.response.send_message(
             content=f"✅ Whitelist details for {user.mention}:",
@@ -241,16 +277,28 @@ async def fetchinfo(interaction: discord.Interaction, user: discord.User):
         )
 
 
+# Command: registerhwid
+
+
 class HWIDModal(discord.ui.Modal, title="Register HWID"):
+    identifier = discord.ui.TextInput(
+        label="Enter an Identifier (Roblox name, PC, etc.)",
+        placeholder="e.g. Corrade",
+        min_length=2,
+        max_length=50,
+        required=True,
+    )
+
     hwid = discord.ui.TextInput(
-        label="Enter your HWID",
-        placeholder="e.g. XXXXXXXX-XXXX-XXXX-XXXX-XXXXXXXXXXXX",
+        label="Enter your HWID (Reference tutorial)",
+        placeholder="96-character SHA-384 hash",
         min_length=8,
-        max_length=100,  # Prevent abuse
+        max_length=100,
         required=True,
     )
 
     async def on_submit(self, interaction: discord.Interaction):
+        identifier_input = self.identifier.value.strip()
         user_input = self.hwid.value.strip()
 
         if not user_input or len(user_input) < 8:
@@ -273,7 +321,6 @@ class HWIDModal(discord.ui.Modal, title="Register HWID"):
             )
             return
 
-        # Check for duplicates
         async for message in registered_hwid_channel.history(limit=100):
             if message.embeds:
                 for embed in message.embeds:
@@ -284,19 +331,32 @@ class HWIDModal(discord.ui.Modal, title="Register HWID"):
                             )
                             return
 
-        # Register
         embed = discord.Embed(title="HWID Registered", color=discord.Color.green())
         embed.add_field(
             name="User",
             value=f"{interaction.user.mention} ({interaction.user.id})",
             inline=False,
         )
-        embed.add_field(name="Hashed HWID", value=hashed_hwid, inline=False)
+        embed.add_field(name="Identifier", value=identifier_input, inline=True)
+        embed.add_field(name="Hashed HWID", value=f"```{hashed_hwid}```", inline=True)
         await registered_hwid_channel.send(embed=embed)
 
         await interaction.response.send_message(
             "✅ Your HWID has been successfully registered.", ephemeral=True
         )
+
+
+class TutorialView(discord.ui.View):
+    def __init__(self):
+        super().__init__(timeout=None)
+
+    @discord.ui.button(
+        label="Continue", style=discord.ButtonStyle.green, custom_id="open_hwid_modal"
+    )
+    async def continue_button(
+        self, interaction: discord.Interaction, button: discord.ui.Button
+    ):
+        await interaction.response.send_modal(HWIDModal())
 
 
 @client.tree.command(
@@ -305,7 +365,17 @@ class HWIDModal(discord.ui.Modal, title="Register HWID"):
     guild=GUILD_ID,
 )
 async def registerhwid(interaction: discord.Interaction):
-    await interaction.response.send_modal(HWIDModal())
+    await interaction.response.send_message(
+        content=(
+            "**Need help finding your HWID?** [Watch the tutorial](https://youtu.be/YOUR_VIDEO_ID)\n\n"
+            "When you're ready, click the button below to continue."
+        ),
+        view=TutorialView(),
+        ephemeral=True,
+    )
+
+
+# Command: whitelist
 
 
 class WhitelistModal(discord.ui.Modal, title="Add Whitelisted User"):
@@ -414,6 +484,9 @@ async def whitelist(interaction: discord.Interaction):
     await interaction.response.send_modal(WhitelistModal())
 
 
+# Command: unwhitelist
+
+
 @client.tree.command(
     name="unwhitelist",
     description="Remove a user from the whitelist using their Discord mention.",
@@ -481,6 +554,9 @@ async def unwhitelist(interaction: discord.Interaction, user: discord.User):
         await interaction.response.send_message(
             f"❌ Failed to update whitelist: {e}", ephemeral=True
         )
+
+
+# Command: viewwhitelist
 
 
 class WhitelistPaginator(View):
@@ -602,6 +678,9 @@ async def view_whitelist(interaction: discord.Interaction):
         )
 
 
+# Command: editwhitelist
+
+
 class EditWhitelistModal(ui.Modal, title="Edit Whitelist Data"):
     def __init__(self, original_data, github, repo, file_path, sha):
         super().__init__()
@@ -676,65 +755,12 @@ async def edit_whitelist(interaction: discord.Interaction):
         await interaction.response.send_message(f"❌ Error: {e}", ephemeral=True)
 
 
-class HWIDModal(discord.ui.Modal, title="Register HWID"):
-    hwid = discord.ui.TextInput(
-        label="Enter your HWID",
-        placeholder="e.g. XXXXXXXX-XXXX-XXXX-XXXX-XXXXXXXXXXXX",
-        min_length=8,
-        max_length=100,
-        required=True,
-    )
-
-    async def on_submit(self, interaction: discord.Interaction):
-        user_input = self.hwid.value.strip()
-
-        if not user_input or len(user_input) < 8:
-            await interaction.response.send_message(
-                "❌ Invalid HWID format. HWID must be at least 8 characters long.",
-                ephemeral=True,
-            )
-            return
-
-        try:
-            hashed_hwid = hash_hwid(user_input)
-        except ValueError as e:
-            await interaction.response.send_message(f"❌ Error: {e}", ephemeral=True)
-            return
-
-        registered_hwid_channel = interaction.client.get_channel(1325394667918987266)
-        if not registered_hwid_channel:
-            await interaction.response.send_message(
-                "Invalid HWID registration channel. Contact an admin.", ephemeral=True
-            )
-            return
-
-        async for message in registered_hwid_channel.history(limit=100):
-            if message.embeds:
-                for embed in message.embeds:
-                    for field in embed.fields:
-                        if hashed_hwid == field.value:
-                            await interaction.response.send_message(
-                                "⚠️ This HWID is already registered.", ephemeral=True
-                            )
-                            return
-
-        embed = discord.Embed(title="HWID Registered", color=discord.Color.green())
-        embed.add_field(
-            name="User",
-            value=f"{interaction.user.mention} ({interaction.user.id})",
-            inline=False,
-        )
-        embed.add_field(name="Hashed HWID", value=hashed_hwid, inline=False)
-        await registered_hwid_channel.send(embed=embed)
-
-        await interaction.response.send_message(
-            "✅ Your HWID has been successfully registered.", ephemeral=True
-        )
+# Command: createpanel
 
 
 class RegisterButton(discord.ui.Button):
     def __init__(self):
-        super().__init__(label="Register", style=discord.ButtonStyle.success)
+        super().__init__(label="Register", style=discord.ButtonStyle.blurple)
 
     async def callback(self, interaction: discord.Interaction):
         await interaction.response.send_modal(HWIDModal())
@@ -742,38 +768,81 @@ class RegisterButton(discord.ui.Button):
 
 class GetScriptButton(discord.ui.Button):
     def __init__(self):
-        super().__init__(label="Get Script", style=discord.ButtonStyle.primary)
+        super().__init__(
+            label="Get Script",
+            style=discord.ButtonStyle.green,
+            custom_id="get_script_button",
+        )
 
     async def callback(self, interaction: discord.Interaction):
-        user_id = str(interaction.user.id)
-        data = await fetch_user_data()
+        global stored_script_content, stored_script_filename
 
-        if not data:
+        # Load whitelist data
+        whitelist_data = await fetch_user_data()
+        if not whitelist_data:
             await interaction.response.send_message(
-                "⚠️ Failed to fetch your key.", ephemeral=True
+                "❌ Could not fetch whitelist data.", ephemeral=True
             )
             return
 
-        user_info = next((u for u in data if u["DiscordId"] == user_id), None)
-        if not user_info:
-            await interaction.response.send_message(
-                "❌ You're not whitelisted.", ephemeral=True
-            )
-            return
-        if user_info.get("Banned", False):
-            await interaction.response.send_message("🚫 You're banned.", ephemeral=True)
-            return
+        user_entry = next(
+            (
+                entry
+                for entry in whitelist_data
+                if str(entry.get("DiscordId")) == str(interaction.user.id)
+            ),
+            None,
+        )
 
-        key = user_info.get("Key")
-        if not key:
+        if not user_entry:
             await interaction.response.send_message(
-                "❌ No key associated with your account.", ephemeral=True
+                "❌ You're not in the whitelist.", ephemeral=True
             )
             return
 
-        script = f'getgenv().script_key = "{key}";\nloadstring(readfile("..."))()'
+        try:
+            validate_whitelist_entry(user_entry)
+        except ValueError as e:
+            await interaction.response.send_message(
+                f"❌ Invalid whitelist entry: {e}", ephemeral=True
+            )
+            return
+
+        if user_entry.get("Banned") or user_entry.get("TempBan"):
+            await interaction.response.send_message(
+                "❌ You are banned from using this service.", ephemeral=True
+            )
+            return
+
+        if not stored_script_content or not stored_script_filename:
+            await interaction.response.send_message(
+                "❌ No script has been uploaded by the admin.", ephemeral=True
+            )
+            return
+
+        # Decode the script for editing
+        try:
+            script_text = stored_script_content.decode("utf-8")
+        except UnicodeDecodeError:
+            await interaction.response.send_message(
+                "❌ Script encoding error.", ephemeral=True
+            )
+            return
+
+        # Replace the key in getgenv().script_key = "..."
+        updated_script = re.sub(
+            r'getgenv\(\)\.script_key\s*=\s*"(.*?)"',
+            f'getgenv().script_key = "{user_entry["Key"]}";',
+            script_text,
+        )
+
+        # Send the modified script as a file
+        file = discord.File(
+            fp=io.BytesIO(updated_script.encode("utf-8")),
+            filename=stored_script_filename,
+        )
         await interaction.response.send_message(
-            f"Here is your script:\n```lua\n{script}\n```", ephemeral=True
+            "📜 Here is your personalized script:", file=file, ephemeral=True
         )
 
 
@@ -802,6 +871,7 @@ class CreatePanelModal(discord.ui.Modal, title="Create Embed Panel"):
             return
 
         await target_channel.send(embed=embed, view=view)
+
         await interaction.response.send_message(
             "✅ Panel created successfully.", ephemeral=True
         )
@@ -815,6 +885,662 @@ class CreatePanelModal(discord.ui.Modal, title="Create Embed Panel"):
 @require_role(RESTRICTED_ROLE_ID)
 async def createpanel(interaction: discord.Interaction):
     await interaction.response.send_modal(CreatePanelModal())
+
+
+# Command: updatescript
+
+
+@client.tree.command(
+    name="updatescript",
+    description="Upload a new script to update the stored script.",
+    guild=GUILD_ID,
+)
+@require_role(RESTRICTED_ROLE_ID)
+async def updatescript(interaction: discord.Interaction, file: Attachment):
+    # Check if the user uploaded a file
+    if not file:
+        await interaction.response.send_message(
+            "❌ Please upload a script file to update.", ephemeral=True
+        )
+        return
+
+    try:
+        # Read the content of the uploaded file asynchronously
+        file_content = await file.read()
+
+        # Update the global variables with the new script's data
+        global stored_script_content, stored_script_filename, stored_script_timestamp
+        stored_script_content = file_content
+        stored_script_filename = file.filename
+        stored_script_timestamp = datetime.now(timezone.utc)
+
+        await interaction.response.send_message(
+            f"✅ The script `{stored_script_filename}` has been successfully uploaded and updated.",
+            ephemeral=True,
+        )
+
+    except Exception as e:
+        await interaction.response.send_message(
+            f"❌ Error reading the file: {e}", ephemeral=True
+        )
+
+
+# Command: purge
+
+
+@client.tree.command(
+    name="purge",
+    description="Deletes a number of recent messages in this channel.",
+    guild=GUILD_ID,
+)
+@require_role(RESTRICTED_ROLE_ID)
+@app_commands.describe(amount="Number of messages to delete (max 100)")
+async def purge(interaction: discord.Interaction, amount: int):
+    if amount < 1 or amount > 100:
+        await interaction.response.send_message(
+            "❌ Amount must be between 1 and 100.", ephemeral=True
+        )
+        return
+
+    await interaction.response.defer(ephemeral=True)
+
+    try:
+        deleted = await interaction.channel.purge(
+            limit=amount, check=lambda msg: not msg.pinned, bulk=True
+        )
+        await interaction.followup.send(
+            f"🗑️ Deleted {len(deleted)} messages.", ephemeral=True
+        )
+
+    except discord.Forbidden:
+        await interaction.followup.send(
+            "❌ I don't have permission to delete messages.", ephemeral=True
+        )
+    except discord.HTTPException as e:
+        await interaction.followup.send(
+            f"❌ Failed to delete messages: {e}", ephemeral=True
+        )
+
+
+# Command: lock
+
+
+@client.tree.command(
+    name="lock",
+    description="Locks a channel (defaults to current channel).",
+    guild=GUILD_ID,
+)
+@require_role(RESTRICTED_ROLE_ID)
+@app_commands.describe(channel="Channel to lock (optional)")
+async def lock(interaction: discord.Interaction, channel: discord.TextChannel = None):
+    channel = channel or interaction.channel
+    overwrite = channel.overwrites_for(interaction.guild.default_role)
+
+    if overwrite.send_messages is False:
+        await interaction.response.send_message(
+            "🔒 Channel is already locked.", ephemeral=True
+        )
+        return
+
+    overwrite.send_messages = False
+    await channel.set_permissions(interaction.guild.default_role, overwrite=overwrite)
+    await interaction.response.send_message(
+        f"🔒 Locked {channel.mention}.", ephemeral=True
+    )
+
+
+# Command: unlock
+
+
+@client.tree.command(
+    name="unlock",
+    description="Unlocks a channel (defaults to current channel).",
+    guild=GUILD_ID,
+)
+@require_role(RESTRICTED_ROLE_ID)
+@app_commands.describe(channel="Channel to unlock (optional)")
+async def unlock(interaction: discord.Interaction, channel: discord.TextChannel = None):
+    channel = channel or interaction.channel
+    overwrite = channel.overwrites_for(interaction.guild.default_role)
+
+    if overwrite.send_messages is not False:
+        await interaction.response.send_message(
+            "🔓 Channel is already unlocked.", ephemeral=True
+        )
+        return
+
+    overwrite.send_messages = None  # Resets to default
+    await channel.set_permissions(interaction.guild.default_role, overwrite=overwrite)
+    await interaction.response.send_message(
+        f"🔓 Unlocked {channel.mention}.", ephemeral=True
+    )
+
+
+# Command: genkey
+
+
+def generate_key(min_length=35, max_length=45):
+    length = random.randint(min_length, max_length)
+    charset = string.ascii_letters + string.digits
+    return "".join(random.choices(charset, k=length))
+
+
+@client.tree.command(
+    name="genkey",
+    description="Generates a new random and unique script key.",
+    guild=GUILD_ID,
+)
+@require_role(RESTRICTED_ROLE_ID)
+async def genkey(interaction: discord.Interaction):
+    key = generate_key()
+    await interaction.response.send_message(
+        f"🔑 **Generated Key:** `{key}`", ephemeral=True
+    )
+
+
+# Command: scriptstatus
+
+
+class ScriptDownloadView(View):
+    def __init__(self, filename: str, content: bytes):
+        super().__init__(timeout=60)
+        self.filename = filename
+        self.content = content
+
+    @discord.ui.button(label="📥 Download Script", style=discord.ButtonStyle.blurple)
+    async def download(
+        self, interaction: discord.Interaction, button: discord.ui.Button
+    ):
+        # Create the file with the content
+        file = discord.File(fp=io.BytesIO(self.content), filename=self.filename)
+
+        # Send the message with the file attachment
+        await interaction.response.send_message(
+            content=f"📦 Here's your script file `{self.filename}`.",
+            file=file,
+            ephemeral=True,
+        )
+
+
+@client.tree.command(
+    name="scriptstatus",
+    description="Check if a script is uploaded and download it.",
+    guild=GUILD_ID,
+)
+@require_role(RESTRICTED_ROLE_ID)
+async def scriptstatus(interaction: discord.Interaction):
+    global stored_script_content, stored_script_filename, stored_script_timestamp
+
+    if stored_script_content and stored_script_filename:
+        timestamp_str = (
+            stored_script_timestamp.strftime("%Y-%m-%d %H:%M:%S %Z")
+            if stored_script_timestamp
+            else "Unknown"
+        )
+
+        embed = discord.Embed(
+            title="📄 Script Status",
+            description=(
+                f"**Script Name:** {stored_script_filename}\n"
+                f"**Last Updated:** `{formatted_time}`"
+            ),
+            color=discord.Color.blue(),
+        )
+
+        # Create the view with the download button and pass the filename/content
+        view = ScriptDownloadView(stored_script_filename, stored_script_content)
+
+        # Send the embed with the download button
+        await interaction.response.send_message(embed=embed, view=view, ephemeral=True)
+    else:
+        await interaction.response.send_message(
+            "❌ No script has been uploaded yet.", ephemeral=True
+        )
+
+
+# Command: scriptban
+
+
+import asyncio
+import discord
+import json
+import base64
+import aiohttp
+from datetime import datetime, timedelta
+from zoneinfo import ZoneInfo
+
+
+async def save_user_data_to_github(data, commit_message):
+    update_url = "https://api.github.com/repos/669053713850403197963270290945742252531/Celestial/contents/Users.json"
+    headers = {
+        "Authorization": f"Bearer {os.getenv('GITHUB_TOKEN')}",
+        "Content-Type": "application/json",
+    }
+    content = json.dumps(data, indent=4)
+    encoded_content = base64.b64encode(content.encode("utf-8")).decode("utf-8")
+
+    async with aiohttp.ClientSession() as session:
+        async with session.get(update_url, headers=headers) as response:
+            if response.status == 200:
+                file_data = await response.json()
+                sha = file_data["sha"]
+                update_data = {
+                    "message": commit_message,
+                    "sha": sha,
+                    "content": encoded_content,
+                }
+                async with session.put(
+                    update_url, json=update_data, headers=headers
+                ) as response:
+                    return response.status == 200
+            else:
+                error_message = await response.text()
+                raise Exception(
+                    f"Failed to fetch file SHA. Status: {response.status}, Details: {error_message}"
+                )
+
+
+@client.tree.command(
+    name="scriptban",
+    description="Bans a user from the script (temporarily or permanently).",
+    guild=GUILD_ID,
+)
+@require_role(RESTRICTED_ROLE_ID)
+@app_commands.describe(
+    user="The Discord user to ban (mention).",
+    duration="Ban duration in seconds (leave blank or 0 for permanent).",
+    reason="Reason for the ban.",
+)
+async def scriptban(
+    interaction: discord.Interaction,
+    user: discord.User,
+    duration: int = 0,
+    reason: str = "No reason provided.",
+):
+    try:
+        # Defer the interaction response early to prevent timeout
+        await interaction.response.defer(ephemeral=True)
+
+        # Fetch user data from GitHub
+        data = await fetch_user_data()
+
+        if not data:
+            await interaction.followup.send(
+                "❌ Failed to fetch user data from GitHub.", ephemeral=True
+            )
+            return
+
+        # Convert mention to user ID
+        user_id = str(user.id)
+
+        # Find user in the fetched data by DiscordId
+        user_data = next(
+            (entry for entry in data if str(entry.get("DiscordId")) == user_id), None
+        )
+
+        if not user_data:
+            await interaction.followup.send(
+                f"❌ User `{user}` is not found in the whitelist. Please ensure the user is added to the whitelist.",
+                ephemeral=True,
+            )
+            return
+
+        # Ban logic
+        now = datetime.now(ZoneInfo("America/New_York"))
+
+        user_data["BanReason"] = reason
+
+        if duration <= 0:
+            # Permanent ban
+            user_data["Banned"] = "true"
+            user_data["TempBan"] = "false"
+            user_data.pop("TempBanDuration", None)
+            user_data.pop("TempBanEnd", None)
+            ban_type = "permanently"
+            await user.send(
+                f"🔒 You have been permanently banned from the script. Reason: {reason}."
+            )
+        else:
+            # Temporary ban
+            end_time = now + timedelta(seconds=duration)
+            user_data["TempBan"] = "true"
+            user_data["TempBanDuration"] = str(duration)
+            user_data["TempBanEnd"] = end_time.strftime("%Y-%m-%d %H:%M:%S %p")
+            user_data["Banned"] = "false"
+            ban_type = f"temporarily for {duration} seconds"
+            # Start background task to handle unban
+            # Save the ban info immediately before starting the timer
+            await save_user_data_to_github(data, f"Temp ban applied to {user.id}")
+
+            # Now start the timer in the background (don't await it)
+            asyncio.create_task(start_temp_ban_timer(user, user_data, end_time, data))
+
+        # Prepare the payload for GitHub
+        content = json.dumps(data, indent=4)
+        update_url = f"https://api.github.com/repos/669053713850403197963270290945742252531/Celestial/contents/Users.json"
+        headers = {
+            "Authorization": f"Bearer {os.getenv('GITHUB_TOKEN')}",
+            "Content-Type": "application/json",
+        }
+
+        async with aiohttp.ClientSession() as session:
+            try:
+                # Fetch the file's current SHA for updating
+                async with session.get(update_url, headers=headers) as response:
+                    if response.status == 200:
+                        file_data = await response.json()
+                        sha = file_data["sha"]  # Get the sha
+
+                        # Prepare update data for GitHub
+                        encoded_content = base64.b64encode(
+                            content.encode("utf-8")
+                        ).decode("utf-8")
+
+                        update_data = {
+                            "message": f"Ban updated for user {user.id}",
+                            "sha": sha,
+                            "content": encoded_content,  # Base64 content
+                        }
+
+                        # Update the file on GitHub
+                        async with session.put(
+                            update_url, json=update_data, headers=headers
+                        ) as response:
+                            if response.status == 200:
+                                await interaction.followup.send(
+                                    f"✅ `{user}` has been {ban_type} banned. Reason: {reason}",
+                                    ephemeral=True,
+                                )
+                            else:
+                                error_message = await response.text()
+                                await interaction.followup.send(
+                                    f"❌ Failed to update user data on GitHub.\n"
+                                    f"Status: {response.status}\n"
+                                    f"Details: {error_message}",  # Detailed error response
+                                    ephemeral=True,
+                                )
+                    else:
+                        await interaction.followup.send(
+                            "❌ Failed to fetch current file from GitHub.",
+                            ephemeral=True,
+                        )
+
+            except aiohttp.ClientError as e:
+                await interaction.followup.send(
+                    f"❌ Error saving data: {e}", ephemeral=True
+                )
+
+    except discord.errors.NotFound as e:
+        # Handle any interaction timeout errors
+        print(f"Error: {e}")
+        await interaction.followup.send(
+            "❌ The interaction has expired or is no longer valid.", ephemeral=True
+        )
+
+    except Exception as e:
+        # Catch all other exceptions
+        await interaction.followup.send(f"❌ Failed to ban user: {e}", ephemeral=True)
+
+
+# Background Task to Handle Temp Ban Timer
+async def start_temp_ban_timer(user, user_data, end_time, data):
+    # Ensure the bot does not block the main thread by offloading the task
+    await asyncio.sleep(
+        (end_time - datetime.now(ZoneInfo("America/New_York"))).total_seconds()
+    )
+    await unban_temp_user(user, user_data, data)
+
+
+async def unban_temp_user(user, user_data, data):
+    # Reset all banned information
+    user_data["Banned"] = "false"
+    user_data["TempBan"] = "false"
+    user_data["BanReason"] = "null"
+    user_data["TempBanDuration"] = "null"
+    user_data["TempBanEnd"] = "null"
+
+    # Send a DM to the user about their unban
+    try:
+        await user.send(
+            "🔓 Your temporary ban from the script has expired. You have been unbanned."
+        )
+    except discord.DiscordException:
+        print(f"Failed to send unban DM to {user.id}.")
+
+    # Prepare the payload for GitHub
+    content = json.dumps(data, indent=4)
+    update_url = f"https://api.github.com/repos/669053713850403197963270290945742252531/Celestial/contents/Users.json"
+    headers = {
+        "Authorization": f"Bearer {os.getenv('GITHUB_TOKEN')}",
+        "Content-Type": "application/json",
+    }
+
+    async with aiohttp.ClientSession() as session:
+        try:
+            # Fetch the file to get the sha for the update
+            async with session.get(update_url, headers=headers) as response:
+                if response.status == 200:
+                    file_data = await response.json()
+                    sha = file_data["sha"]  # Get the sha
+
+                    # Prepare update data for GitHub
+                    encoded_content = base64.b64encode(content.encode("utf-8")).decode(
+                        "utf-8"
+                    )
+
+                    update_data = {
+                        "message": f"Temporary ban expired for user {user.id}",
+                        "sha": sha,
+                        "content": encoded_content,  # Base64 encoded content
+                    }
+
+                    # Send the PUT request to GitHub API
+                    async with session.put(
+                        update_url, json=update_data, headers=headers
+                    ) as response:
+                        if response.status == 200:
+                            print(f"User {user.id} has been unbanned.")
+                        else:
+                            error_message = (
+                                await response.text()
+                            )  # Fetch the error response text
+                            print(
+                                f"Failed to update user data on GitHub. Details: {error_message}"
+                            )
+                else:
+                    print("Failed to fetch current file from GitHub.")
+
+        except aiohttp.ClientError as e:
+            print(f"Error saving data: {e}")
+
+
+# Command: scriptunban
+
+
+@client.tree.command(
+    name="scriptunban",
+    description="Unbans a user from the script (removes both permanent and temporary bans).",
+    guild=GUILD_ID,
+)
+@require_role(RESTRICTED_ROLE_ID)
+@app_commands.describe(
+    user="The Discord user to unban (mention).",
+)
+async def scriptunban(
+    interaction: discord.Interaction,
+    user: discord.User,
+):
+    try:
+        # Fetch user data from the GitHub JSON
+        data = await fetch_user_data()
+
+        if not data:
+            await interaction.response.send_message(
+                "❌ Failed to fetch user data from GitHub.", ephemeral=True
+            )
+            return
+
+        user_id = str(user.id)
+        print(f"User ID: {user_id}")
+
+        user_data = next(
+            (entry for entry in data if str(entry.get("DiscordId")) == user_id), None
+        )
+
+        if not user_data:
+            await interaction.response.send_message(
+                f"❌ User `{user}` is not found in the whitelist.",
+                ephemeral=True,
+            )
+            return
+
+        if user_data.get("Banned") == "false" and user_data.get("TempBan") == "false":
+            await interaction.response.send_message(
+                f"❌ User `{user}` is not banned.", ephemeral=True
+            )
+            return
+
+        # Unban user
+        user_data["Banned"] = "false"
+        user_data["TempBan"] = "false"
+        user_data["BanReason"] = "null"
+        user_data["TempBanDuration"] = "null"
+        user_data["TempBanEnd"] = "null"
+
+        content = json.dumps(data, indent=4)
+        update_url = "https://api.github.com/repos/669053713850403197963270290945742252531/Celestial/contents/Users.json"
+        headers = {
+            "Authorization": f"Bearer {os.getenv('GITHUB_TOKEN')}",
+            "Content-Type": "application/json",
+        }
+
+        async with aiohttp.ClientSession() as session:
+            try:
+                async with session.get(update_url, headers=headers) as response:
+                    if response.status == 200:
+                        file_data = await response.json()
+                        sha = file_data["sha"]
+
+                        encoded_content = base64.b64encode(
+                            content.encode("utf-8")
+                        ).decode("utf-8")
+                        update_data = {
+                            "message": f"Unban updated for user {user.id}",
+                            "sha": sha,
+                            "content": encoded_content,
+                        }
+
+                        async with session.put(
+                            update_url, json=update_data, headers=headers
+                        ) as response:
+                            if response.status == 200:
+                                await interaction.response.send_message(
+                                    f"✅ `{user}` has been unbanned successfully.",
+                                    ephemeral=True,
+                                )
+
+                                # ✅ Attempt to DM the user
+                                try:
+                                    await user.send(
+                                        "✅ You have been unbanned from using the script. You may now access it again."
+                                    )
+                                except discord.Forbidden:
+                                    await interaction.followup.send(
+                                        f"⚠️ `{user}` has been unbanned, but I couldn't DM them (they may have DMs disabled).",
+                                        ephemeral=True,
+                                    )
+                            else:
+                                error_message = await response.text()
+                                await interaction.response.send_message(
+                                    f"❌ Failed to update user data on GitHub.\n"
+                                    f"Status: {response.status}\nDetails: {error_message}",
+                                    ephemeral=True,
+                                )
+                    else:
+                        await interaction.response.send_message(
+                            "❌ Failed to fetch current file from GitHub.",
+                            ephemeral=True,
+                        )
+            except aiohttp.ClientError as e:
+                await interaction.response.send_message(
+                    f"❌ Error saving data: {e}", ephemeral=True
+                )
+
+    except Exception as e:
+        await interaction.response.send_message(
+            f"❌ Failed to unban user: {e}", ephemeral=True
+        )
+
+
+# Command: dm
+
+
+@client.tree.command(
+    name="dm",
+    description="Send a private message to a user from the bot.",
+    guild=GUILD_ID,
+)
+@app_commands.describe(user="The user to message", message="The message to send")
+async def dm(interaction: discord.Interaction, user: discord.User, message: str):
+    if user.bot:
+        await interaction.response.send_message(
+            "🤖 You can't DM other bots.", ephemeral=True
+        )
+        return
+
+    try:
+        await user.send(message)
+        await interaction.response.send_message(
+            f"📬 Successfully sent a DM to {user.mention}.", ephemeral=True
+        )
+    except discord.Forbidden:
+        await interaction.response.send_message(
+            f"❌ Couldn't DM {user.mention}. They may have DMs off or blocked the bot.",
+            ephemeral=True,
+        )
+    except discord.HTTPException as e:
+        await interaction.response.send_message(f"❌ DM failed: {e}", ephemeral=True)
+
+
+# Command: clearregistrations
+
+
+@client.tree.command(
+    name="clearregistrations",
+    description="Clears the HWID registration log.",
+    guild=GUILD_ID,
+)
+async def clearregistrations(interaction: discord.Interaction):
+    await interaction.response.send_message(
+        "🧹 Clearing registration messages...", ephemeral=True
+    )
+
+    registered_hwid_channel = interaction.client.get_channel(1325394667918987266)
+    if not registered_hwid_channel:
+        await interaction.followup.send(
+            "❌ Couldn't find the HWID registration channel.", ephemeral=True
+        )
+        return
+
+    deleted_count = 0
+    async for message in registered_hwid_channel.history(limit=100):
+        if message.author == client.user and message.embeds:
+            embed = message.embeds[0]
+            if embed.title == "HWID Registered":
+                try:
+                    await message.delete()
+                    deleted_count += 1
+                except discord.Forbidden:
+                    pass  # Bot lacks permission to delete
+                except discord.HTTPException:
+                    pass  # Deletion failed for some reason
+
+    await interaction.followup.send(
+        f"✅ Cleared {deleted_count} registration(s).", ephemeral=True
+    )
+
+
+# Establishing the bot connection
 
 
 token = os.getenv("DISCORD_TOKEN")
