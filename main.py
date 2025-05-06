@@ -178,36 +178,30 @@ async def myinfo(interaction: discord.Interaction):
     data = await fetch_user_data()
 
     try:
-        if not interaction.response.is_done():
-            embed = discord.Embed(title="User Info", description="Info about the user.")
-            await interaction.response.send_message(embed=embed, ephemeral=True)
-        else:
-            await interaction.followup.send("Interaction already acknowledged.", ephemeral=True)
-    except discord.errors.HTTPException as e:
-        await interaction.followup.send(f"❌ Error: {e}", ephemeral=True)
-        
-    if data is None:
-        await interaction.response.send_message(
-            "Failed to fetch user data. Please try again later.", ephemeral=True
-        )
-        return
+        # Wait for the data before sending the final embed
+        if data is None:
+            await interaction.response.send_message(
+                "Failed to fetch user data. Please try again later.", ephemeral=True
+            )
+            return
 
-    user_info = next((user for user in data if user["DiscordId"] == user_id), None)
-    print(f"Fetched user info: {user_info}")
+        user_info = next((user for user in data if user["DiscordId"] == user_id), None)
+        print(f"Fetched user info: {user_info}")
 
-    if user_info:
-        # Check if the user is banned or HWID is not set
-        print(f"User Roles: {[role.id for role in interaction.user.roles]}")
-        hashed_hwid = user_info.get("HashedHWID", "N/A")  # Fetch the HashedHWID safely
-        print(f"Hashed HWID: {user_info.get('HWID', 'N/A')}")
+        if not user_info:
+            await interaction.response.send_message(
+                "No information found for your user ID.", ephemeral=True
+            )
+            return
 
+        # Check if HWID is set
         if not user_info.get("HWID"):
             await interaction.response.send_message(
                 "You are not authorized to use this command.", ephemeral=True
             )
             return
 
-        # Construct embed with non-sensitive data
+        # Construct the embed with non-sensitive data
         embed = discord.Embed(
             title="Your whitelist information", color=discord.Color.blue()
         )
@@ -222,12 +216,11 @@ async def myinfo(interaction: discord.Interaction):
             name="DiscordId", value=user_info.get("DiscordId", "N/A"), inline=True
         )
 
+        # Send the completed embed after all data is collected
         await interaction.response.send_message(embed=embed, ephemeral=True)
-    else:
-        await interaction.response.send_message(
-            "No information found for your user ID.", ephemeral=True
-        )
 
+    except discord.errors.HTTPException as e:
+        await interaction.followup.send(f"❌ Error: {e}", ephemeral=True)
 
 # Command: fetchinfo
 
