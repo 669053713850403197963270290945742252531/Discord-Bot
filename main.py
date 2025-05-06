@@ -177,6 +177,15 @@ async def myinfo(interaction: discord.Interaction):
     user_id = str(interaction.user.id)  # User's Discord ID as a string
     data = await fetch_user_data()
 
+    try:
+        if not interaction.response.is_done():
+            embed = discord.Embed(title="User Info", description="Info about the user.")
+            await interaction.response.send_message(embed=embed, ephemeral=True)
+        else:
+            await interaction.followup.send("Interaction already acknowledged.", ephemeral=True)
+    except discord.errors.HTTPException as e:
+        await interaction.followup.send(f"❌ Error: {e}", ephemeral=True)
+        
     if data is None:
         await interaction.response.send_message(
             "Failed to fetch user data. Please try again later.", ephemeral=True
@@ -727,6 +736,15 @@ class EditWhitelistModal(ui.Modal, title="Edit Whitelist Data"):
 )
 @require_role(RESTRICTED_ROLE_ID)
 async def edit_whitelist(interaction: discord.Interaction):
+    try:
+        # Ensure we don't respond after it's already acknowledged
+        if interaction.response.is_done():
+            await interaction.followup.send("You have already responded to this interaction.", ephemeral=True)
+            return
+        await interaction.response.send_modal(EditWhitelistModal())
+    except discord.errors.HTTPException as e:
+        await interaction.response.send_message(f"❌ Error: {e}", ephemeral=True)
+
     admin_role_id = 1273432694533001286
     if not any(role.id == admin_role_id for role in interaction.user.roles):
         await interaction.response.send_message(
