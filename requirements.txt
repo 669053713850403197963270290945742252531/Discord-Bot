@@ -4,3 +4,8 @@ requests
 PyGithub
 python-dotenv
 Flask
+base64
+string
+random
+io
+asyncio
