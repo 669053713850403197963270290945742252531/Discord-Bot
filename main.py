@@ -45,6 +45,7 @@ def keep_alive():
     t = Thread(target=run)
     t.start()
 
+
 load_dotenv()  # Load environment variables into bot environment
 stored_script_timestamp = datetime.now(ZoneInfo("America/New_York"))
 formatted_time = stored_script_timestamp.strftime("%Y-%m-%d %I:%M:%S %p %Z")
@@ -221,6 +222,7 @@ async def myinfo(interaction: discord.Interaction):
 
     except discord.errors.HTTPException as e:
         await interaction.followup.send(f"❌ Error: {e}", ephemeral=True)
+
 
 # Command: fetchinfo
 
@@ -732,32 +734,31 @@ async def edit_whitelist(interaction: discord.Interaction):
     try:
         # Ensure we don't respond after it's already acknowledged
         if interaction.response.is_done():
-            await interaction.followup.send("You have already responded to this interaction.", ephemeral=True)
+            await interaction.followup.send(
+                "You have already responded to this interaction.", ephemeral=True
+            )
             return
-        await interaction.response.send_modal(EditWhitelistModal())
-    except discord.errors.HTTPException as e:
-        await interaction.response.send_message(f"❌ Error: {e}", ephemeral=True)
 
-    admin_role_id = 1273432694533001286
-    if not any(role.id == admin_role_id for role in interaction.user.roles):
-        await interaction.response.send_message(
-            "❌ You do not have permission.", ephemeral=True
-        )
-        return
+        admin_role_id = 1273432694533001286
+        if not any(role.id == admin_role_id for role in interaction.user.roles):
+            await interaction.response.send_message(
+                "❌ You do not have permission.", ephemeral=True
+            )
+            return
 
-    github_token = os.getenv("GITHUB_TOKEN")
-    if not github_token:
-        await interaction.response.send_message(
-            "❌ GitHub token not found.", ephemeral=True
-        )
-        return
+        github_token = os.getenv("GITHUB_TOKEN")
+        if not github_token:
+            await interaction.response.send_message(
+                "❌ GitHub token not found.", ephemeral=True
+            )
+            return
 
-    try:
         github = Github(github_token)
         repo = github.get_repo("669053713850403197963270290945742252531/Celestial")
         file = repo.get_contents("Users.json")
         content = file.decoded_content.decode()
 
+        # Pass the necessary arguments to the modal
         await interaction.response.send_modal(
             EditWhitelistModal(content, github, repo, "Users.json", file.sha)
         )
