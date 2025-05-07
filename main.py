@@ -12,11 +12,11 @@ from discord import (
 import aiohttp
 import json
 import hashlib
-from github import Github  # Requires `PyGithub` library
+from github import Github
 import os
 from dotenv import load_dotenv
 import re
-from datetime import datetime, timezone, timedelta
+from datetime import datetime, timezone, timedelta, UTC
 from zoneinfo import ZoneInfo
 from functools import wraps
 from discord.ui import View, Button
@@ -25,6 +25,7 @@ import io
 import random
 import string
 import base64
+
 from flask import Flask
 from threading import Thread
 from keep_alive import keep_alive
@@ -45,39 +46,6 @@ def keep_alive():
     t = Thread(target=run)
     t.start()
 
-
-load_dotenv()  # Load environment variables into bot environment
-stored_script_timestamp = datetime.now(ZoneInfo("America/New_York"))
-formatted_time = stored_script_timestamp.strftime("%Y-%m-%d %I:%M:%S %p %Z")
-
-
-import discord
-from discord.ext import commands
-from discord import (
-    app_commands,
-    ui,
-    Interaction,
-    TextStyle,
-    Embed,
-    ButtonStyle,
-    Attachment,
-)
-import aiohttp
-import json
-import hashlib
-from github import Github
-import os
-from dotenv import load_dotenv
-import re
-from datetime import datetime, timezone, timedelta
-from zoneinfo import ZoneInfo
-from functools import wraps
-from discord.ui import View, Button
-import asyncio
-import io
-import random
-import string
-import base64
 
 load_dotenv()  # Load environment variables into bot environment
 stored_script_timestamp = datetime.now(ZoneInfo("America/New_York"))
@@ -273,13 +241,6 @@ async def fetchinfo(interaction: discord.Interaction, user: discord.User):
     user_info = next((entry for entry in data if entry["DiscordId"] == user_id), None)
 
     if user_info:
-        if user_info.get("Banned", False):
-            await interaction.response.send_message(
-                f"🚫 {user.mention} is banned. Their information cannot be viewed.",
-                ephemeral=True,
-            )
-            return
-
         embed = discord.Embed(
             title=f"Whitelist Info for {user}",
             description=f"Requested by {interaction.user.mention}",
@@ -366,7 +327,8 @@ class HWIDModal(discord.ui.Modal, title="Register HWID"):
         await registered_hwid_channel.send(embed=embed)
 
         await interaction.response.send_message(
-            "✅ Your HWID has been successfully registered.", ephemeral=True
+            "✅ Your HWID has been successfully registered. Please wait for a response from an admin while it's being reviewed.",
+            ephemeral=True,
         )
 
 
@@ -456,11 +418,27 @@ class WhitelistModal(discord.ui.Modal, title="Add Whitelisted User"):
                 )
                 return
 
-            if any(entry.get("HWID") == hashed_hwid for entry in data):
-                await interaction.response.send_message(
-                    "⚠️ This HWID is already whitelisted.", ephemeral=True
-                )
-                return
+            for entry in data:
+                if entry.get("HWID") == hashed_hwid:
+                    await interaction.response.send_message(
+                        "⚠️ This HWID is already whitelisted.", ephemeral=True
+                    )
+                    return
+                if entry.get("Identifier") == self.identifier.value:
+                    await interaction.response.send_message(
+                        "⚠️ This Identifier is already used.", ephemeral=True
+                    )
+                    return
+                if entry.get("DiscordId") == self.discord_id.value:
+                    await interaction.response.send_message(
+                        "⚠️ This Discord ID is already registered.", ephemeral=True
+                    )
+                    return
+                if entry.get("Key") == self.key.value:
+                    await interaction.response.send_message(
+                        "⚠️ This Key is already in use.", ephemeral=True
+                    )
+                    return
 
             join_date = f"{datetime.now().year}-{datetime.now().month:02d}-{datetime.now().day:02d}"
 
@@ -482,6 +460,7 @@ class WhitelistModal(discord.ui.Modal, title="Add Whitelisted User"):
             data.append(new_entry)
 
             updated_content = json.dumps(data, indent=4)
+
             repo.update_file(
                 path=file.path,
                 message=f"Add whitelist entry for {self.identifier.value}",
@@ -492,6 +471,7 @@ class WhitelistModal(discord.ui.Modal, title="Add Whitelisted User"):
             await interaction.response.send_message(
                 "✅ Whitelisted user successfully added.", ephemeral=True
             )
+
         except Exception as e:
             await interaction.response.send_message(
                 f"❌ Failed to update whitelist: {e}", ephemeral=True
@@ -500,7 +480,7 @@ class WhitelistModal(discord.ui.Modal, title="Add Whitelisted User"):
 
 @client.tree.command(
     name="whitelist",
-    description="Add a user to the whitelist JSON file.",
+    description="Add a user to the database.",
     guild=GUILD_ID,
 )
 @require_role(RESTRICTED_ROLE_ID)
@@ -513,7 +493,7 @@ async def whitelist(interaction: discord.Interaction):
 
 @client.tree.command(
     name="unwhitelist",
-    description="Remove a user from the whitelist using their Discord mention.",
+    description="Remove a user from the database.",
     guild=GUILD_ID,
 )
 @app_commands.describe(user="Mention the user to remove from the whitelist")
@@ -617,7 +597,7 @@ class WhitelistPaginator(View):
 
 
 @client.tree.command(
-    name="viewwhitelist", description="View all users in the whitelist.", guild=GUILD_ID
+    name="viewwhitelist", description="View all users in the database.", guild=GUILD_ID
 )
 @require_role(RESTRICTED_ROLE_ID)
 async def view_whitelist(interaction: discord.Interaction):
@@ -746,7 +726,7 @@ class EditWhitelistModal(ui.Modal, title="Edit Whitelist Data"):
 
 
 @client.tree.command(
-    name="editwhitelist", description="Edit the raw whitelist data.", guild=GUILD_ID
+    name="editwhitelist", description="Edit the raw database data.", guild=GUILD_ID
 )
 @require_role(RESTRICTED_ROLE_ID)
 async def edit_whitelist(interaction: discord.Interaction):
@@ -781,14 +761,110 @@ async def edit_whitelist(interaction: discord.Interaction):
 # Command: createpanel
 
 
-class RegisterButton(discord.ui.Button):
+class RedeemKeyModal(discord.ui.Modal, title="Redeem Script Key"):
+    key = discord.ui.TextInput(label="Script Key", required=True)
+    hwid = discord.ui.TextInput(label="HWID (SHA-384 hash)", required=True)
+    identifier = discord.ui.TextInput(label="Username / Identifier", required=True)
+
+    async def on_submit(self, interaction: discord.Interaction):
+        github_token = os.getenv("GITHUB_TOKEN")
+        if not github_token:
+            await interaction.response.send_message(
+                "❌ GitHub token missing.", ephemeral=True
+            )
+            return
+
+        try:
+            # Validate HWID format
+            try:
+                hashed_hwid = hash_hwid(self.hwid.value)
+            except ValueError as e:
+                await interaction.response.send_message(
+                    f"❌ HWID error: {e}", ephemeral=True
+                )
+                return
+
+            repo_name = "669053713850403197963270290945742252531/Celestial"
+            file_path = "Users.json"
+            github = Github(github_token)
+            repo = github.get_repo(repo_name)
+            file = repo.get_contents(file_path)
+
+            try:
+                data = json.loads(file.decoded_content.decode())
+            except json.JSONDecodeError:
+                await interaction.response.send_message(
+                    "⚠️ JSON file is invalid.", ephemeral=True
+                )
+                return
+
+            # Check if HWID or Key already used
+            if any(u["HWID"] == hashed_hwid for u in data):
+                await interaction.response.send_message(
+                    "⚠️ This HWID is already registered.", ephemeral=True
+                )
+                return
+            if any(u["Key"] == self.key.value for u in data):
+                await interaction.response.send_message(
+                    "⚠️ This key has already been used.", ephemeral=True
+                )
+                return
+
+            # Prepare new entry
+            today = datetime.now(UTC).strftime("%Y-%m-%d")
+            new_entry = {
+                "HWID": hashed_hwid,
+                "Identifier": self.identifier.value,
+                "Rank": "User",
+                "JoinDate": today,
+                "DiscordId": str(interaction.user.id),
+                "Key": self.key.value,
+                "Notes": "false",
+                "Banned": "false",
+                "TempBan": "false",
+                "BanReason": "null",
+                "TempBanDuration": "null",
+                "TempBanEnd": "null",
+            }
+
+            data.append(new_entry)
+            updated_content = json.dumps(data, indent=4)
+            repo.update_file(
+                path=file.path,
+                message=f"Redeemed key for {self.identifier.value}",
+                content=updated_content,
+                sha=file.sha,
+            )
+
+            await interaction.response.send_message(
+                "✅ Key redeemed and access granted!", ephemeral=True
+            )
+        except Exception as e:
+            await interaction.response.send_message(
+                f"❌ Failed to redeem: {e}", ephemeral=True
+            )
+
+
+class ContinueRedeemView(discord.ui.View):
     def __init__(self):
-        super().__init__(label="Register", style=discord.ButtonStyle.blurple)
+        super().__init__(timeout=60)
+
+    @discord.ui.button(label="Continue", style=discord.ButtonStyle.primary)
+    async def continue_button(
+        self, interaction: discord.Interaction, button: discord.ui.Button
+    ):
+        await interaction.response.send_modal(RedeemKeyModal())
+
+
+class RedeemKeyButton(discord.ui.Button):
+    def __init__(self):
+        super().__init__(label="🔑 Redeem Key", style=discord.ButtonStyle.green)
 
     async def callback(self, interaction: discord.Interaction):
         await interaction.response.send_message(
-            "Please click 'Continue' below to been the registration process.",
-            view=TutorialView(),
+            "To redeem your key, you'll need your HWID. If you're unsure how to get it, follow this [tutorial](https://www.youtube.com/VIDEO).\n"
+            "When you're ready, click **Continue**.",
+            view=ContinueRedeemView(),
             ephemeral=True,
         )
 
@@ -796,8 +872,8 @@ class RegisterButton(discord.ui.Button):
 class GetScriptButton(discord.ui.Button):
     def __init__(self):
         super().__init__(
-            label="Get Script",
-            style=discord.ButtonStyle.green,
+            label="📜 Get Script",
+            style=discord.ButtonStyle.blurple,
             custom_id="get_script_button",
         )
 
@@ -808,7 +884,7 @@ class GetScriptButton(discord.ui.Button):
         whitelist_data = await fetch_user_data()
         if not whitelist_data:
             await interaction.response.send_message(
-                "❌ Could not fetch whitelist data.", ephemeral=True
+                "❌ Your not whitelisted to this script.", ephemeral=True
             )
             return
 
@@ -869,11 +945,11 @@ class GetScriptButton(discord.ui.Button):
             filename=stored_script_filename,
         )
         await interaction.response.send_message(
-            "📜 Here is your personalized script:", file=file, ephemeral=True
+            "Here is your script:", file=file, ephemeral=True
         )
 
 
-class CreatePanelModal(discord.ui.Modal, title="Create Embed Panel"):
+class CreatePanelModal(discord.ui.Modal, title="Create Script Panel"):
     embed_title = discord.ui.TextInput(label="Embed Title", required=True)
     embed_description = discord.ui.TextInput(
         label="Embed Description", style=discord.TextStyle.paragraph, required=True
@@ -887,7 +963,7 @@ class CreatePanelModal(discord.ui.Modal, title="Create Embed Panel"):
         )
 
         view = discord.ui.View(timeout=None)
-        view.add_item(RegisterButton())
+        view.add_item(RedeemKeyButton())
         view.add_item(GetScriptButton())
 
         target_channel = interaction.client.get_channel(1368816321139183647)
@@ -906,7 +982,7 @@ class CreatePanelModal(discord.ui.Modal, title="Create Embed Panel"):
 
 @client.tree.command(
     name="createpanel",
-    description="Creates the embed panel inside the panel channel.",
+    description="Creates an embed panel inside the panel channel.",
     guild=GUILD_ID,
 )
 @require_role(RESTRICTED_ROLE_ID)
@@ -919,7 +995,7 @@ async def createpanel(interaction: discord.Interaction):
 
 @client.tree.command(
     name="updatescript",
-    description="Upload a new script to update the stored script.",
+    description="Upload a new script to update the stored script to then supply in the panel.",
     guild=GUILD_ID,
 )
 @require_role(RESTRICTED_ROLE_ID)
@@ -957,7 +1033,7 @@ async def updatescript(interaction: discord.Interaction, file: Attachment):
 
 @client.tree.command(
     name="purge",
-    description="Deletes a number of recent messages in this channel.",
+    description="Deletes a number of messages in a channel.",
     guild=GUILD_ID,
 )
 @require_role(RESTRICTED_ROLE_ID)
@@ -994,7 +1070,7 @@ async def purge(interaction: discord.Interaction, amount: int):
 
 @client.tree.command(
     name="lock",
-    description="Locks a channel (defaults to current channel).",
+    description="Locks a specific channel (defaults to current channel).",
     guild=GUILD_ID,
 )
 @require_role(RESTRICTED_ROLE_ID)
@@ -1021,7 +1097,7 @@ async def lock(interaction: discord.Interaction, channel: discord.TextChannel = 
 
 @client.tree.command(
     name="unlock",
-    description="Unlocks a channel (defaults to current channel).",
+    description="Unlocks a specific channel (defaults to current channel).",
     guild=GUILD_ID,
 )
 @require_role(RESTRICTED_ROLE_ID)
@@ -1091,7 +1167,7 @@ class ScriptDownloadView(View):
 
 @client.tree.command(
     name="scriptstatus",
-    description="Check if a script is uploaded and download it.",
+    description="View the information about the currently uploaded script.",
     guild=GUILD_ID,
 )
 @require_role(RESTRICTED_ROLE_ID)
@@ -1117,7 +1193,7 @@ async def scriptstatus(interaction: discord.Interaction):
         # Create download button, pass filename & content
         view = ScriptDownloadView(stored_script_filename, stored_script_content)
 
-        # Send embed with the download button
+        # Send embed with download button
         await interaction.response.send_message(embed=embed, view=view, ephemeral=True)
     else:
         await interaction.response.send_message(
@@ -1126,15 +1202,6 @@ async def scriptstatus(interaction: discord.Interaction):
 
 
 # Command: scriptban
-
-
-import asyncio
-import discord
-import json
-import base64
-import aiohttp
-from datetime import datetime, timedelta
-from zoneinfo import ZoneInfo
 
 
 async def save_user_data_to_github(data, commit_message):
@@ -1221,8 +1288,8 @@ async def scriptban(
             # Perm ban
             user_data["Banned"] = "true"
             user_data["TempBan"] = "false"
-            user_data.pop("TempBanDuration", None)
-            user_data.pop("TempBanEnd", None)
+            user_data["TempBanDuration"] = "null"
+            user_data["TempBanEnd"] = "null"
             ban_type = "permanently"
             await user.send(
                 f"🔒 You have been permanently banned from the script. Reason: {reason}."
@@ -1236,10 +1303,7 @@ async def scriptban(
             user_data["Banned"] = "false"
             ban_type = f"temporarily for {duration} seconds"
             # Handling ban shit
-            # Save ban info before starting the timer
-            await save_user_data_to_github(data, f"Temp ban applied to {user.id}")
-
-            # Now start timer in the background
+            # Just mark that we're doing a temp ban
             asyncio.create_task(start_temp_ban_timer(user, user_data, end_time, data))
 
         # Prepare GitHub payload
@@ -1298,15 +1362,18 @@ async def scriptban(
                 )
 
     except discord.errors.NotFound as e:
-        # Handle timeout errors
-        print(f"Error: {e}")
-        await interaction.followup.send(
-            "❌ The interaction has expired or is no longer valid.", ephemeral=True
-        )
+        # Interaction has expired or already responded
+        print(f"Interaction error: {e} - Cannot respond again.")
 
     except Exception as e:
-        # Catch other exceptions
-        await interaction.followup.send(f"❌ Failed to ban user: {e}", ephemeral=True)
+        try:
+            await interaction.followup.send(
+                f"❌ Failed to ban user: {e}", ephemeral=True
+            )
+        except discord.errors.InteractionResponded:
+            print(f"❌ Could not follow up — interaction already responded or expired.")
+        except discord.HTTPException as err:
+            print(f"❌ HTTP error on followup: {err}")
 
 
 # Handle temp ban timer
@@ -1381,7 +1448,7 @@ async def unban_temp_user(user, user_data, data):
 
 @client.tree.command(
     name="scriptunban",
-    description="Unbans a user from the script (removes both permanent and temporary bans).",
+    description="Unbans a user from the script.",
     guild=GUILD_ID,
 )
 @require_role(RESTRICTED_ROLE_ID)
@@ -1564,6 +1631,7 @@ async def clearregistrations(interaction: discord.Interaction):
 
 
 # Command: edituser
+
 
 VALID_FIELDS = {
     "HWID",
