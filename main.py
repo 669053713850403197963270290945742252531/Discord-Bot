@@ -1723,7 +1723,7 @@ async def edituser(
 
 @client.tree.command(
     name="verifydata",
-    description="Verify that the Users.json file on GitHub matches the raw version.",
+    description="Verifies the integrity of the users with the raw version.",
     guild=GUILD_ID,
 )
 @require_role(RESTRICTED_ROLE_ID)
