@@ -11,7 +11,6 @@ from discord import (
 )
 import aiohttp
 import json
-import hashlib
 from github import Github
 import os
 from dotenv import load_dotenv
@@ -25,6 +24,8 @@ import io
 import random
 import string
 import base64
+import time
+import pytz
 
 from flask import Flask
 from threading import Thread
@@ -85,6 +86,10 @@ client = Client(command_prefix="!", intents=intents)
 
 GUILD_ID = discord.Object(id=1263334150018961559)
 RESTRICTED_ROLE_ID = 1368809009456615434
+
+REPO_OWNER = "669053713850403197963270290945742252531"
+REPO_NAME = "Celestial"
+USERFILE_PATH = "Users.json"
 
 stored_script_content = None
 stored_script_filename = None
@@ -402,13 +407,10 @@ class WhitelistModal(discord.ui.Modal, title="Add Whitelisted User"):
             await interaction.response.send_message(f"❌ {e}", ephemeral=True)
             return
 
-        repo_name = "669053713850403197963270290945742252531/Celestial"
-        file_path = "Users.json"
-
         try:
             github = Github(github_token)
-            repo = github.get_repo(repo_name)
-            file = repo.get_contents(file_path)
+            repo = github.get_repo(REPO_NAME)
+            file = repo.get_contents(USERFILE_PATH)
 
             try:
                 data = json.loads(file.decoded_content.decode())
@@ -514,12 +516,9 @@ async def unwhitelist(interaction: discord.Interaction, user: discord.User):
         return
 
     try:
-        repo_name = "669053713850403197963270290945742252531/Celestial"
-        file_path = "Users.json"
-
         github = Github(github_token)
-        repo = github.get_repo(repo_name)
-        file = repo.get_contents(file_path)
+        repo = github.get_repo(REPO_NAME)
+        file = repo.get_contents(USERFILE_PATH)
 
         try:
             data = json.loads(file.decoded_content.decode())
@@ -616,12 +615,9 @@ async def view_whitelist(interaction: discord.Interaction):
         return
 
     try:
-        repo_name = "669053713850403197963270290945742252531/Celestial"
-        file_path = "Users.json"
-
         github = Github(github_token)
-        repo = github.get_repo(repo_name)
-        file = repo.get_contents(file_path)
+        repo = github.get_repo(REPO_NAME)
+        file = repo.get_contents(USERFILE_PATH)
 
         try:
             data = json.loads(file.decoded_content.decode())
@@ -746,12 +742,11 @@ async def edit_whitelist(interaction: discord.Interaction):
 
     try:
         github = Github(github_token)
-        repo = github.get_repo("669053713850403197963270290945742252531/Celestial")
-        file = repo.get_contents("Users.json")
+        file = REPO_NAME.get_contents(USERFILE_PATH)
         content = file.decoded_content.decode()
 
         await interaction.response.send_modal(
-            EditWhitelistModal(content, github, repo, "Users.json", file.sha)
+            EditWhitelistModal(content, github, REPO_NAME, "Users.json", file.sha)
         )
 
     except Exception as e:
@@ -1720,6 +1715,220 @@ async def edituser(
     except Exception as e:
         await interaction.response.send_message(
             f"❌ An error occurred: `{e}`", ephemeral=True
+        )
+
+
+# Command: verifydata
+
+
+@client.tree.command(
+    name="verifydata",
+    description="Verify that the Users.json file on GitHub matches the raw version.",
+    guild=GUILD_ID,
+)
+@require_role(RESTRICTED_ROLE_ID)
+async def verifydata(interaction: discord.Interaction):
+    await interaction.response.defer(ephemeral=True)
+
+    api_url = f"https://api.github.com/repos/{REPO_OWNER}/{REPO_NAME}/contents/{USERFILE_PATH}"
+    raw_url = f"https://raw.githubusercontent.com/{REPO_OWNER}/{REPO_NAME}/main/{USERFILE_PATH}"
+
+    headers = {
+        "Authorization": f"Bearer {os.getenv('GITHUB_TOKEN')}",
+        "Accept": "application/vnd.github.v3+json",
+    }
+
+    async with aiohttp.ClientSession() as session:
+        try:
+            # Get API version
+            async with session.get(api_url, headers=headers) as api_response:
+                if api_response.status != 200:
+                    raise Exception(f"GitHub API returned {api_response.status}")
+                api_data = await api_response.json()
+                api_content = base64.b64decode(api_data["content"]).decode("utf-8")
+                api_json = json.loads(api_content)
+
+            # Get raw version
+            async with session.get(raw_url) as raw_response:
+                if raw_response.status != 200:
+                    raise Exception(f"Raw GitHub file returned {raw_response.status}")
+                raw_content = await raw_response.text()
+                raw_json = json.loads(raw_content)
+
+            # Compare json objects
+            if api_json == raw_json:
+                embed = discord.Embed(
+                    title="✅ Sync Verified!",
+                    description=(
+                        "The `Users.json` file is exactly the same between GitHub API and the raw version.\n\n"
+                        f"🔍 **Entries Compared:** `{len(api_json)}`\n"
+                        f"🕓 **Last Checked:** <t:{int(time.time())}:R>\n"
+                        f"📁 **Repo:** [Celestial/Users.json](https://github.com/{REPO_OWNER}/{REPO_NAME}/blob/main/{USERFILE_PATH})"
+                    ),
+                    color=discord.Color.green(),
+                )
+
+            else:
+                embed = discord.Embed(
+                    title="⚠️ Data Mismatch!",
+                    description=(
+                        "The `Users.json` file from the GitHub API does **not** match the raw version.\n\n"
+                        "⚠️ This may be due to a **delay in GitHub's raw file caching**. Raw URLs usually take a few minutes to reflect recent commits."
+                    ),
+                    color=discord.Color.orange(),
+                )
+
+            await interaction.followup.send(embed=embed)
+
+        except Exception as e:
+            await interaction.followup.send(
+                f"❌ Error verifying data: `{e}`", ephemeral=True
+            )
+
+
+# Command: commitdetails
+
+
+@client.tree.command(
+    name="commitdetails",
+    description="Check the status of a specific GitHub commit by SHA.",
+    guild=GUILD_ID,
+)
+@require_role(RESTRICTED_ROLE_ID)
+@app_commands.describe(sha="The SHA hash of the commit to check.")
+async def commitdetails(interaction: discord.Interaction, sha: str):
+    await interaction.response.defer(ephemeral=True)
+
+    commit_url = f"https://api.github.com/repos/669053713850403197963270290945742252531/Celestial/commits/{sha}"
+    headers = {
+        "Authorization": f"Bearer {os.getenv('GITHUB_TOKEN')}",
+        "Accept": "application/vnd.github.v3+json",
+    }
+
+    async with aiohttp.ClientSession() as session:
+        try:
+            async with session.get(commit_url, headers=headers) as resp:
+                if resp.status != 200:
+                    error = await resp.text()
+                    return await interaction.followup.send(
+                        f"❌ Failed to fetch commit info.\nStatus: {resp.status}\nDetails: {error}",
+                        ephemeral=True,
+                    )
+
+                commit_data = await resp.json()
+
+                message = commit_data["commit"]["message"]
+                author = commit_data["commit"]["author"]["name"]
+                date = commit_data["commit"]["author"]["date"]  # Get github date
+
+                # Date > to local time zone
+                date_obj = datetime.fromisoformat(
+                    date.replace("Z", "+00:00")
+                )  # Convert from github's UTC
+                local_time = date_obj.astimezone(ZoneInfo("America/New_York"))
+
+                # 12-hour
+                formatted_time = local_time.strftime("%Y-%m-%d %I:%M:%S %p")
+
+                stats = commit_data.get("stats", {})
+                files = commit_data.get("files", [])
+
+                file_list = "\n".join(f"- {file['filename']}" for file in files)
+
+                embed = discord.Embed(
+                    title=f"Commit {sha[:7]} Status",
+                    description=message,
+                    color=discord.Color.blurple(),
+                )
+                embed.add_field(name="Author", value=author, inline=True)
+                embed.add_field(name="Date", value=formatted_time, inline=True)
+                embed.add_field(
+                    name="Stats",
+                    value=f"+{stats.get('additions', 0)} / -{stats.get('deletions', 0)}",
+                    inline=False,
+                )
+                embed.add_field(
+                    name="Files Changed", value=file_list or "None", inline=False
+                )
+
+                await interaction.followup.send(embed=embed, ephemeral=True)
+
+        except Exception as e:
+            await interaction.followup.send(f"❌ Error occurred: {e}", ephemeral=True)
+
+
+# Command: commithistory
+
+
+@client.tree.command(
+    name="commithistory",
+    description="Fetch recent commit history and SHAs for the whitelist file.",
+    guild=GUILD_ID,
+)
+@require_role(RESTRICTED_ROLE_ID)
+@app_commands.describe(limit="How many recent commits to show (1-20)")
+async def commithistory(interaction: discord.Interaction, limit: int = 5):
+    if not (1 <= limit <= 20):
+        return await interaction.response.send_message(
+            "❌ Please provide a number between 1 and 20 for the commit limit.",
+            ephemeral=True,
+        )
+
+    await interaction.response.defer(ephemeral=True)
+
+    commits_url = f"https://api.github.com/repos/{REPO_OWNER}/{REPO_NAME}/commits?path={USERFILE_PATH}&per_page={limit}"
+    headers = {"Authorization": f"Bearer {os.getenv('GITHUB_TOKEN')}"}
+
+    try:
+        async with aiohttp.ClientSession() as session:
+            async with session.get(commits_url, headers=headers) as resp:
+                if resp.status != 200:
+                    return await interaction.followup.send(
+                        f"❌ Failed to fetch commit history. Status: {resp.status}",
+                        ephemeral=True,
+                    )
+
+                commits = await resp.json()
+
+                if not commits:
+                    return await interaction.followup.send(
+                        "⚠️ No recent commits found for the whitelist file.",
+                        ephemeral=True,
+                    )
+
+                embed = discord.Embed(
+                    title=f"📜 Last {len(commits)} Commits – `Users.json`",
+                    color=discord.Color.blue(),
+                )
+
+                local_tz = pytz.timezone("US/Eastern")
+
+                for commit in commits:
+                    sha = commit.get("sha", "")
+                    message = commit["commit"]["message"]
+                    author = commit["commit"]["author"]["name"]
+                    iso_time = commit["commit"]["author"]["date"]
+
+                    # UTC > local timezone
+                    dt = datetime.strptime(iso_time, "%Y-%m-%dT%H:%M:%SZ").replace(
+                        tzinfo=timezone.utc
+                    )
+                    local_dt = dt.astimezone(local_tz)
+                    formatted_time = local_dt.strftime("%b %d, %Y at %I:%M %p %Z")
+
+                    commit_url = commit["html_url"]
+
+                    embed.add_field(
+                        name=f"{author} – {message}",
+                        value=f"🔗 [View Commit]({commit_url})\n🧾 SHA: `{sha}`\n🕒 {formatted_time}",
+                        inline=False,
+                    )
+
+                await interaction.followup.send(embed=embed, ephemeral=True)
+
+    except Exception as e:
+        await interaction.followup.send(
+            f"❌ Error fetching commits: {e}", ephemeral=True
         )
 
 
