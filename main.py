@@ -1932,6 +1932,90 @@ async def commithistory(interaction: discord.Interaction, limit: int = 5):
         )
 
 
+# Command: giveaccess
+
+
+BOT_ACCESS_ROLE_ID = 1368809009456615434
+
+
+@client.tree.command(
+    name="giveaccess",
+    description="Grants or revokes bot access to a user.",
+    guild=GUILD_ID,
+)
+@app_commands.describe(
+    user="Mention the user to modify access for",
+    state="Grant or revoke access",
+    notify="Whether to notify the user about the change (default: No)",
+)
+@app_commands.choices(
+    state=[
+        app_commands.Choice(name="true", value="true"),
+        app_commands.Choice(name="false", value="false"),
+    ],
+    notify=[
+        app_commands.Choice(name="Yes", value="true"),
+        app_commands.Choice(name="No", value="false"),
+    ],
+)
+@require_role(RESTRICTED_ROLE_ID)
+async def giveaccess(
+    interaction: discord.Interaction,
+    user: discord.Member,
+    state: app_commands.Choice[str],
+    notify: app_commands.Choice[str] = None,
+):
+    role = interaction.guild.get_role(1368809009456615434)
+    if not role:
+        await interaction.response.send_message(
+            "❌ Bot Access role not found.", ephemeral=True
+        )
+        return
+
+    notify_user = notify is not None and notify.value == "true"
+
+    try:
+        if state.value == "true":
+            if role in user.roles:
+                await interaction.response.send_message(
+                    f"⚠️ {user.mention} already has access.", ephemeral=True
+                )
+                return
+
+            await user.add_roles(role)
+            await interaction.response.send_message(
+                f"✅ Granted access to {user.mention}.", ephemeral=True
+            )
+            if notify_user:
+                try:
+                    await user.send("✅ You've been granted access to the bot.")
+                except discord.Forbidden:
+                    pass
+
+        else:  # state == "false"
+            if role not in user.roles:
+                await interaction.response.send_message(
+                    f"⚠️ {user.mention} does not currently have access.", ephemeral=True
+                )
+                return
+
+            await user.remove_roles(role)
+            await interaction.response.send_message(
+                f"🚫 Removed access from {user.mention}.", ephemeral=True
+            )
+            if notify_user:
+                try:
+                    await user.send("🚫 Your access to the bot has been revoked.")
+                except discord.Forbidden:
+                    pass
+
+    except discord.Forbidden:
+        await interaction.response.send_message(
+            "❌ I don't have permission to modify that user's roles. Check my permissions and role order.",
+            ephemeral=True,
+        )
+
+
 # Establish bot connection
 
 
