@@ -203,18 +203,22 @@ def is_valid_date(d: str) -> bool:
     except:
         return False
     
-def get_db():
-    db_password = os.getenv("SUPABASE_PASSWORD")
-    if not db_password:
-        raise ValueError("Please set the SUPABASE_PASSWORD environment variable")
-
-    db_user = "postgres"
-    db_host = "db.mpstvnkoxzxtacizodto.supabase.co"
-    db_port = 5432
-    db_name = "postgres"
-
-    DATABASE_URL = f"postgresql://{db_user}:{db_password}@{db_host}:{db_port}/{db_name}?sslmode=require"
-    return psycopg2.connect(DATABASE_URL, cursor_factory=RealDictCursor)
+def get_db(dict_cursor=False):
+    try:
+        cursor_factory = psycopg2.extras.RealDictCursor if dict_cursor else None
+        conn = psycopg2.connect(
+            host=os.getenv("DB_HOST"),        # db.xxxxxx.supabase.co
+            dbname=os.getenv("DB_NAME"),
+            user=os.getenv("DB_USER"),
+            password=os.getenv("DB_PASSWORD"),
+            port=5432,
+            sslmode="require",
+            cursor_factory=cursor_factory
+        )
+        return conn
+    except Exception as e:
+        print(f"Database connection failed: {e}")
+        raise
 
 # --- Commands ---
 
@@ -586,7 +590,7 @@ async def myinfo(interaction: discord.Interaction):
     discord_id = interaction.user.id
 
     try:
-        conn = get_db()
+        conn = get_db(dict_cursor=True)
         cur = conn.cursor()
 
         # Postgres uses %s placeholders, not ?
@@ -656,7 +660,7 @@ async def whitelist(interaction: discord.Interaction, identifier: str, rank: str
     key = generate_key()
 
     try:
-        conn = get_db()
+        conn = get_db(dict_cursor=True)
         cur = conn.cursor()
 
         # Check for duplicate DiscordId or Identifier
@@ -695,7 +699,7 @@ async def unwhitelist(interaction: discord.Interaction, user: discord.User):
     await interaction.response.defer(ephemeral=True)
 
     try:
-        conn = get_db()
+        conn = get_db(dict_cursor=True)
         cur = conn.cursor()
 
         cur.execute('DELETE FROM "Users" WHERE "DiscordId" = %s;', (str(user.id),))
@@ -731,7 +735,7 @@ class EditWhitelistModal(Modal):
             return
 
         try:
-            conn = get_db()
+            conn = get_db(dict_cursor=True)
             cur = conn.cursor()
 
             # Clear old data
@@ -769,7 +773,7 @@ class EditWhitelistModal(Modal):
 @is_in_guild(GUILD_ID)
 async def editwhitelist(interaction: discord.Interaction):
     try:
-        conn = get_db()
+        conn = get_db(dict_cursor=True)
         cur = conn.cursor(cursor_factory=RealDictCursor)
 
         cur.execute('SELECT "HWID", "Identifier", "Rank", "JoinDate", "DiscordId", "Key", "Notes" FROM "Users";')
@@ -832,7 +836,7 @@ async def edituser(interaction: discord.Interaction, user: discord.User, field: 
         return
 
     try:
-        conn = get_db()
+        conn = get_db(dict_cursor=True)
         cur = conn.cursor(cursor_factory=RealDictCursor)
 
         # User existence check
@@ -892,7 +896,7 @@ async def export(interaction: discord.Interaction, format: app_commands.Choice[s
     await interaction.response.defer(ephemeral=True)
 
     try:
-        conn = get_db()
+        conn = get_db(dict_cursor=True)
         cur = conn.cursor(cursor_factory=RealDictCursor)
         cur.execute('SELECT * FROM "Users";')
         rows = cur.fetchall()
@@ -940,7 +944,7 @@ async def validatekey(interaction: discord.Interaction, key: str):
     await interaction.response.defer(ephemeral=True)
 
     try:
-        conn = get_db()
+        conn = get_db(dict_cursor=True)
         cur = conn.cursor()
         cur.execute('SELECT * FROM "Users" WHERE "Key" = %s', (key,))
         entry = cur.fetchone()
@@ -990,7 +994,7 @@ async def validatekey(interaction: discord.Interaction, key: str):
 @has_role(REQUIRED_ROLE_ID)
 @is_in_guild(GUILD_ID)
 async def fetchuser(interaction: discord.Interaction, user: discord.User):
-    conn = get_db()
+    conn = get_db(dict_cursor=True)
     cur = conn.cursor()
     cur.execute('SELECT "HWID", "Identifier", "Rank", "JoinDate", "DiscordId", "Key", "Notes" FROM "Users" WHERE "DiscordId" = %s', (str(user.id),))
     row = cur.fetchone()
@@ -1042,7 +1046,7 @@ async def fetchdupes(interaction: discord.Interaction, field: app_commands.Choic
     field_name = field.value
 
     try:
-        conn = get_db()
+        conn = get_db(dict_cursor=True)
         cur = conn.cursor()
 
         fields = ["HWID", "Identifier", "Rank", "DiscordId", "Key"]
@@ -1143,7 +1147,7 @@ class EditUserModal(Modal):
         self.user_data["Notes"] = self.notes.value or "false"
 
         try:
-            conn = get_db()
+            conn = get_db(dict_cursor=True)
             cursor = conn.cursor()
 
             cursor.execute("""
@@ -1216,7 +1220,7 @@ class WhitelistView(ui.View):
         discord_id = user_to_delete.get("DiscordId")
 
         try:
-            conn = get_db()
+            conn = get_db(dict_cursor=True)
             cursor = conn.cursor()
             cursor.execute('DELETE FROM "Users" WHERE "DiscordId" = %s', (int(discord_id),))
             conn.commit()
@@ -1283,7 +1287,7 @@ async def viewwhitelist(interaction: discord.Interaction):
     await interaction.response.defer(ephemeral=True)
 
     try:
-        conn = get_db()
+        conn = get_db(dict_cursor=True)
         cursor = conn.cursor()
         cursor.execute('SELECT * FROM "Users"')
         rows = cursor.fetchall()
@@ -1312,7 +1316,7 @@ async def register(interaction: discord.Interaction, identifier: str):
     discord_id = interaction.user.id
 
     try:
-        conn = get_db()
+        conn = get_db(dict_cursor=True)
         cur = conn.cursor()
 
         # Check if already registered in Registrations database
@@ -1383,7 +1387,7 @@ async def checkregistration(interaction: discord.Interaction, user: discord.User
     discord_id = user.id
 
     try:
-        conn = get_db()
+        conn = get_db(dict_cursor=True)
         cur = conn.cursor()
 
         # Check whitelist db
@@ -1452,7 +1456,7 @@ async def clearregistrations(interaction: discord.Interaction):
         return
 
     try:
-        conn = get_db()
+        conn = get_db(dict_cursor=True)
         cur = conn.cursor()
         cur.execute('DELETE FROM "Registrations"')
         conn.commit()
@@ -1474,7 +1478,7 @@ async def delregistration(interaction: discord.Interaction, user: discord.User):
     discord_id = user.id
 
     try:
-        conn = get_db()
+        conn = get_db(dict_cursor=True)
         cur = conn.cursor()
 
         # Check if registration exists
@@ -1652,7 +1656,7 @@ async def upload(interaction: discord.Interaction, file: discord.Attachment):
         return await interaction.followup.send(f"Failed to parse file: {e}", ephemeral=True)
 
     try:
-        conn = get_db()
+        conn = get_db(dict_cursor=True)
         cur = conn.cursor()
 
         # Clear current database
@@ -1753,7 +1757,7 @@ async def remove_temp_access_after(user: discord.Member, role: discord.Role, min
 async def dbsearch(interaction: discord.Interaction, query: str):
     await interaction.response.defer(ephemeral=True)
 
-    conn = get_db()
+    conn = get_db(dict_cursor=True)
     cur = conn.cursor()
 
     # Fetch all users
@@ -1799,7 +1803,7 @@ async def tempwhitelist(interaction: discord.Interaction, user: discord.User, mi
 
     # Insert into the database
     try:
-        conn = get_db()
+        conn = get_db(dict_cursor=True)
         cur = conn.cursor()
 
         # Check if user already in DB whitelist (full check is recommended in your real logic)
@@ -1854,7 +1858,7 @@ async def tempwhitelist(interaction: discord.Interaction, user: discord.User, mi
 
             # Remove from DB
             try:
-                conn = get_db()
+                conn = get_db(dict_cursor=True)
                 cur = conn.cursor()
                 cur.execute('DELETE FROM "Users" WHERE "DiscordId" = %s AND "Rank" = %s', (discord_id, "Temp"))
                 conn.commit()
@@ -1886,7 +1890,7 @@ async def clearnotes(interaction: discord.Interaction, user: discord.User):
     discord_id = str(user.id)
 
     try:
-        conn = get_db()
+        conn = get_db(dict_cursor=True)
         cur = conn.cursor()
         cur.execute('UPDATE "Users" SET "Notes" = NULL WHERE "DiscordId" = %s', (discord_id,))
         conn.commit()
