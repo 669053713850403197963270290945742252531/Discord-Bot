@@ -213,7 +213,7 @@ def get_db():
     db_port = 5432
     db_name = "postgres"
 
-    DATABASE_URL = f"postgresql://{db_user}:{db_password}@{db_host}:{db_port}/{db_name}"
+    DATABASE_URL = f"postgresql://{db_user}:{db_password}@{db_host}:{db_port}/{db_name}?sslmode=require"
     return psycopg2.connect(DATABASE_URL, cursor_factory=RealDictCursor)
 
 # --- Commands ---
@@ -989,7 +989,7 @@ async def validatekey(interaction: discord.Interaction, key: str):
 @app_commands.describe(user="The user to look up")
 @has_role(REQUIRED_ROLE_ID)
 @is_in_guild(GUILD_ID)
-async def fetchinfo(interaction: discord.Interaction, user: discord.User):
+async def fetchuser(interaction: discord.Interaction, user: discord.User):
     conn = get_db()
     cur = conn.cursor()
     cur.execute('SELECT "HWID", "Identifier", "Rank", "JoinDate", "DiscordId", "Key", "Notes" FROM "Users" WHERE "DiscordId" = %s', (str(user.id),))
