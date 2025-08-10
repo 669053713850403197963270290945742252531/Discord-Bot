@@ -2,5 +2,3 @@ discord.py==2.4.0
 aiohttp==3.10.5
 Flask==3.0.3
 python-dotenv==1.0.1
-supabase==2.5.1
-psycopg2-binary==2.9.9
