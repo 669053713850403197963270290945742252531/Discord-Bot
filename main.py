@@ -25,6 +25,11 @@ import io
 import subprocess
 import hashlib
 from collections import defaultdict
+import sqlite3
+import csv
+import psycopg2
+from psycopg2.extras import RealDictCursor
+from psycopg2 import sql
 
 # // Constants //
 
@@ -60,9 +65,13 @@ intents.message_content = True
 intents.reactions = True
 intents.members = True
 
+conn = sqlite3.connect("users.db")
+cursor = conn.cursor()
+
 class Client(commands.Bot):
     async def on_ready(self):
         print(f"Logged in as {self.user} ({self.user.id})")
+        await bot.change_presence(activity=discord.Activity(type=discord.ActivityType.watching, name="database"))
         try:
             guild_obj = discord.Object(id=GUILD_ID)
             synced = await self.tree.sync(guild=guild_obj)
@@ -193,6 +202,19 @@ def is_valid_date(d: str) -> bool:
         return True
     except:
         return False
+    
+def get_db():
+    db_password = os.getenv("SUPABASE_PASSWORD")
+    if not db_password:
+        raise ValueError("Please set the SUPABASE_PASSWORD environment variable")
+
+    db_user = "postgres"
+    db_host = "db.mpstvnkoxzxtacizodto.supabase.co"
+    db_port = 5432
+    db_name = "postgres"
+
+    DATABASE_URL = f"postgresql://{db_user}:{db_password}@{db_host}:{db_port}/{db_name}"
+    return psycopg2.connect(DATABASE_URL, cursor_factory=RealDictCursor)
 
 # --- Commands ---
 
@@ -561,222 +583,129 @@ async def dm(interaction: discord.Interaction, target: discord.User, message: st
 async def myinfo(interaction: discord.Interaction):
     await interaction.response.defer(ephemeral=True)
 
-    async with aiohttp.ClientSession() as session:
-        try:
-            async with session.get(GITHUB_FILE_URL, headers=headers) as resp:
-                if resp.status != 200:
-                    await interaction.followup.send(f"Failed to fetch user data. (HTTP {resp.status})", ephemeral=True)
-                    return
-                text = await resp.text()
-                users = json.loads(text)
-        except Exception as e:
-            await interaction.followup.send(f"Error fetching whitelist data: {e}", ephemeral=True)
-            return
+    discord_id = interaction.user.id
 
-    discord_id = str(interaction.user.id)
-    user_data: Optional[dict] = next((entry for entry in users if entry.get("DiscordId") == discord_id), None)
+    try:
+        conn = get_db()
+        cur = conn.cursor()
 
-    if not user_data:
+        # Postgres uses %s placeholders, not ?
+        cur.execute(
+            'SELECT "Identifier", "Rank", "JoinDate", "HWID", "Key", "Notes" '
+            'FROM "Users" WHERE "DiscordId" = %s;',
+            (discord_id,)
+        )
+        row = cur.fetchone()
+        conn.close()
+
+    except Exception as e:
+        await interaction.followup.send(f"Database error: `{e}`", ephemeral=True)
+        return
+
+    if not row:
         await interaction.followup.send("You were not found in the user database.", ephemeral=True)
         return
 
-    embed = discord.Embed(title=f"User Info: {interaction.user}", color=discord.Color.blue())
+    # Extract values with .get() for safety
+    identifier = row.get("Identifier")
+    rank = row.get("Rank")
+    join_date_raw = row.get("JoinDate")
+    hwid = row.get("HWID")
+    key = row.get("Key")
+    notes = row.get("Notes")
+
+    embed = discord.Embed(
+        title=f"User Info: {interaction.user}",
+        color=discord.Color.blue()
+    )
     embed.set_thumbnail(url=interaction.user.display_avatar.url)
 
-    # Parse join date string into timestamp
+    # Convert join date to Discord timestamp if possible
+    join_date_value = "N/A"
+    if join_date_raw:
+        try:
+            if isinstance(join_date_raw, datetime):
+                join_timestamp = int(join_date_raw.timestamp())
+            else:
+                join_timestamp = int(datetime.strptime(join_date_raw, "%Y-%m-%d").timestamp())
+            join_date_value = f"<t:{join_timestamp}:D>"
+        except Exception:
+            join_date_value = str(join_date_raw)
 
-    join_date_raw = user_data.get("JoinDate")
-    try:
-        join_date_obj = datetime.strptime(join_date_raw, "%Y-%m-%d")
-        join_timestamp = int(join_date_obj.timestamp())
-        join_date_value = f"<t:{join_timestamp}:D>"
-    except Exception:
-        join_date_value = join_date_raw or "N/A"
-
-    # Add fields
-    embed.add_field(name="Identifier", value=user_data.get("Identifier", "N/A"), inline=True)
-    embed.add_field(name="Rank", value=user_data.get("Rank", "N/A"), inline=True)
+    embed.add_field(name="Identifier", value=identifier or "N/A", inline=True)
+    embed.add_field(name="Rank", value=rank or "N/A", inline=True)
     embed.add_field(name="Join Date", value=join_date_value, inline=True)
-    embed.add_field(name="HWID", value=f"||{user_data.get('HWID', 'N/A')}||", inline=True)
-    embed.add_field(name="Key", value=f"||{user_data.get('Key', 'N/A')}||", inline=True)
+    embed.add_field(name="HWID", value=f"||{hwid or 'N/A'}||", inline=True)
+    embed.add_field(name="Key", value=f"||{key or 'N/A'}||", inline=True)
 
-    # Only add Notes if it's not the string "false"
-    notes = user_data.get("Notes")
     if notes and notes.lower() != "false":
         embed.add_field(name="Notes", value=notes, inline=True)
 
     await interaction.followup.send(embed=embed, ephemeral=True)
 
-# // verifydata
-
-@bot.tree.command(name="verifydata", description="Validates if the raw database file matches the real database file.", guild=discord.Object(id=GUILD_ID))
-@has_role(REQUIRED_ROLE_ID)
-@is_in_guild(GUILD_ID)
-async def verifydata(interaction: discord.Interaction):
-    await interaction.response.defer(ephemeral=True)
-
-    try:
-        async with aiohttp.ClientSession() as session:
-            # Fetch raw file
-
-            async with session.get(RAW_URL, headers=headers) as raw_resp:
-                if raw_resp.status != 200:
-                    await interaction.followup.send(f"Failed to fetch raw file. HTTP {raw_resp.status}", ephemeral=True)
-                    return
-                raw_content = await raw_resp.text()
-
-            # Fetch real repo file
-
-            async with session.get(API_URL, headers=headers) as api_resp:
-                if api_resp.status != 200:
-                    await interaction.followup.send(f"Failed to fetch real database. HTTP {api_resp.status}", ephemeral=True)
-                    return
-                api_data = await api_resp.json()
-                encoded_content = api_data.get("content", "")
-                real_content = base64.b64decode(encoded_content).decode("utf-8")
-
-        # Comparison
-
-        if raw_content.strip() == real_content.strip():
-            embed = discord.Embed(title="Database Integrity Verified", description="The raw database matches the real database exactly.", color=discord.Color.green())
-        else:
-            embed = discord.Embed(
-                title="Database Integrity Mismatch",
-                description="The raw database does **not** match the real database.\nPossible causes:\n- CDN caching\n- Unauthorized edits\n- Commit mismatch (API Limitations)",
-                color=discord.Color.red()
-            )
-
-        await interaction.followup.send(embed=embed, ephemeral=True)
-    except Exception as e:
-        await interaction.followup.send(f"Error: {e}", ephemeral=True)
-
 # // whitelist //
 
-@bot.tree.command(name="whitelist", description="Adds a user to the database.", guild=discord.Object(id=GUILD_ID))
-@app_commands.describe(hwid="Pre-hashed HWID in SHA-256", identifier="Username or alias", rank="User rank", discord_id="Discord ID of the user", notes="Notes to keep reminders about this user")
+@bot.tree.command(name="whitelist", description="Adds a user to whitelist.", guild=discord.Object(id=GUILD_ID))
+@app_commands.describe(identifier="User Identifier", rank="User Rank", hwid="User HWID", discord_id="Discord ID of the user", notes="Optional notes about the user")
 @has_role(REQUIRED_ROLE_ID)
 @is_in_guild(GUILD_ID)
-async def whitelist(interaction: discord.Interaction, hwid: str, identifier: str, rank: str, discord_id: str, notes: str = "false"):
+async def whitelist(interaction: discord.Interaction, identifier: str, rank: str, hwid: str, discord_id: str, notes: str = None):
     await interaction.response.defer(ephemeral=True)
 
-    # Checks
+    join_date = datetime.now(timezone.utc).strftime("%Y-%m-%d")
+    key = generate_key()
 
-    if not is_valid_hwid(hwid):
-        return await interaction.followup.send("Invalid HWID format. Must be 64 hex characters (SHA-256).", ephemeral=True)
+    try:
+        conn = get_db()
+        cur = conn.cursor()
 
-    if not is_valid_discord_id(discord_id):
-        return await interaction.followup.send("Invalid Discord ID.", ephemeral=True)
+        # Check for duplicate DiscordId or Identifier
 
-    if notes != "false" and not notes.strip():
-        return await interaction.followup.send("Notes must be 'false' or a non-empty string.", ephemeral=True)
-    
-    generated_key = generate_key()
+        cur.execute(
+            'SELECT 1 FROM "Users" WHERE "DiscordId" = %s OR "Identifier" = %s;',
+            (discord_id, identifier)
+        )
+        if cur.fetchone():
+            await interaction.followup.send("User with that Discord ID or Identifier already exists in whitelist.", ephemeral=True)
+            conn.close()
+            return
 
-    async with aiohttp.ClientSession() as session:
-        try:
-            # Fetch current users via github
+        # Insert new entry
 
-            async with session.get(API_URL, headers=headers) as get_resp:
-                if get_resp.status != 200:
-                    return await interaction.followup.send(f"Failed to fetch current user data: HTTP {get_resp.status}", ephemeral=True)
-                data = await get_resp.json()
-                content_b64 = data["content"]
-                sha = data["sha"]
-                existing = json.loads(base64.b64decode(content_b64).decode("utf-8"))
+        cur.execute(
+            'INSERT INTO "Users" ("Identifier", "Rank", "JoinDate", "HWID", "DiscordId", "Key", "Notes") '
+            'VALUES (%s, %s, %s, %s, %s, %s, %s);',
+            (identifier, rank, join_date, hwid, discord_id, key, notes or "")
+        )
+        conn.commit()
+        conn.close()
 
-            today = datetime.now(timezone.utc).date().isoformat()
-            new_entry = {
-                "HWID": hwid,
-                "Identifier": identifier,
-                "Rank": rank,
-                "JoinDate": today,
-                "DiscordId": discord_id,
-                "Key": generated_key,
-                "Notes": notes
-            }
+        await interaction.followup.send(f"✅ **{identifier}** whitelisted as **{rank}** with key ||{key}||.", ephemeral=True)
 
-            existing.append(new_entry)
-
-            updated_content = json.dumps(existing, indent=4)
-            updated_b64 = base64.b64encode(updated_content.encode()).decode("utf-8")
-
-            commit_payload = {
-                "message": f"Whitelist user: {identifier} ({discord_id})",
-                "content": updated_b64,
-                "branch": BRANCH,
-                "sha": sha
-            }
-
-            async with session.put(API_URL, headers=headers, json=commit_payload) as put_resp:
-                if put_resp.status != 200:
-                    err = await put_resp.text()
-                    return await interaction.followup.send(f"Failed to commit changes: HTTP {put_resp.status}\n{err}", ephemeral=True)
-
-        except Exception as e:
-            return await interaction.followup.send(f"Error: {e}", ephemeral=True)
-
-    await interaction.followup.send(
-        f"✅ **{identifier}** has been whitelisted.\n"
-        f"HWID: ||`{hwid}`||",
-        ephemeral=True
-    )
+    except Exception as e:
+        await interaction.followup.send(f"Database error: `{e}`", ephemeral=True)
 
 # // unwhitelist //
 
 @bot.tree.command(name="unwhitelist", description="Removes a user from the database.", guild=discord.Object(id=GUILD_ID))
-@app_commands.describe(discord_id="Discord ID of the user to remove from the database.")
+@app_commands.describe(user="User to remove")
 @has_role(REQUIRED_ROLE_ID)
 @is_in_guild(GUILD_ID)
-async def unwhitelist(interaction: discord.Interaction, discord_id: str):
+async def unwhitelist(interaction: discord.Interaction, user: discord.User):
     await interaction.response.defer(ephemeral=True)
 
-    async with aiohttp.ClientSession() as session:
-        try:
-            # Fetch current users via github
-            async with session.get(API_URL, headers=headers) as get_resp:
-                if get_resp.status != 200:
-                    return await interaction.followup.send(f"Failed to fetch current data: HTTP {get_resp.status}", ephemeral=True)
-                data = await get_resp.json()
-                content_b64 = data["content"]
-                sha = data["sha"]
-                existing = json.loads(base64.b64decode(content_b64).decode("utf-8"))
+    try:
+        conn = get_db()
+        cur = conn.cursor()
 
-            # Filter out entries matching the discord_id
-            filtered = [entry for entry in existing if entry.get("DiscordId") != discord_id]
+        cur.execute('DELETE FROM "Users" WHERE "DiscordId" = %s;', (str(user.id),))
+        conn.commit()
+        conn.close()
 
-            if len(filtered) == len(existing):
-                # Attempt to fetch user and get their mention
+        await interaction.followup.send(f"Removed whitelist entry for {user.mention}.", ephemeral=True)
 
-                user = None
-                try:
-                    user = await bot.fetch_user(int(discord_id))
-                except Exception:
-                    pass
-
-                mention = user.mention if user else f"<@{discord_id}>"
-                return await interaction.followup.send(f"{mention} was not found in database.", ephemeral=True)
-
-            # Convert back to json string & base64 encode
-            updated_content = json.dumps(filtered, indent=4)
-            updated_b64 = base64.b64encode(updated_content.encode()).decode("utf-8")
-
-            # Commit updated content back to github
-            commit_payload = {
-                "message": f"Unwhitelist user: {discord_id}",
-                "content": updated_b64,
-                "branch": BRANCH,
-                "sha": sha
-            }
-
-            async with session.put(API_URL, headers=headers, json=commit_payload) as put_resp:
-                if put_resp.status != 200:
-                    err = await put_resp.text()
-                    return await interaction.followup.send(f"Failed to commit changes: HTTP {put_resp.status}\n{err}", ephemeral=True)
-
-        except Exception as e:
-            return await interaction.followup.send(f"Error: {e}", ephemeral=True)
-
-    await interaction.followup.send(f"User with Discord ID `{discord_id}` has been removed from the whitelist.", ephemeral=True)
+    except Exception as e:
+        await interaction.followup.send(f"Database error: `{e}`", ephemeral=True)
 
 # // editwhitelist //
 
@@ -788,7 +717,7 @@ class EditWhitelistModal(Modal):
             label="Whitelist JSON",
             style=discord.TextStyle.paragraph,
             default=initial_json,
-            max_length=1900  # Discord limit = 2000 chars for modal inputs
+            max_length=1900
         )
         self.add_item(self.json_input)
 
@@ -801,58 +730,73 @@ class EditWhitelistModal(Modal):
             await interaction.response.send_message(f"Invalid JSON: {e}", ephemeral=True)
             return
 
-        # Prepare commit
+        try:
+            conn = get_db()
+            cur = conn.cursor()
 
-        async with aiohttp.ClientSession() as session:
-            try:
-                # Fetch latest sha again to avoid race conditions
-                async with session.get(API_URL, headers=headers) as get_resp:
-                    if get_resp.status != 200:
-                        await interaction.response.send_message(f"Failed to fetch latest data: HTTP {get_resp.status}", ephemeral=True)
-                        return
-                    data = await get_resp.json()
-                    sha = data["sha"]
+            # Clear old data
+            cur.execute('DELETE FROM "Users";')
 
-                updated_b64 = base64.b64encode(new_content.encode()).decode("utf-8")
-                commit_payload = {
-                    "message": f"Edit whitelist by {interaction.user}",
-                    "content": updated_b64,
-                    "branch": BRANCH,
-                    "sha": sha
-                }
+            # Insert new data
 
-                async with session.put(API_URL, headers=headers, json=commit_payload) as put_resp:
-                    if put_resp.status != 200:
-                        err = await put_resp.text()
-                        await interaction.response.send_message(f"Failed to commit changes: HTTP {put_resp.status}\n{err}", ephemeral=True)
-                        return
+            for entry in parsed:
+                cur.execute(
+                    '''
+                    INSERT INTO "Users" ("HWID", "Identifier", "Rank", "JoinDate", "DiscordId", "Key", "Notes")
+                    VALUES (%s, %s, %s, %s, %s, %s, %s);
+                    ''',
+                    (
+                        entry.get("HWID"),
+                        entry.get("Identifier"),
+                        entry.get("Rank"),
+                        entry.get("JoinDate"),
+                        int(entry["DiscordId"]) if entry.get("DiscordId") else None,
+                        entry.get("Key"),
+                        entry.get("Notes")
+                    )
+                )
 
-            except Exception as e:
-                await interaction.response.send_message(f"Error: {e}", ephemeral=True)
-                return
+            conn.commit()
+            conn.close()
 
-        await interaction.response.send_message("Whitelist updated successfully.", ephemeral=True)
+            await interaction.response.send_message("✅ Whitelist updated successfully.", ephemeral=True)
 
+        except Exception as e:
+            await interaction.response.send_message(f"Database error: {e}", ephemeral=True)
 
 @bot.tree.command(name="editwhitelist", description="Edits the database JSON directly.", guild=discord.Object(id=GUILD_ID))
 @has_role(REQUIRED_ROLE_ID)
 @is_in_guild(GUILD_ID)
 async def editwhitelist(interaction: discord.Interaction):
-    async with aiohttp.ClientSession() as session:
-        try:
-            async with session.get(API_URL, headers=headers) as get_resp:
-                if get_resp.status != 200:
-                    await interaction.response.send_message(f"Failed to fetch whitelist: HTTP {get_resp.status}", ephemeral=True)
-                    return
-                data = await get_resp.json()
-                content_b64 = data["content"]
-                decoded = base64.b64decode(content_b64).decode("utf-8")
+    try:
+        conn = get_db()
+        cur = conn.cursor(cursor_factory=RealDictCursor)
 
-        except Exception as e:
-            await interaction.response.send_message(f"Error fetching whitelist: {e}", ephemeral=True)
-            return
+        cur.execute('SELECT "HWID", "Identifier", "Rank", "JoinDate", "DiscordId", "Key", "Notes" FROM "Users";')
+        rows = cur.fetchall()
+        conn.close()
 
-    modal = EditWhitelistModal(decoded)
+        # Convert to list of dicts as RealDictCursor already gives dicts
+        
+        users_list = []
+        for r in rows:
+            users_list.append({
+                "HWID": r["HWID"],
+                "Identifier": r["Identifier"],
+                "Rank": r["Rank"],
+                "JoinDate": r["JoinDate"],
+                "DiscordId": str(r["DiscordId"]) if r["DiscordId"] is not None else None,
+                "Key": r["Key"],
+                "Notes": r["Notes"]
+            })
+
+        json_str = json.dumps(users_list, indent=4)
+
+    except Exception as e:
+        await interaction.response.send_message(f"Error fetching database: {e}", ephemeral=True)
+        return
+
+    modal = EditWhitelistModal(json_str)
     await interaction.response.send_modal(modal)
 
 # // edituser //
@@ -870,12 +814,13 @@ async def editwhitelist(interaction: discord.Interaction):
 ])
 @has_role(REQUIRED_ROLE_ID)
 @is_in_guild(GUILD_ID)
-async def edituser(interaction: discord.Interaction, user: discord.Member, field: app_commands.Choice[str], value: str):
+async def edituser(interaction: discord.Interaction, user: discord.User, field: app_commands.Choice[str], value: str):
     await interaction.response.defer(ephemeral=True)
 
     field_name = field.value
 
-    # Input checks per field
+    # Checks
+
     if field_name == "HWID" and not is_valid_hwid(value):
         await interaction.followup.send("Invalid HWID format. Must be 64 hex characters and in SHA-256.", ephemeral=True)
         return
@@ -886,52 +831,38 @@ async def edituser(interaction: discord.Interaction, user: discord.Member, field
         await interaction.followup.send("Invalid Discord ID format.", ephemeral=True)
         return
 
-    async with aiohttp.ClientSession() as session:
-        try:
-            # Fetch current data
+    try:
+        conn = get_db()
+        cur = conn.cursor(cursor_factory=RealDictCursor)
 
-            async with session.get(API_URL, headers=headers) as get_resp:
-                if get_resp.status != 200:
-                    await interaction.followup.send(f"Failed to fetch data: HTTP {get_resp.status}", ephemeral=True)
-                    return
-                data = await get_resp.json()
-                content_b64 = data["content"]
-                sha = data["sha"]
-                users = json.loads(base64.b64decode(content_b64).decode("utf-8"))
+        # User existence check
 
-            discord_id_str = str(user.id)
-            # Find user entry
-            user_entry = next((u for u in users if u.get("DiscordId") == discord_id_str), None)
-            if not user_entry:
-                await interaction.followup.send(f"User {user.mention} not found in whitelist.", ephemeral=True)
-                return
-
-            # Update the field
-            user_entry[field_name] = value
-
-            # Prepare new content
-
-            updated_content = json.dumps(users, indent=4)
-            updated_b64 = base64.b64encode(updated_content.encode()).decode("utf-8")
-
-            commit_payload = {
-                "message": f"Edit whitelist user {user} - set {field_name} to {value}",
-                "content": updated_b64,
-                "branch": BRANCH,
-                "sha": sha
-            }
-
-            async with session.put(API_URL, headers=headers, json=commit_payload) as put_resp:
-                if put_resp.status != 200:
-                    err = await put_resp.text()
-                    await interaction.followup.send(f"Failed to commit changes: HTTP {put_resp.status}\n{err}", ephemeral=True)
-                    return
-
-        except Exception as e:
-            await interaction.followup.send(f"Error: {e}", ephemeral=True)
+        cur.execute('SELECT * FROM "Users" WHERE "DiscordId" = %s;', (user.id,))
+        row = cur.fetchone()
+        if not row:
+            await interaction.followup.send(
+                f"User {user.mention} not found in whitelist.",
+                ephemeral=True
+            )
+            conn.close()
             return
 
-    await interaction.followup.send(f"Updated {field_name} for {user.mention} to:\n```{value}```", ephemeral=True)
+        # DiscordId > integer if said field is updating
+        if field_name == "DiscordId":
+            value = int(value)
+
+        cur.execute(
+            f'UPDATE "Users" SET "{field_name}" = %s WHERE "DiscordId" = %s;',
+            (value, user.id)
+        )
+        conn.commit()
+        conn.close()
+
+    except Exception as e:
+        await interaction.followup.send(f"Database error: {e}", ephemeral=True)
+        return
+
+    await interaction.followup.send(f"✅ Updated `{field_name}` for {user.mention} to:\n```{value}```", ephemeral=True)
 
 # // genkey //
 
@@ -950,26 +881,54 @@ async def genkey(interaction: discord.Interaction):
 # // export //
 
 @bot.tree.command(name="export", description="Export the current database.", guild=discord.Object(id=GUILD_ID))
+@app_commands.describe(format="Choose the export format")
+@app_commands.choices(format=[
+    app_commands.Choice(name="CSV", value="csv"),
+    app_commands.Choice(name="JSON", value="json")
+])
 @has_role(REQUIRED_ROLE_ID)
 @is_in_guild(GUILD_ID)
-async def export(interaction: discord.Interaction):
+async def export(interaction: discord.Interaction, format: app_commands.Choice[str]):
     await interaction.response.defer(ephemeral=True)
 
-    async with aiohttp.ClientSession() as session:
+    try:
+        conn = get_db()
+        cur = conn.cursor(cursor_factory=RealDictCursor)
+        cur.execute('SELECT * FROM "Users";')
+        rows = cur.fetchall()
+        conn.close()
+
+        if not rows:
+            await interaction.followup.send("No data found in the database.", ephemeral=True)
+            return
+
+        # Get column names from first row's keys
+        columns = list(rows[0].keys())
+
+    except Exception as e:
+        await interaction.followup.send(f"Failed to read database: {e}", ephemeral=True)
+        return
+
+    if format.value == "csv":
         try:
-            async with session.get(API_URL, headers=headers) as get_resp:
-                if get_resp.status != 200:
-                    return await interaction.followup.send(f"Failed to fetch database. (HTTP {get_resp.status})", ephemeral=True)
+            output = io.StringIO()
+            writer = csv.DictWriter(output, fieldnames=columns)
+            writer.writeheader()
+            writer.writerows(rows)
+            output.seek(0)
 
-                data = await get_resp.json()
-                content_b64 = data["content"]
-                file_bytes = base64.b64decode(content_b64)
+            file = discord.File(io.BytesIO(output.getvalue().encode()), filename="users.csv")
+            await interaction.followup.send("Here is the exported CSV file:", file=file, ephemeral=True)
         except Exception as e:
-            return await interaction.followup.send(f"Error fetching: {e}", ephemeral=True)
+            await interaction.followup.send(f"Failed to export CSV: {e}", ephemeral=True)
 
-    # Send attachment
-    file = discord.File(io.BytesIO(file_bytes), filename="Users.json")
-    await interaction.followup.send("Here is the exported database:", file=file, ephemeral=True)
+    elif format.value == "json":
+        try:
+            json_str = json.dumps(rows, indent=4, default=str)
+            file = discord.File(io.BytesIO(json_str.encode()), filename="users.json")
+            await interaction.followup.send("Here is the exported JSON file:", file=file, ephemeral=True)
+        except Exception as e:
+            await interaction.followup.send(f"Failed to export JSON: {e}", ephemeral=True)
 
 # // validatekey //
 
@@ -980,296 +939,88 @@ async def export(interaction: discord.Interaction):
 async def validatekey(interaction: discord.Interaction, key: str):
     await interaction.response.defer(ephemeral=True)
 
-    async with aiohttp.ClientSession() as session:
-        try:
-            async with session.get(API_URL, headers=headers) as get_resp:
-                if get_resp.status != 200:
-                    return await interaction.followup.send(f"Failed to fetch user data: HTTP {get_resp.status}", ephemeral=True)
-
-                data = await get_resp.json()
-                content_b64 = data["content"]
-                users = json.loads(base64.b64decode(content_b64).decode("utf-8"))
-        except Exception as e:
-            return await interaction.followup.send(f"Error retrieving data: {e}", ephemeral=True)
-
-    # Key search
-    entry = next((user for user in users if user.get("Key") == key), None)
+    try:
+        conn = get_db()
+        cur = conn.cursor()
+        cur.execute('SELECT * FROM "Users" WHERE "Key" = %s', (key,))
+        entry = cur.fetchone()
+        conn.close()
+    except Exception as e:
+        return await interaction.followup.send(f"Error retrieving data: {e}", ephemeral=True)
 
     if not entry:
         return await interaction.followup.send("Invalid key. No match found.", ephemeral=True)
 
-    join_date = entry.get("JoinDate", "Unknown")
+    join_date = entry.get("JoinDate", "Unknown") if isinstance(entry, dict) else entry[3]
+
     try:
         timestamp = int(datetime.strptime(join_date, "%Y-%m-%d").replace(tzinfo=timezone.utc).timestamp())
         join_date_formatted = f"<t:{timestamp}:D>"
     except Exception:
         join_date_formatted = join_date
 
-    embed = discord.Embed(
-        title="Valid Key",
-        description=f"**The info for key:** ||`{key}`||",
-        color=discord.Color.green()
-    )
+    # Extract fields safely whether dict or tuple:
+    def get_field(field_name, idx):
+        if isinstance(entry, dict):
+            return entry.get(field_name, "N/A")
+        return entry[idx] if idx < len(entry) else "N/A"
 
-    embed.add_field(name="Identifier", value=entry.get("Identifier", "N/A"), inline=True)
-    embed.add_field(name="Rank", value=entry.get("Rank", "N/A"), inline=True)
+    embed = discord.Embed(title="Valid Key", description=f"**The info for key:** ||`{key}`||", color=discord.Color.green())
+
+    embed.add_field(name="Identifier", value=get_field("Identifier", 1), inline=True)
+    embed.add_field(name="Rank", value=get_field("Rank", 2), inline=True)
     embed.add_field(name="Join Date", value=join_date_formatted, inline=True)
-    embed.add_field(name="Discord ID", value=f"<@{entry.get('DiscordId')}>" if entry.get("DiscordId") else "N/A", inline=True)
-    embed.add_field(name="Key", value=f"||`{entry.get('Key')}`||", inline=False)
-    embed.add_field(name="HWID", value=f"||`{entry.get('HWID')}`||", inline=False)
 
-    notes = entry.get("Notes")
+    discord_id = get_field("DiscordId", 5)
+    embed.add_field(name="Discord ID", value=f"<@{discord_id}>" if discord_id and discord_id != "N/A" else "N/A", inline=True)
+
+    embed.add_field(name="Key", value=f"||`{get_field('Key', 4)}`||", inline=False)
+    embed.add_field(name="HWID", value=f"||`{get_field('HWID', 0)}`||", inline=False)
+
+    notes = get_field("Notes", 6)
     if notes and notes != "false":
         embed.add_field(name="Notes", value=notes, inline=False)
 
     await interaction.followup.send(embed=embed, ephemeral=True)
 
-# // rollback //
-
-@bot.tree.command(name="rollback", description="Rollback the user database to a specific commit.", guild=discord.Object(id=GUILD_ID))
-@app_commands.describe(sha="The commit SHA to rollback to")
-@has_role(REQUIRED_ROLE_ID)
-@is_in_guild(GUILD_ID)
-async def rollback(interaction: discord.Interaction, sha: str):
-    await interaction.response.defer(ephemeral=True)
-
-    raw_url = f"https://raw.githubusercontent.com/{OWNER}/{REPO}/{sha}/{FILE_PATH}"
-
-    async with aiohttp.ClientSession() as session:
-        try:
-            # Fetch old file content from specific commit
-
-            async with session.get(raw_url) as raw_resp:
-                if raw_resp.status != 200:
-                    return await interaction.followup.send(f"Failed to fetch content from SHA `{sha}` (HTTP {raw_resp.status})", ephemeral=True)
-                old_content = await raw_resp.text()
-                json.loads(old_content)
-        except Exception as e:
-            return await interaction.followup.send(f"Error loading commit content: {e}", ephemeral=True)
-
-        try:
-            # Get current sha of Users.json
-
-            async with session.get(API_URL, headers=headers) as get_resp:
-                if get_resp.status != 200:
-                    return await interaction.followup.send(f"Failed to fetch database metadata. (HTTP {get_resp.status})", ephemeral=True)
-                data = await get_resp.json()
-                current_sha = data["sha"]
-        except Exception as e:
-            return await interaction.followup.send(f"Error retrieving current database metadata: {e}", ephemeral=True)
-
-        # Encode rollback content
-        rollback_b64 = base64.b64encode(old_content.encode()).decode("utf-8")
-
-        payload = {
-            "message": f"Rollback Users.json to commit {sha}",
-            "content": rollback_b64,
-            "branch": BRANCH,
-            "sha": current_sha
-        }
-
-        # Commit
-
-        try:
-            async with session.put(API_URL, headers=headers, json=payload) as put_resp:
-                if put_resp.status != 200:
-                    err = await put_resp.text()
-                    return await interaction.followup.send(f"Commit failed (HTTP {put_resp.status}):\n{err}", ephemeral=True)
-        except Exception as e:
-            return await interaction.followup.send(f"Commit error: {e}", ephemeral=True)
-
-    await interaction.followup.send(f"Successfully rolled back the database to commit `{sha}`.", ephemeral=True)
-
-# // commithistory //
-
-@bot.tree.command(name="commithistory", description="View the recent commit history.", guild=discord.Object(id=GUILD_ID))
-@app_commands.describe(max_entries="Maximum number of commits to display (default 5, max 20)")
-@has_role(REQUIRED_ROLE_ID)
-@is_in_guild(GUILD_ID)
-async def commithistory(interaction: discord.Interaction, max_entries: int = 5):
-    await interaction.response.defer(ephemeral=True)
-
-    max_entries = min(max(1, max_entries), 20) # Clamp 1-20
-    url = f"https://api.github.com/repos/{OWNER}/{REPO}/commits"
-    params = {
-        "path": FILE_PATH,
-        "sha": BRANCH,
-        "per_page": max_entries
-    }
-
-    async with aiohttp.ClientSession() as session:
-        try:
-            async with session.get(url, headers=headers, params=params) as resp:
-                if resp.status != 200:
-                    return await interaction.followup.send(f"Failed to fetch commits (HTTP {resp.status})", ephemeral=True)
-
-                commits = await resp.json()
-
-            if not commits:
-                return await interaction.followup.send("No commits found.", ephemeral=True)
-
-            embed = discord.Embed(title=f"Commit History: `{FILE_PATH}`", color=discord.Color.blurple(), timestamp=datetime.now(timezone.utc))
-
-            for commit in commits:
-                sha = commit["sha"]
-                html_url = commit["html_url"]
-                message = commit["commit"]["message"].split('\n')[0]
-                author = commit["commit"]["author"]["name"]
-                date = commit["commit"]["author"]["date"]
-                date_obj = datetime.fromisoformat(date.replace("Z", "+00:00"))
-                date_str = date_obj.strftime("%Y-%m-%d")
-
-                max_name_len = 256
-                sha_spoiler = f"||`{sha[:7]}`||"
-                base_name = f"{date_str} — {sha_spoiler} — [View Commit]({html_url}) — "
-
-                allowed_msg_len = max_name_len - len(base_name)
-                if len(message) > allowed_msg_len:
-                    message = message[:allowed_msg_len - 3] + "..."
-
-                # Fetch commit stats
-
-                stats_url = f"https://api.github.com/repos/{OWNER}/{REPO}/commits/{sha}"
-                async with session.get(stats_url, headers=headers) as stats_resp:
-                    stats_data = await stats_resp.json()
-                    additions = stats_data.get("stats", {}).get("additions", 0)
-                    deletions = stats_data.get("stats", {}).get("deletions", 0)
-
-                date_ts = int(date_obj.timestamp())
-                name = f"{date_str} — ||{sha}||"
-                value = (
-                    f"[View Commit]({html_url}) — {message}\n"
-                    f"🟢 `+{additions}` 🔴 `-{deletions}`\n"
-                    f"👤 **{author}** • <t:{date_ts}:R>\n"
-                    "\u200b\n" # zero width space + newline to gap | shoutout google 👍
-                )
-
-                embed.add_field(name=name, value=value, inline=False)
-            await interaction.followup.send(embed=embed, ephemeral=True)
-
-        except Exception as e:
-            await interaction.followup.send(f"Error: {e}", ephemeral=True)
-
-# // fetchcommits //
-
-@bot.tree.command(name="fetchcommit", description="Fetches the details for a specific commit.", guild=discord.Object(id=GUILD_ID))
-@app_commands.describe(sha="Commit SHA to fetch")
-@has_role(REQUIRED_ROLE_ID)
-@is_in_guild(GUILD_ID)
-async def fetchcommit(interaction: discord.Interaction, sha: str):
-    await interaction.response.defer(ephemeral=True)
-    commit_url = f"https://api.github.com/repos/{OWNER}/{REPO}/commits/{sha}"
-
-    async with aiohttp.ClientSession() as session:
-        try:
-            async with session.get(commit_url, headers=headers) as resp:
-                if resp.status != 200:
-                    return await interaction.followup.send(f"Commit not found or an unexpected error has occurred. (HTTP {resp.status})", ephemeral=True)
-                data = await resp.json()
-
-            commit = data["commit"]
-            author = commit["author"]["name"]
-            date_str = commit["author"]["date"]
-            date_obj = datetime.fromisoformat(date_str.replace("Z", "+00:00"))
-            date_ts = int(date_obj.timestamp())
-
-            message = commit["message"]
-            additions = data.get("stats", {}).get("additions", 0)
-            deletions = data.get("stats", {}).get("deletions", 0)
-            html_url = data["html_url"]
-
-            embed = discord.Embed(
-                title=f"Commit Details — ||{sha}||",
-                url=html_url,
-                description=message,
-                color=discord.Color.green(),
-                timestamp=date_obj
-            )
-            embed.set_author(name=author)
-            embed.add_field(name="Additions", value=f"🟢 +{additions}", inline=True)
-            embed.add_field(name="Deletions", value=f"❌ -{deletions}", inline=True)
-            embed.add_field(name="Date", value=f"<t:{date_ts}:F>", inline=False)
-
-            await interaction.followup.send(embed=embed, ephemeral=True)
-
-        except Exception as e:
-            await interaction.followup.send(f"Error fetching commit: {e}", ephemeral=True)
-
 # // fetchuser //
 
-@bot.tree.command(name="fetchuser", description="Fetches all stored info about a user.", guild=discord.Object(id=GUILD_ID))
+@bot.tree.command(name="fetchuser", description="Fetches all stored info about a user", guild=discord.Object(id=GUILD_ID))
 @app_commands.describe(user="The user to look up")
 @has_role(REQUIRED_ROLE_ID)
 @is_in_guild(GUILD_ID)
-async def fetchuser(interaction: discord.Interaction, user: discord.User):
-    await interaction.response.defer(ephemeral=True)
+async def fetchinfo(interaction: discord.Interaction, user: discord.User):
+    conn = get_db()
+    cur = conn.cursor()
+    cur.execute('SELECT "HWID", "Identifier", "Rank", "JoinDate", "DiscordId", "Key", "Notes" FROM "Users" WHERE "DiscordId" = %s', (str(user.id),))
+    row = cur.fetchone()
+    conn.close()
 
-    async with aiohttp.ClientSession() as session:
-        try:
-            # Fetch and decode json file
-
-            async with session.get(GITHUB_FILE_URL, headers=headers) as resp:
-                if resp.status != 200:
-                    return await interaction.followup.send(f"Failed to fetch data. (HTTP {resp.status})", ephemeral=True)
-
-                raw_text = await resp.text()
-                users = json.loads(raw_text)
-
-        except Exception as e:
-            return await interaction.followup.send(f"Error: {e}", ephemeral=True)
-
-    # Look up by user id
-
-    discord_id = str(user.id)
-    user_data = next((entry for entry in users if entry.get("DiscordId") == discord_id), None)
-
-    if not user_data:
-        return await interaction.followup.send(f"No data found for {user.mention}.", ephemeral=True)
-
-    # Fetch member from guild to fetch roles and join date
-    guild = bot.get_guild(GUILD_ID)
-    member = guild.get_member(user.id) if guild else None
-
-    # Number of roles
-    num_roles = len(member.roles) - 1 if member else "Unknown"
-
-    # Format server join date as a timestamp
-    if member and member.joined_at:
-        join_ts = int(member.joined_at.replace(tzinfo=timezone.utc).timestamp())
-        server_join_display = f"<t:{join_ts}:D>"
-    else:
-        server_join_display = "Unknown"
+    if not row:
+        return await interaction.response.send_message(f"No data found for {user.mention}.", ephemeral=True)
 
     embed = discord.Embed(title=f"User Info: {user.name}", color=discord.Color.teal(), timestamp=datetime.now(timezone.utc))
     embed.set_thumbnail(url=user.display_avatar.url)
 
-    # Format join date as timestamp
-    join_date = user_data.get("JoinDate", "Unknown")
-    try:
-        timestamp = int(datetime.strptime(join_date, "%Y-%m-%d").replace(tzinfo=timezone.utc).timestamp())
-        join_date_display = f"<t:{timestamp}:D>"
-    except:
-        join_date_display = join_date
-
-    # Fields
     fields = [
-        ("Identifier", user_data.get("Identifier")),
-        ("Rank", user_data.get("Rank")),
-        ("Join Date", join_date_display),
-        ("HWID", f"||{user_data.get('HWID')}||" if user_data.get("HWID") else "N/A"),
-        ("Key", f"||{user_data.get('Key')}||" if user_data.get("Key") else "N/A"),
-        ("Discord ID", f"{user_data.get('DiscordId')} ({user.mention})"),
-        ("Server Join Date", server_join_display),
-        ("Number of Roles", str(num_roles))
+        ("Identifier", row.get("Identifier")),
+        ("Rank", row.get("Rank")),
+        ("Join Date", row.get("JoinDate")),
+        ("HWID", f"||{row.get('HWID')}||" if row.get("HWID") else "N/A"),
+        ("Key", f"||{row.get('Key')}||" if row.get("Key") else "N/A"),
+        ("Discord ID", f"{row.get('DiscordId')} (<@{row.get('DiscordId')}>)"),
+        ("Notes", row.get("Notes") if row.get("Notes") and row.get("Notes").lower() != "false" else "N/A")
     ]
 
-    if user_data.get("Notes") and user_data["Notes"] != "false":
-        fields.append(("Notes", user_data["Notes"]))
+    member = interaction.guild.get_member(user.id)
+    if member:
+        fields.append(("Roles", str(len(member.roles) - 1)))  # exclude @everyone
+        fields.append(("Server Join Date", f"<t:{int(member.joined_at.timestamp())}:D>"))
 
     for name, value in fields:
         embed.add_field(name=name, value=value or "N/A", inline=True)
 
-    await interaction.followup.send(embed=embed, ephemeral=True)
+    await interaction.response.send_message(embed=embed, ephemeral=True)
 
 # // fetchdupes //
 
@@ -1278,92 +1029,92 @@ async def fetchuser(interaction: discord.Interaction, user: discord.User):
 @app_commands.choices(field=[
     app_commands.Choice(name="HWID", value="HWID"),
     app_commands.Choice(name="Identifier", value="Identifier"),
+    app_commands.Choice(name="Rank", value="Rank"),
     app_commands.Choice(name="Discord ID", value="DiscordId"),
-    app_commands.Choice(name="Key", value="Key")
+    app_commands.Choice(name="Key", value="Key"),
+    app_commands.Choice(name="All", value="All")
 ])
 @has_role(REQUIRED_ROLE_ID)
 @is_in_guild(GUILD_ID)
 async def fetchdupes(interaction: discord.Interaction, field: app_commands.Choice[str]):
     await interaction.response.defer(ephemeral=True)
 
-    async with aiohttp.ClientSession() as session:
-        try:
-            async with session.get(GITHUB_FILE_URL, headers=headers) as resp:
-                if resp.status != 200:
-                    return await interaction.followup.send(f"Failed to fetch user data. (HTTP {resp.status})", ephemeral=True)
-                text = await resp.text()
-                users = json.loads(text)
-        except Exception as e:
-            return await interaction.followup.send(f"Error fetching data: {e}", ephemeral=True)
-
     field_name = field.value
-    value_map = defaultdict(list)
 
-    for entry in users:
-        value = entry.get(field_name)
-        if not value or value == "false":
-            continue
-        value_map[value].append(entry)
+    try:
+        conn = get_db()
+        cur = conn.cursor()
 
-    dupes = {k: v for k, v in value_map.items() if len(v) > 1}
+        fields = ["HWID", "Identifier", "Rank", "DiscordId", "Key"]
 
-    if not dupes:
-        return await interaction.followup.send(f"No duplicates found for **{field_name}**.", ephemeral=True)
+        if field_name == "All":
+            # Fetch all relevant columns
+            cur.execute('SELECT "HWID", "Identifier", "Rank", "DiscordId", "Key" FROM "Users"')
+            rows = cur.fetchall()
+
+            dupes_map = {f: defaultdict(list) for f in fields}
+
+            for row in rows:
+                for f in fields:
+                    value = row.get(f)
+                    if value and str(value).lower() != "false":
+                        dupes_map[f][value].append(row)
+
+            # Filter dupes only
+            dupes = {f: {k: v for k, v in val.items() if len(v) > 1} for f, val in dupes_map.items() if any(len(v) > 1 for v in val.values())}
+
+            if not dupes:
+                await interaction.followup.send(f"No duplicates found for **{field_name}**.", ephemeral=True)
+                return
+
+        else:
+            # Fetch rows that dont have a null value
+
+            cur.execute(f'SELECT * FROM "Users" WHERE "{field_name}" IS NOT NULL')
+            rows = cur.fetchall()
+
+            value_map = defaultdict(list)
+            for row in rows:
+                value = row.get(field_name)
+                if value and str(value).lower() != "false":
+                    value_map[value].append(row)
+
+            dupes = {field_name: {k: v for k, v in value_map.items() if len(v) > 1}}
+
+            if not dupes[field_name]:
+                await interaction.followup.send(f"No duplicates found for **{field_name}**.", ephemeral=True)
+                return
+
+        conn.close()
+
+    except Exception as e:
+        await interaction.followup.send(f"Error accessing database: {e}", ephemeral=True)
+        return
 
     embed = discord.Embed(title=f"🔁 Duplicate Entries: `{field_name}`", color=discord.Color.orange(), timestamp=datetime.now(timezone.utc))
 
-    for value, entries in dupes.items():
-        identifiers = ", ".join(entry.get("Identifier", "Unknown") for entry in entries)
-        value_display = f"`{value}`" if len(value) <= 50 else f"`{value[:47]}...`"
-        embed.add_field(name=value_display, value=f"Count: `{len(entries)}` — {identifiers}", inline=False)
+    if field_name == "All":
+        for f, field_dupes in dupes.items():
+            embed.add_field(name=f"**Duplicates in {f}:**", value="\u200b", inline=False)
+
+            for value, entries in field_dupes.items():
+                # Build list of identifiers for the dupes
+                identifiers = ", ".join(e.get("Identifier", "N/A") for e in entries)
+                val_display = f"`{value}`" if len(str(value)) <= 50 else f"`{str(value)[:47]}...`"
+
+                embed.add_field(name=val_display, value=f"Count: `{len(entries)}` — {identifiers}", inline=False)
+            embed.add_field(name="\n", value="\n\n", inline=False)
+
+    else:
+        for value, entries in dupes[field_name].items():
+            identifiers = ", ".join(e.get("Identifier", "N/A") for e in entries)
+            val_display = f"`{value}`" if len(str(value)) <= 50 else f"`{str(value)[:47]}...`"
+
+            embed.add_field(name=val_display, value=f"Count: `{len(entries)}` — {identifiers}", inline=False)
 
     await interaction.followup.send(embed=embed, ephemeral=True)
 
 # // viewwhitelist //
-
-class WhitelistPaginator(ui.View):
-    def __init__(self, embeds: list[discord.Embed], author_id: int):
-        super().__init__(timeout=120)
-        self.embeds = embeds
-        self.author_id = author_id
-        self.index = 0
-
-        self.prev_button = ui.Button(label="⏮️ Previous", style=discord.ButtonStyle.secondary)
-        self.next_button = ui.Button(label="⏭️ Next", style=discord.ButtonStyle.secondary)
-        self.delete_button = ui.Button(label="🗑️ Delete", style=discord.ButtonStyle.danger)
-
-        self.prev_button.callback = self.prev_page
-        self.next_button.callback = self.next_page
-        self.delete_button.callback = self.delete_message
-
-        self.add_item(self.prev_button)
-        self.add_item(self.next_button)
-        self.add_item(self.delete_button)
-
-        self.update_button_states()
-
-    def update_button_states(self):
-        self.prev_button.disabled = self.index == 0
-        self.next_button.disabled = self.index >= len(self.embeds) - 1
-
-    async def prev_page(self, interaction: discord.Interaction):
-        if interaction.user.id != self.author_id:
-            return await interaction.response.send_message("You can't control this panel.", ephemeral=True)
-        self.index -= 1
-        self.update_button_states()
-        await interaction.response.edit_message(embed=self.embeds[self.index], view=self)
-
-    async def next_page(self, interaction: discord.Interaction):
-        if interaction.user.id != self.author_id:
-            return await interaction.response.send_message("You can't control this panel.", ephemeral=True)
-        self.index += 1
-        self.update_button_states()
-        await interaction.response.edit_message(embed=self.embeds[self.index], view=self)
-
-    async def delete_message(self, interaction: discord.Interaction):
-        if interaction.user.id != self.author_id:
-            return await interaction.response.send_message("You can't delete this message.", ephemeral=True)
-        await interaction.message.delete
 
 class EditUserModal(Modal):
     def __init__(self, user_data, whitelist_view):
@@ -1385,56 +1136,47 @@ class EditUserModal(Modal):
         self.add_item(self.notes)
 
     async def on_submit(self, interaction: discord.Interaction):
-        # Update user data dictionary with form values
-
         self.user_data["Identifier"] = self.identifier.value
         self.user_data["Rank"] = self.rank.value
         self.user_data["HWID"] = self.hwid.value or "N/A"
         self.user_data["Key"] = self.key.value or "N/A"
         self.user_data["Notes"] = self.notes.value or "false"
 
-        async with aiohttp.ClientSession() as session:
-            try:
-                async with session.get(API_URL, headers=headers) as get_resp:
-                    if get_resp.status != 200:
-                        await interaction.response.send_message(f"Failed to fetch data: HTTP {get_resp.status}", ephemeral=True)
-                        return
-                    data = await get_resp.json()
-                    content_b64 = data["content"]
-                    sha = data["sha"]
-                    existing = json.loads(base64.b64decode(content_b64).decode("utf-8"))
+        try:
+            conn = get_db()
+            cursor = conn.cursor()
 
-                discord_id = self.user_data.get("DiscordId")
-                for i, u in enumerate(existing):
-                    if u.get("DiscordId") == discord_id:
-                        existing[i] = self.user_data
-                        break
+            cursor.execute("""
+                UPDATE "Users" SET
+                    "Identifier" = %s,
+                    "Rank" = %s,
+                    "HWID" = %s,
+                    "Key" = %s,
+                    "Notes" = %s
+                WHERE "DiscordId" = %s
+            """, (
+                self.user_data["Identifier"],
+                self.user_data["Rank"],
+                self.user_data["HWID"],
+                self.user_data["Key"],
+                self.user_data["Notes"],
+                int(self.user_data.get("DiscordId") or 0),
+            ))
 
-                updated_content = json.dumps(existing, indent=4)
-                updated_b64 = base64.b64encode(updated_content.encode()).decode("utf-8")
+            conn.commit()
+            cursor.close()
+            conn.close()
 
-                commit_payload = {
-                    "message": f"Edited whitelist user: {self.user_data.get('Identifier', 'N/A')} ({discord_id})",
-                    "content": updated_b64,
-                    "branch": BRANCH,
-                    "sha": sha
-                }
+            self.whitelist_view.users[self.whitelist_view.current_index] = self.user_data
+            self.whitelist_view.update_buttons()
+            embed = await self.whitelist_view.create_embed()
 
-                async with session.put(API_URL, headers=headers, json=commit_payload) as put_resp:
-                    if put_resp.status != 200:
-                        err = await put_resp.text()
-                        await interaction.response.send_message(f"Failed to commit changes: HTTP {put_resp.status}\n{err}", ephemeral=True)
-                        return
+            await interaction.response.edit_message(content=f"User **{self.user_data.get('Identifier')}** updated.", embed=embed, view=self.whitelist_view)
+        except Exception as e:
+            await interaction.response.send_message(f"Error updating user in database: {e}", ephemeral=True)
 
-                self.whitelist_view.users = existing
-                self.whitelist_view.update_buttons()
-                embed = self.whitelist_view.create_embed()
 
-                await interaction.response.edit_message(content=f"User **{self.user_data.get('Identifier')}** updated.", embed=embed, view=self.whitelist_view)
-            except Exception as e:
-                await interaction.response.send_message(f"Error: {e}", ephemeral=True)
-
-class WhitelistView(View):
+class WhitelistView(ui.View):
     def __init__(self, bot, users, current_index=0):
         super().__init__(timeout=None)
         self.bot = bot
@@ -1447,76 +1189,58 @@ class WhitelistView(View):
         self.next_button.disabled = self.current_index >= len(self.users) - 1
         self.delete_button.disabled = len(self.users) == 0
 
-    @discord.ui.button(label="⏮️ Previous", style=discord.ButtonStyle.secondary)
+    @ui.button(label="⏮️ Previous", style=discord.ButtonStyle.secondary)
     async def prev_button(self, interaction: discord.Interaction, button: Button):
         self.current_index = max(0, self.current_index - 1)
         self.update_buttons()
-        embed = self.create_embed()
+        embed = await self.create_embed()
         await interaction.response.edit_message(embed=embed, view=self)
 
-    @discord.ui.button(label="⏭️ Next", style=discord.ButtonStyle.secondary)
+    @ui.button(label="⏭️ Next", style=discord.ButtonStyle.secondary)
     async def next_button(self, interaction: discord.Interaction, button: Button):
         self.current_index = min(len(self.users) - 1, self.current_index + 1)
         self.update_buttons()
-        embed = self.create_embed()
+        embed = await self.create_embed()
         await interaction.response.edit_message(embed=embed, view=self)
 
-    @discord.ui.button(label="✏️ Edit User", style=discord.ButtonStyle.primary)
+    @ui.button(label="✏️ Edit User", style=discord.ButtonStyle.primary)
     async def edit_button(self, interaction: discord.Interaction, button: Button):
         user_data = self.users[self.current_index]
         modal = EditUserModal(user_data, self)
         await interaction.response.send_modal(modal)
 
-    @discord.ui.button(label="🗑️ Delete User", style=discord.ButtonStyle.danger)
+    @ui.button(label="🗑️ Delete User", style=discord.ButtonStyle.danger)
     async def delete_button(self, interaction: discord.Interaction, button: Button):
         user_to_delete = self.users[self.current_index]
         identifier = user_to_delete.get("Identifier", "N/A")
+        discord_id = user_to_delete.get("DiscordId")
 
-        async with aiohttp.ClientSession() as session:
-            try:
-                async with session.get(API_URL, headers=headers) as get_resp:
-                    if get_resp.status != 200:
-                        await interaction.response.send_message(f"Failed to fetch data for deletion: HTTP {get_resp.status}", ephemeral=True)
-                        return
-                    data = await get_resp.json()
-                    content_b64 = data["content"]
-                    sha = data["sha"]
-                    existing = json.loads(base64.b64decode(content_b64).decode("utf-8"))
+        try:
+            conn = get_db()
+            cursor = conn.cursor()
+            cursor.execute('DELETE FROM "Users" WHERE "DiscordId" = %s', (int(discord_id),))
+            conn.commit()
+            cursor.close()
+            conn.close()
 
-                existing = [u for u in existing if u.get("DiscordId") != user_to_delete.get("DiscordId")]
+            # Remove from local list
+            self.users.pop(self.current_index)
+            if self.current_index >= len(self.users):
+                self.current_index = max(0, len(self.users) - 1)
 
-                updated_content = json.dumps(existing, indent=4)
-                updated_b64 = base64.b64encode(updated_content.encode()).decode("utf-8")
-                commit_payload = {
-                    "message": f"Deleted whitelist user: {identifier} ({user_to_delete.get('DiscordId', 'N/A')})",
-                    "content": updated_b64,
-                    "branch": BRANCH,
-                    "sha": sha
-                }
+            self.update_buttons()
 
-                async with session.put(API_URL, headers=headers, json=commit_payload) as put_resp:
-                    if put_resp.status != 200:
-                        err = await put_resp.text()
-                        await interaction.response.send_message(f"Failed to commit deletion: HTTP {put_resp.status}\n{err}", ephemeral=True)
-                        return
+            if self.users:
+                embed = await self.create_embed()
+                await interaction.response.edit_message(content=f"Deleted user **{identifier}**.", embed=embed, view=self)
+            else:
+                for child in self.children:
+                    child.disabled = True
+                await interaction.response.edit_message(content=f"Deleted user **{identifier}**. The database is now empty.", embed=None, view=self)
+        except Exception as e:
+            await interaction.response.send_message(f"Error deleting user: {e}", ephemeral=True)
 
-                self.users = existing
-                if self.current_index >= len(self.users):
-                    self.current_index = max(0, len(self.users) - 1)
-
-                self.update_buttons()
-                if self.users:
-                    embed = self.create_embed()
-                    await interaction.response.edit_message(content=f"Deleted user **{identifier}**.", embed=embed, view=self)
-                else:
-                    for child in self.children:
-                        child.disabled = True
-                    await interaction.response.edit_message(content=f"Deleted user **{identifier}**. The database is now empty.", embed=None, view=self)
-
-            except Exception as e:
-                await interaction.response.send_message(f"Error deleting user: {e}", ephemeral=True)
-
-    def create_embed(self):
+    async def create_embed(self):
         if not self.users:
             embed = discord.Embed(title="Database is empty", color=discord.Color.red())
             return embed
@@ -1535,21 +1259,19 @@ class WhitelistView(View):
         except Exception:
             pass
 
-        # Fields
-
         embed.add_field(name="Join Date", value=join_date, inline=True)
         embed.add_field(name="HWID", value=f"||`{user_data.get('HWID', '')}`||", inline=False)
         embed.add_field(name="Key", value=f"||`{user_data.get('Key', '')}`||", inline=False)
 
-        notes = user_data.get("Notes", "false")
-        if notes != "false" and notes.strip() != "":
+        notes = user_data.get("Notes")
+        if notes is not None and notes != "false" and notes.strip() != "":
             embed.add_field(name="Notes", value=notes, inline=False)
 
         discord_id = int(user_data.get("DiscordId", 0))
-        member = self.bot.get_user(discord_id)
-        if member:
+        try:
+            member = await self.bot.fetch_user(discord_id)
             embed.set_thumbnail(url=member.display_avatar.url)
-        else:
+        except Exception:
             embed.set_thumbnail(url="https://cdn.discordapp.com/embed/avatars/0.png")
 
         return embed
@@ -1560,146 +1282,134 @@ class WhitelistView(View):
 async def viewwhitelist(interaction: discord.Interaction):
     await interaction.response.defer(ephemeral=True)
 
-    async with aiohttp.ClientSession() as session:
-        async with session.get(API_URL, headers=headers) as resp:
-            if resp.status != 200:
-                return await interaction.followup.send(f"Failed to fetch whitelist: HTTP {resp.status}", ephemeral=True)
-            data = await resp.json()
-            content_b64 = data["content"]
-            users = json.loads(base64.b64decode(content_b64).decode("utf-8"))
+    try:
+        conn = get_db()
+        cursor = conn.cursor()
+        cursor.execute('SELECT * FROM "Users"')
+        rows = cursor.fetchall()
+        cursor.close()
+        conn.close()
 
-    if not users:
-        return await interaction.followup.send("No database entries found.", ephemeral=True)
+        if not rows:
+            return await interaction.followup.send("No database entries found.", ephemeral=True)
+
+        users = [row for row in rows]
+
+    except Exception as e:
+        return await interaction.followup.send(f"Error accessing database: {e}", ephemeral=True)
 
     view = WhitelistView(bot, users)
-    embed = view.create_embed()
+    embed = await view.create_embed()
     await interaction.followup.send(embed=embed, view=view, ephemeral=True)
 
 # // register
 
 @bot.tree.command(name="register", description="Submit your info to be reviewed and whitelisted.", guild=discord.Object(id=GUILD_ID))
 @app_commands.describe(identifier="Your identifier (username, alias, etc.)")
-@has_role(REQUIRED_ROLE_ID)
 @is_in_guild(GUILD_ID)
 async def register(interaction: discord.Interaction, identifier: str):
     await interaction.response.defer(ephemeral=True)
+    discord_id = interaction.user.id
 
-    discord_id_str = str(interaction.user.id)
+    try:
+        conn = get_db()
+        cur = conn.cursor()
 
-    # Check whitelist json for existing discord id
+        # Check if already registered in Registrations database
 
-    async with aiohttp.ClientSession() as session:
-        async with session.get(API_URL, headers=headers) as resp:
-            if resp.status != 200:
-                return await interaction.followup.send(f"Failed to fetch whitelist data: HTTP {resp.status}", ephemeral=True)
-            data = await resp.json()
-            content_b64 = data["content"]
-            whitelist_users = json.loads(base64.b64decode(content_b64).decode("utf-8"))
+        cur.execute('SELECT * FROM "Registrations" WHERE "DiscordId" = %s', (discord_id,))
+        existing_reg = cur.fetchone()
+        if existing_reg:
+            await interaction.followup.send("You have already registered.", ephemeral=True)
+            cur.close()
+            conn.close()
+            return
 
-    for user in whitelist_users:
-        if user.get("DiscordId") == discord_id_str:
-            return await interaction.followup.send("You are already whitelisted.", ephemeral=True)
+        # Check if already whitelisted in Users database
 
-    # Check for existing registration
+        cur.execute('SELECT * FROM "Users" WHERE "DiscordId" = %s', (discord_id,))
+        already_whitelisted = cur.fetchone()
+        if already_whitelisted:
+            await interaction.followup.send("You are already whitelisted.", ephemeral=True)
+            cur.close()
+            conn.close()
+            return
 
-    reg_channel = bot.get_channel(REGISTRATION_CHANNEL_ID)
-    if not reg_channel:
-        return await interaction.followup.send("Registration channel not found.", ephemeral=True)
+        # Prepare registration data
+        rank = "User"
+        join_date = datetime.now(timezone.utc).date().isoformat()
+        hwid_raw = get_hwid() or "UNKNOWN_HWID"
+        hwid_hash = hashlib.sha256(hwid_raw.encode()).hexdigest()
 
-    messages = [msg async for msg in reg_channel.history(limit=100)]
-    for msg in messages:
-        if msg.embeds:
-            embed = msg.embeds[0]
-            for field in embed.fields:
-                if discord_id_str in field.value:
-                    return await interaction.followup.send("You have already registered before.", ephemeral=True)
+        # Insert registration details into database
+        cur.execute(
+            'INSERT INTO "Registrations" ("HWID", "Identifier", "Rank", "JoinDate", "DiscordId") VALUES (%s, %s, %s, %s, %s)',
+            (hwid_hash, identifier, rank, join_date, discord_id)
+        )
+        conn.commit()
+        cur.close()
+        conn.close()
 
-    # Registration
+        # Send embed
 
-    rank = "User"
-    join_date = datetime.now(timezone.utc).date().isoformat()
-    hwid_raw = get_hwid()
-    if not hwid_raw:
-        hwid_raw = "UNKNOWN_HWID"
-    hwid_hash = hashlib.sha256(hwid_raw.encode()).hexdigest()
+        reg_channel = bot.get_channel(REGISTRATION_CHANNEL_ID)
+        if reg_channel:
+            embed = discord.Embed(title="A registration has been logged.", color=discord.Color.green(), timestamp=datetime.now(timezone.utc))
+            embed.set_author(name=str(interaction.user), icon_url=interaction.user.display_avatar.url)
 
-    embed = discord.Embed(title="Registration Successful", color=discord.Color.green(), timestamp=datetime.now(timezone.utc))
-    embed.set_author(name=str(interaction.user), icon_url=interaction.user.display_avatar.url)
-    embed.add_field(name="Identifier", value=identifier, inline=True)
-    embed.add_field(name="Rank", value=rank, inline=True)
-    embed.add_field(name="Discord ID", value=discord_id_str, inline=True)
-    embed.add_field(name="Join Date", value=f"<t:{int(datetime.strptime(join_date, '%Y-%m-%d').timestamp())}:D>", inline=True)
-    embed.add_field(name="HWID", value=f"||`{hwid_hash}`||", inline=False)
+            await reg_channel.send(embed=embed)
 
-    await reg_channel.send(embed=embed)
+        await interaction.followup.send(
+            f"Registration completed:\n"
+            f"Identifier: {identifier}\n"
+            f"Rank: {rank}\n"
+            f"Discord ID: {discord_id}\n"
+            f"Join Date: {join_date}\n"
+            f"HWID: ||`{hwid_hash}`||",
+            ephemeral=True
+        )
 
-    await interaction.followup.send(
-        f"Registration completed:\n"
-        f"Identifier: {identifier}\n"
-        f"Rank: {rank}\n"
-        f"Discord ID: {discord_id_str}\n"
-        f"Join Date: {join_date}\n"
-        f"HWID: ||`{hwid_hash}`||",
-        ephemeral=True
-    )
+    except Exception as e:
+        await interaction.followup.send(f"Failed to register: {e}", ephemeral=True)
 
 # // checkregistration
 
-@bot.tree.command(name="checkregistration", description="Checks if a user is registered.", guild=discord.Object(id=GUILD_ID))
+@bot.tree.command(name="checkregistration", description="Checks if a user is registered in the Registration database.", guild=discord.Object(id=GUILD_ID))
 @app_commands.describe(user="The user to check registration for")
 @has_role(REQUIRED_ROLE_ID)
 @is_in_guild(GUILD_ID)
 async def checkregistration(interaction: discord.Interaction, user: discord.User):
     await interaction.response.defer(ephemeral=True)
-    discord_id_str = str(user.id)
-
-    # Check whitelist file
+    discord_id = user.id
 
     try:
-        async with aiohttp.ClientSession() as session:
-            async with session.get(API_URL, headers=headers) as resp:
-                if resp.status != 200:
-                    return await interaction.followup.send(f"Failed to fetch whitelist: HTTP {resp.status}", ephemeral=True)
-                data = await resp.json()
-                content_b64 = data["content"]
-                users = json.loads(base64.b64decode(content_b64).decode("utf-8"))
+        conn = get_db()
+        cur = conn.cursor()
+
+        # Check whitelist db
+        cur.execute('SELECT 1 FROM "Users" WHERE "DiscordId" = %s', (discord_id,))
+        whitelist_registered = cur.fetchone() is not None
+
+        # Check registrations db
+        cur.execute('SELECT * FROM "Registrations" WHERE "DiscordId" = %s', (discord_id,))
+        registration_row = cur.fetchone()
+
+        cur.close()
+        conn.close()
+
+        if whitelist_registered and registration_row:
+            status_msg = f"User **{user}** is **registered** in both the whitelist and registration database."
+        elif whitelist_registered:
+            status_msg = f"User **{user}** is **registered** in the whitelist only."
+        elif registration_row:
+            status_msg = f"User **{user}** is **registered** in the registration database only."
+        else:
+            status_msg = f"User **{user}** is **not** registered."
+
+        await interaction.followup.send(status_msg, ephemeral=True)
+
     except Exception as e:
-        return await interaction.followup.send(f"Error fetching whitelist: {e}", ephemeral=True)
-
-    whitelist_registered = any(u.get("DiscordId") == discord_id_str for u in users)
-
-    # Check registration embeds and find message link if found
-    reg_channel = bot.get_channel(REGISTRATION_CHANNEL_ID)
-    if not reg_channel:
-        return await interaction.followup.send("Registration channel not found.", ephemeral=True)
-
-    registered_in_channel = False
-    registration_message_url = None
-    try:
-        async for msg in reg_channel.history(limit=100):
-            if msg.embeds:
-                embed = msg.embeds[0]
-                for field in embed.fields:
-                    if discord_id_str in field.value:
-                        registered_in_channel = True
-                        registration_message_url = msg.jump_url
-                        break
-            if registered_in_channel:
-                break
-    except Exception as e:
-        return await interaction.followup.send(f"Error reading registration embeds: {e}", ephemeral=True)
-
-    # Reply
-    if whitelist_registered and registered_in_channel:
-        status_msg = f"User **{user}** is **registered** in both whitelist and registration channel.\n[View Registration Message]({registration_message_url})"
-    elif whitelist_registered:
-        status_msg = f"User **{user}** is **registered** in the whitelist only."
-    elif registered_in_channel:
-        status_msg = f"User **{user}** is **registered** in the registration channel only.\n[View Registration Message]({registration_message_url})"
-    else:
-        status_msg = f"User **{user}** is **not** registered."
-
-    await interaction.followup.send(status_msg, ephemeral=True)
+        await interaction.followup.send(f"Error checking registration: {e}", ephemeral=True)
 
 # // clearregistrations
 
@@ -1713,7 +1423,6 @@ class ConfirmClearView(View):
     async def confirm(self, interaction: discord.Interaction, button: Button):
         if interaction.user.id != self.author_id:
             return await interaction.response.send_message("You cannot confirm this action.", ephemeral=True)
-
         self.confirmed = True
         self.stop()
         await interaction.response.edit_message(content="Clearing registrations...", view=None)
@@ -1722,53 +1431,74 @@ class ConfirmClearView(View):
     async def cancel(self, interaction: discord.Interaction, button: Button):
         if interaction.user.id != self.author_id:
             return await interaction.response.send_message("You cannot cancel this action.", ephemeral=True)
-
         self.confirmed = False
         self.stop()
         await interaction.response.edit_message(content="Cancelled clearing registrations.", view=None)
 
 
-@bot.tree.command(name="clearregistrations", description="Clear all messages in the registration channel.", guild=discord.Object(id=GUILD_ID))
+@bot.tree.command(name="clearregistrations", description="Clears all registrations from the database.", guild=discord.Object(id=GUILD_ID))
 @has_role(REQUIRED_ROLE_ID)
 @is_in_guild(GUILD_ID)
 async def clearregistrations(interaction: discord.Interaction):
     await interaction.response.defer(ephemeral=True)
 
-    # Check bot perms
-
-    reg_channel = bot.get_channel(REGISTRATION_CHANNEL_ID)
-    if not reg_channel:
-        return await interaction.followup.send("Registration channel not found.", ephemeral=True)
-
-    permissions = reg_channel.permissions_for(interaction.guild.me)
-    if not permissions.manage_messages:
-        return await interaction.followup.send("I need Manage Messages permission in the registration channel to clear messages.", ephemeral=True)
-
     # Confirmation
+
     view = ConfirmClearView(interaction.user.id)
-    await interaction.followup.send("Are you sure you want to clear all registration messages? This action cannot be undone.", view=view, ephemeral=True)
+    await interaction.followup.send("Are you sure you want to clear all registrations? This action cannot be undone.", view=view, ephemeral=True)
 
-    await view.wait() # Confirmation wait
-
+    await view.wait()
     if not view.confirmed:
-        return # User cancel or timed out
+        return
 
-    # Bulk delete messages
-
-    deleted_count = 0
     try:
-        while True:
-            msgs = [msg async for msg in reg_channel.history(limit=100)]
-            if not msgs:
-                break
-            await reg_channel.delete_messages(msgs)
-            deleted_count += len(msgs)
-            if len(msgs) < 100:
-                break
-    except Exception as e:
-        return await interaction.followup.send(f"Failed to clear messages: {e}", ephemeral=True)
+        conn = get_db()
+        cur = conn.cursor()
+        cur.execute('DELETE FROM "Registrations"')
+        conn.commit()
+        cur.close()
+        conn.close()
 
-    await interaction.followup.send(f"Cleared {deleted_count} registrations.", ephemeral=True)
+        await interaction.followup.send("All registrations have been cleared.", ephemeral=True)
+    except Exception as e:
+        await interaction.followup.send(f"Failed to clear registrations: {e}", ephemeral=True)
+
+# // delregistration
+
+@bot.tree.command(name="delregistration", description="Deletes a specific registration from the database.", guild=discord.Object(id=GUILD_ID))
+@app_commands.describe(user="The user whose registration to delete")
+@has_role(REQUIRED_ROLE_ID)
+@is_in_guild(GUILD_ID)
+async def delregistration(interaction: discord.Interaction, user: discord.User):
+    await interaction.response.defer(ephemeral=True)
+    discord_id = user.id
+
+    try:
+        conn = get_db()
+        cur = conn.cursor()
+
+        # Check if registration exists
+
+        cur.execute('SELECT * FROM "Registrations" WHERE "DiscordId" = %s', (discord_id,))
+        reg = cur.fetchone()
+
+        if not reg:
+            await interaction.followup.send(f"No registration found for {user.mention}.", ephemeral=True)
+            cur.close()
+            conn.close()
+            return
+
+        # Delete registration
+
+        cur.execute('DELETE FROM "Registrations" WHERE "DiscordId" = %s', (discord_id,))
+        conn.commit()
+        cur.close()
+        conn.close()
+
+        await interaction.followup.send(f"Registration for {user.mention} has been deleted.", ephemeral=True)
+
+    except Exception as e:
+        await interaction.followup.send(f"Failed to delete registration: {e}", ephemeral=True)
 
 # // reactionrole
 
@@ -1790,7 +1520,7 @@ async def reactionrole(interaction: discord.Interaction, emoji: str, role: disco
         try:
             msg = await channel.fetch_message(reaction_roles_message_id)
         except discord.NotFound:
-            # If panel deleted, recreate it and save the new id\
+            # If panel deleted, recreate it and save the new id
 
             embed = discord.Embed(title="React to assign roles", description="", color=discord.Color.blurple())
             msg = await channel.send(embed=embed)
@@ -1894,57 +1624,66 @@ async def togglelockdown(interaction: discord.Interaction):
 
 # // upload //
 
-@bot.tree.command(name="upload", description="Upload a Users.json file to replace the contents of the database. Can be used as a bulk-import.", guild=discord.Object(id=GUILD_ID))
-@app_commands.describe(file="Upload a Users.json file")
+@bot.tree.command(name="upload", description="Upload a Users.json or Users.csv file to replace the database. Can be used as a bulk-import.", guild=discord.Object(id=GUILD_ID))
 @has_role(REQUIRED_ROLE_ID)
 @is_in_guild(GUILD_ID)
-async def upload(interaction: Interaction, file: discord.Attachment):
+async def upload(interaction: discord.Interaction, file: discord.Attachment):
     await interaction.response.defer(ephemeral=True)
 
-    # File extension check
-    if not file.filename.lower().endswith(".json"):
-        await interaction.followup.send("Please upload a valid JSON file.", ephemeral=True)
-        return
+    filename = file.filename.lower()
+    if not (filename.endswith(".json") or filename.endswith(".csv")):
+        return await interaction.followup.send("Please upload a `.json` or `.csv` file.", ephemeral=True)
+
+    data = await file.read()
 
     try:
-        file_bytes = await file.read()
-        users_data = json.loads(file_bytes)
+        if filename.endswith(".json"):
+            users = json.loads(data.decode())
+            # Check if users database is a list of dicts
+            
+            if not isinstance(users, list):
+                raise ValueError("JSON file does not contain a list of users.")
+
+        elif filename.endswith(".csv"):
+            decoded = data.decode()
+            reader = csv.DictReader(io.StringIO(decoded))
+            users = list(reader)
     except Exception as e:
-        await interaction.followup.send(f"Failed to parse JSON: {e}", ephemeral=True)
-        return
+        return await interaction.followup.send(f"Failed to parse file: {e}", ephemeral=True)
 
-    # Prepare commit
-    content_str = json.dumps(users_data, indent=4)
-    content_b64 = base64.b64encode(content_str.encode()).decode()
+    try:
+        conn = get_db()
+        cur = conn.cursor()
 
-    async with aiohttp.ClientSession() as session:
-        # Get current file SHA
+        # Clear current database
+        cur.execute(sql.SQL('DELETE FROM "Users"'))
 
-        async with session.get(API_URL, headers=headers) as get_resp:
-            if get_resp.status != 200:
-                await interaction.followup.send(f"Failed to fetch current file info: HTTP {get_resp.status}", ephemeral=True)
-                return
-            data = await get_resp.json()
-            sha = data.get("sha")
-            if not sha:
-                await interaction.followup.send("Could not retrieve file SHA for update.", ephemeral=True)
-                return
+        # Insert users from uploaded file
+        insert_query = sql.SQL("""
+            INSERT INTO "Users" ("Identifier", "Rank", "JoinDate", "HWID", "Key", "DiscordId", "Notes")
+            VALUES (%s, %s, %s, %s, %s, %s, %s)
+        """)
 
-        # Commit new file content
-        commit_payload = {
-            "message": f"Upload Users.json by {interaction.user}",
-            "content": content_b64,
-            "branch": BRANCH,
-            "sha": sha
-        }
+        for user in users:
+            cur.execute(
+                insert_query,
+                (
+                    user.get("Identifier"),
+                    user.get("Rank"),
+                    user.get("JoinDate"),
+                    user.get("HWID"),
+                    user.get("Key"),
+                    user.get("DiscordId"),
+                    user.get("Notes"),
+                )
+            )
+        conn.commit()
+        cur.close()
+        conn.close()
+    except Exception as e:
+        return await interaction.followup.send(f"Database error: {e}", ephemeral=True)
 
-        async with session.put(API_URL, headers=headers, json=commit_payload) as put_resp:
-            if put_resp.status not in (200, 201):
-                error_text = await put_resp.text()
-                await interaction.followup.send(f"Failed to commit file: HTTP {put_resp.status}\n{error_text}", ephemeral=True)
-                return
-
-    await interaction.followup.send("Users.json uploaded successfully.", ephemeral=True)
+    await interaction.followup.send("Database replaced with uploaded file.", ephemeral=True)
 
 # // toggleaccess //
 
@@ -2007,80 +1746,34 @@ async def remove_temp_access_after(user: discord.Member, role: discord.Role, min
 
 # // dbsearch //
 
-class DbSearchView(discord.ui.View):
-    def __init__(self, bot, matches, current_index=0):
-        super().__init__(timeout=300)
-        self.bot = bot
-        self.matches = matches
-        self.current_index = current_index
-        self.update_buttons()
-
-    def update_buttons(self):
-        self.prev_button.disabled = self.current_index == 0
-        self.next_button.disabled = self.current_index >= len(self.matches) - 1
-
-    @discord.ui.button(label="⏮️ Previous", style=discord.ButtonStyle.secondary)
-    async def prev_button(self, interaction: discord.Interaction, button: discord.ui.Button):
-        self.current_index = max(0, self.current_index - 1)
-        self.update_buttons()
-        await interaction.response.edit_message(embed=self.create_embed(), view=self)
-
-    @discord.ui.button(label="⏭️ Next", style=discord.ButtonStyle.secondary)
-    async def next_button(self, interaction: discord.Interaction, button: discord.ui.Button):
-        self.current_index = min(len(self.matches) - 1, self.current_index + 1)
-        self.update_buttons()
-        await interaction.response.edit_message(embed=self.create_embed(), view=self)
-
-    def create_embed(self):
-        user = self.matches[self.current_index]
-        embed = discord.Embed(title=f"Search Result {self.current_index + 1}/{len(self.matches)}", color=discord.Color.green())
-        embed.add_field(name="Identifier", value=user.get("Identifier", "N/A"), inline=True)
-        embed.add_field(name="Rank", value=user.get("Rank", "N/A"), inline=True)
-
-        discord_id = user.get("DiscordId", "N/A")
-        mention = f"<@{discord_id}>" if isinstance(discord_id, str) and discord_id.isdigit() else "N/A"
-        embed.add_field(name="Discord ID", value=f"{discord_id} ({mention})", inline=True)
-        embed.add_field(name="HWID", value=f"||`{user.get('HWID', '')}`||", inline=False)
-        embed.add_field(name="Key", value=f"||`{user.get('Key', '')}`||", inline=False)
-
-        notes = user.get("Notes", "false")
-        if notes != "false" and notes.strip() != "":
-            embed.add_field(name="Notes", value=notes, inline=False)
-        return embed
-
 @bot.tree.command(name="dbsearch", description="Searches the entire database for a value.", guild=discord.Object(id=GUILD_ID))
-@app_commands.describe(query="Value to search for in all user fields")
+@app_commands.describe(query="Search term")
 @has_role(REQUIRED_ROLE_ID)
 @is_in_guild(GUILD_ID)
 async def dbsearch(interaction: discord.Interaction, query: str):
     await interaction.response.defer(ephemeral=True)
 
-    async with aiohttp.ClientSession() as session:
-        async with session.get(API_URL, headers=headers) as resp:
-            if resp.status != 200:
-                return await interaction.followup.send(f"Failed to fetch data: HTTP {resp.status}", ephemeral=True)
-            data = await resp.json()
-            content_b64 = data["content"]
-            users = json.loads(base64.b64decode(content_b64).decode("utf-8"))
+    conn = get_db()
+    cur = conn.cursor()
 
-    query_lower = query.lower()
+    # Fetch all users
+    cur.execute('SELECT * FROM "Users"')
+    rows = cur.fetchall()
+    conn.close()
+
+    # Rows are RealDictCursor dicts, so look through all
+
     matches = []
-
-    for user in users:
-        for value in user.values():
-            if isinstance(value, str) and query_lower in value.lower():
-                matches.append(user)
-                break
-            elif isinstance(value, (int, float)) and query_lower in str(value).lower():
-                matches.append(user)
-                break
+    for row in rows:
+        if any(query.lower() in (str(value).lower() if value else "") for value in row.values()):
+            matches.append(row)
 
     if not matches:
-        return await interaction.followup.send("No matching entries found.", ephemeral=True)
+        return await interaction.followup.send("No matches found.", ephemeral=True)
 
-    view = DbSearchView(bot, matches)
-    embed = view.create_embed()
-    await interaction.followup.send(embed=embed, view=view, ephemeral=True)
+    # Build list of matches
+    msg = "\n".join(f'ID: {m["DiscordId"]} (<@{m["DiscordId"]}>) | Identifier: {m.get("Identifier", "N/A")}' for m in matches)
+    await interaction.followup.send(f"**Matches:**\n{msg}", ephemeral=True)
 
 # // tempwhitelist //
 
@@ -2092,59 +1785,61 @@ async def tempwhitelist(interaction: discord.Interaction, user: discord.User, mi
     await interaction.response.defer(ephemeral=True)
     discord_id = str(user.id)
 
+    # Check if already temporarily whitelisted
     if discord_id in active_temp_whitelists:
+        expires = active_temp_whitelists[discord_id]
+        expires_str = f"<t:{int(expires.timestamp())}:F>"
         return await interaction.followup.send(
-            f"{user.mention} is already temporarily whitelisted until "
-            f"{active_temp_whitelists[discord_id].strftime('%Y-%m-%d %H:%M:%S UTC')}.",
+            f"{user.mention} is already temporarily whitelisted until {expires_str}.",
             ephemeral=True
         )
 
-    async with aiohttp.ClientSession() as session:
-        async with session.get(API_URL, headers=headers) as get_resp:
-            if get_resp.status != 200:
-                return await interaction.followup.send(f"Failed to fetch whitelist data: HTTP {get_resp.status}", ephemeral=True)
-            data = await get_resp.json()
-            content_b64 = data["content"]
-            sha = data["sha"]
-            whitelist = json.loads(base64.b64decode(content_b64).decode())
+    join_date = datetime.now(timezone.utc).date().isoformat()
+    expires_at = datetime.now(timezone.utc) + timedelta(minutes=minutes)
 
-        # Already whitelisted check via discord id
-        if any(str(u.get("DiscordId", "")) == discord_id for u in whitelist):
-            return await interaction.followup.send(f"{user.mention} is already in the whitelist.", ephemeral=True)
+    # Insert into the database
+    try:
+        conn = get_db()
+        cur = conn.cursor()
 
-        join_date = datetime.now(timezone.utc).date().isoformat()
-        new_entry = {
-            "Identifier": user.name,
-            "Rank": "Temp",
-            "DiscordId": discord_id,
-            "JoinDate": join_date,
-            "HWID": hwid,
-            "Key": generate_key(),
-            "Notes": f"Temp whitelist until {minutes} minutes from addition."
-        }
-        whitelist.append(new_entry)
+        # Check if user already in DB whitelist (full check is recommended in your real logic)
+        cur.execute('SELECT * FROM "Users" WHERE "DiscordId" = %s', (discord_id,))
+        existing = cur.fetchone()
+        if existing:
+            await interaction.followup.send(f"{user.mention} is already whitelisted in the database.", ephemeral=True)
+            cur.close()
+            conn.close()
+            return
 
-        updated_content = json.dumps(whitelist, indent=4)
-        updated_b64 = base64.b64encode(updated_content.encode()).decode()
-        commit_payload = {
-            "message": f"Temp whitelist added: {user.name} ({discord_id}) for {minutes} minutes",
-            "content": updated_b64,
-            "branch": BRANCH,
-            "sha": sha
-        }
-        async with session.put(API_URL, headers=headers, json=commit_payload) as put_resp:
-            if put_resp.status != 200:
-                err = await put_resp.text()
-                return await interaction.followup.send(f"Failed to commit whitelist addition: HTTP {put_resp.status}\n{err}", ephemeral=True)
+        # Insert new temp whitelist user with expiration timestamp
+        cur.execute("""
+            INSERT INTO "Users" ("Identifier", "Rank", "DiscordId", "JoinDate", "HWID", "Key", "Notes", "TempExpires")
+            VALUES (%s, %s, %s, %s, %s, %s, %s, %s)
+        """, (
+            user.name,
+            "Temp",
+            discord_id,
+            join_date,
+            hwid,
+            generate_key(),
+            f"Temp whitelist until {minutes} minutes from addition.",
+            expires_at  # datetime object stored as timestamptz
+        ))
+        conn.commit()
+        cur.close()
+        conn.close()
 
-    expiration_time = datetime.now(timezone.utc) + timedelta(minutes=minutes)
-    active_temp_whitelists[discord_id] = expiration_time
+    except Exception as e:
+        return await interaction.followup.send(f"Database error: {e}", ephemeral=True)
 
-    await interaction.followup.send(f"Temporarily whitelisted {user.mention} for {minutes} minutes.", ephemeral=True)
+    active_temp_whitelists[discord_id] = expires_at
+
+    expires_str = f"<t:{int(expires_at.timestamp())}:F>"
+    await interaction.followup.send(f"Temporarily whitelisted {user.mention} for {minutes} minutes (until {expires_str}).", ephemeral=True)
 
     async def notify_and_remove():
         try:
-            notify_time = expiration_time - timedelta(minutes=5)
+            notify_time = expires_at - timedelta(minutes=5)
             now = datetime.now(timezone.utc)
             if notify_time > now:
                 await asyncio.sleep((notify_time - now).total_seconds())
@@ -2154,31 +1849,19 @@ async def tempwhitelist(interaction: discord.Interaction, user: discord.User, mi
                     pass
 
             now = datetime.now(timezone.utc)
-            if expiration_time > now:
-                await asyncio.sleep((expiration_time - now).total_seconds())
+            if expires_at > now:
+                await asyncio.sleep((expires_at - now).total_seconds())
 
-            async with aiohttp.ClientSession() as session:
-                async with session.get(API_URL, headers=headers) as get_resp:
-                    if get_resp.status != 200:
-                        return
-                    data = await get_resp.json()
-                    content_b64 = data["content"]
-                    sha = data["sha"]
-                    whitelist = json.loads(base64.b64decode(content_b64).decode())
-
-                whitelist = [u for u in whitelist if str(u.get("DiscordId")) != discord_id]
-
-                updated_content = json.dumps(whitelist, indent=4)
-                updated_b64 = base64.b64encode(updated_content.encode()).decode()
-                commit_payload = {
-                    "message": f"Temp whitelist expired: {user.name} ({discord_id})",
-                    "content": updated_b64,
-                    "branch": BRANCH,
-                    "sha": sha
-                }
-                async with session.put(API_URL, headers=headers, json=commit_payload) as put_resp:
-                    if put_resp.status != 200:
-                        return
+            # Remove from DB
+            try:
+                conn = get_db()
+                cur = conn.cursor()
+                cur.execute('DELETE FROM "Users" WHERE "DiscordId" = %s AND "Rank" = %s', (discord_id, "Temp"))
+                conn.commit()
+                cur.close()
+                conn.close()
+            except Exception:
+                pass
 
             active_temp_whitelists.pop(discord_id, None)
 
@@ -2186,10 +1869,38 @@ async def tempwhitelist(interaction: discord.Interaction, user: discord.User, mi
                 await user.send("Your temporary whitelist has expired and access has now been removed.")
             except Exception:
                 pass
+
         except asyncio.CancelledError:
             pass
 
     asyncio.create_task(notify_and_remove())
+
+# // clearchat //
+
+@bot.tree.command(name="clearnotes", description="Clears the Notes field.", guild=discord.Object(id=GUILD_ID))
+@app_commands.describe(user="The user to clear notes for")
+@has_role(REQUIRED_ROLE_ID)
+@is_in_guild(GUILD_ID)
+async def clearnotes(interaction: discord.Interaction, user: discord.User):
+    await interaction.response.defer(ephemeral=True)
+    discord_id = str(user.id)
+
+    try:
+        conn = get_db()
+        cur = conn.cursor()
+        cur.execute('UPDATE "Users" SET "Notes" = NULL WHERE "DiscordId" = %s', (discord_id,))
+        conn.commit()
+        updated_rows = cur.rowcount
+        cur.close()
+        conn.close()
+
+        if updated_rows == 0:
+            await interaction.followup.send(f"No user found with Discord ID `{discord_id}`.", ephemeral=True)
+        else:
+            await interaction.followup.send(f"Cleared notes for user {user.mention}.", ephemeral=True)
+
+    except Exception as e:
+        await interaction.followup.send(f"Failed to clear notes: {e}", ephemeral=True)
 
 
 # --- Events ---
