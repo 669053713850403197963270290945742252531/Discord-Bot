@@ -25,7 +25,6 @@ import io
 import subprocess
 import hashlib
 from collections import defaultdict
-import sqlite3
 import csv
 import psycopg2
 from psycopg2.extras import RealDictCursor
@@ -64,9 +63,6 @@ intents = discord.Intents.default()
 intents.message_content = True
 intents.reactions = True
 intents.members = True
-
-conn = sqlite3.connect("users.db")
-cursor = conn.cursor()
 
 class Client(commands.Bot):
     async def on_ready(self):
