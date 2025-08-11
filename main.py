@@ -950,10 +950,15 @@ async def genkey(interaction: discord.Interaction):
 
 # // export //
 
-@bot.tree.command(name="export", description="Export the current database.", guild=discord.Object(id=GUILD_ID))
+@bot.tree.command(name="export", description="Exports the current database.", guild=discord.Object(id=GUILD_ID))
 @has_role(REQUIRED_ROLE_ID)
 @is_in_guild(GUILD_ID)
-async def export(interaction: discord.Interaction):
+@app_commands.describe(format="Select export format")
+@app_commands.choices(format=[
+    app_commands.Choice(name="JSON", value="json"),
+    app_commands.Choice(name="CSV", value="csv"),
+])
+async def export(interaction: discord.Interaction, format: app_commands.Choice[str]):
     await interaction.response.defer(ephemeral=True)
 
     async with aiohttp.ClientSession() as session:
@@ -964,13 +969,35 @@ async def export(interaction: discord.Interaction):
 
                 data = await get_resp.json()
                 content_b64 = data["content"]
-                file_bytes = base64.b64decode(content_b64)
         except Exception as e:
             return await interaction.followup.send(f"Error fetching: {e}", ephemeral=True)
 
-    # Send attachment
-    file = discord.File(io.BytesIO(file_bytes), filename="Users.json")
-    await interaction.followup.send("Here is the exported database:", file=file, ephemeral=True)
+    import io
+    import json
+    import base64
+
+    decoded = base64.b64decode(content_b64).decode('utf-8')
+    users = json.loads(decoded)
+
+    if format.value == "json":
+        file_bytes = base64.b64decode(content_b64)
+        file = discord.File(io.BytesIO(file_bytes), filename="Users.json")
+        await interaction.followup.send("Here is the exported JSON database:", file=file, ephemeral=True)
+
+    elif format.value == "csv":
+        import csv
+        output = io.StringIO()
+        if users:
+            fieldnames = users[0].keys()
+            writer = csv.DictWriter(output, fieldnames=fieldnames)
+            writer.writeheader()
+            for user in users:
+                writer.writerow(user)
+        else:
+            output.write("No data available.")
+
+        file = discord.File(io.BytesIO(output.getvalue().encode()), filename="Users.csv")
+        await interaction.followup.send("Here is the exported CSV database:", file=file, ephemeral=True)
 
 # // validatekey //
 
@@ -1279,8 +1306,10 @@ async def fetchuser(interaction: discord.Interaction, user: discord.User):
 @app_commands.choices(field=[
     app_commands.Choice(name="HWID", value="HWID"),
     app_commands.Choice(name="Identifier", value="Identifier"),
+    app_commands.Choice(name="Rank", value="Rank"),
     app_commands.Choice(name="Discord ID", value="DiscordId"),
-    app_commands.Choice(name="Key", value="Key")
+    app_commands.Choice(name="Key", value="Key"),
+    app_commands.Choice(name="All", value="All")
 ])
 @has_role(REQUIRED_ROLE_ID)
 @is_in_guild(GUILD_ID)
@@ -1297,26 +1326,54 @@ async def fetchdupes(interaction: discord.Interaction, field: app_commands.Choic
         except Exception as e:
             return await interaction.followup.send(f"Error fetching data: {e}", ephemeral=True)
 
-    field_name = field.value
-    value_map = defaultdict(list)
+    if field.value == "All":
+        # Check duplicates for all relevant fields, accumulate results
+        fields_to_check = ["HWID", "Identifier", "Rank", "DiscordId", "Key"]
+        dupes_all = {}
 
-    for entry in users:
-        value = entry.get(field_name)
-        if not value or value == "false":
-            continue
-        value_map[value].append(entry)
+        for fname in fields_to_check:
+            value_map = defaultdict(list)
+            for entry in users:
+                value = entry.get(fname)
+                if not value or value == "false":
+                    continue
+                value_map[value].append(entry)
+            dupes = {k: v for k, v in value_map.items() if len(v) > 1}
+            if dupes:
+                dupes_all[fname] = dupes
 
-    dupes = {k: v for k, v in value_map.items() if len(v) > 1}
+        if not dupes_all:
+            return await interaction.followup.send("No duplicates found in any fields.", ephemeral=True)
 
-    if not dupes:
-        return await interaction.followup.send(f"No duplicates found for **{field_name}**.", ephemeral=True)
+        embed = discord.Embed(title="🔁 Duplicate Entries: All Fields", color=discord.Color.orange(), timestamp=datetime.now(timezone.utc))
 
-    embed = discord.Embed(title=f"🔁 Duplicate Entries: `{field_name}`", color=discord.Color.orange(), timestamp=datetime.now(timezone.utc))
+        for fname, dupes in dupes_all.items():
+            embed.add_field(name=f"Field: {fname}", value="—", inline=False)
+            for value, entries in dupes.items():
+                identifiers = ", ".join(entry.get("Identifier", "Unknown") for entry in entries)
+                value_display = f"`{value}`" if len(value) <= 50 else f"`{value[:47]}...`"
+                embed.add_field(name=value_display, value=f"Count: `{len(entries)}` — {identifiers}", inline=False)
 
-    for value, entries in dupes.items():
-        identifiers = ", ".join(entry.get("Identifier", "Unknown") for entry in entries)
-        value_display = f"`{value}`" if len(value) <= 50 else f"`{value[:47]}...`"
-        embed.add_field(name=value_display, value=f"Count: `{len(entries)}` — {identifiers}", inline=False)
+    else:
+        # Single field duplicate check
+        value_map = defaultdict(list)
+        for entry in users:
+            value = entry.get(field.value)
+            if not value or value == "false":
+                continue
+            value_map[value].append(entry)
+
+        dupes = {k: v for k, v in value_map.items() if len(v) > 1}
+
+        if not dupes:
+            return await interaction.followup.send(f"No duplicates found for **{field.value}**.", ephemeral=True)
+
+        embed = discord.Embed(title=f"🔁 Duplicate Entries: `{field.value}`", color=discord.Color.orange(), timestamp=datetime.now(timezone.utc))
+
+        for value, entries in dupes.items():
+            identifiers = ", ".join(entry.get("Identifier", "Unknown") for entry in entries)
+            value_display = f"`{value}`" if len(value) <= 50 else f"`{value[:47]}...`"
+            embed.add_field(name=value_display, value=f"Count: `{len(entries)}` — {identifiers}", inline=False)
 
     await interaction.followup.send(embed=embed, ephemeral=True)
 
@@ -2237,6 +2294,60 @@ async def on_raw_reaction_add(payload):
                     except discord.Forbidden:
                         pass
             break
+
+# // clearnotes //
+
+@bot.tree.command(name="clearnotes", description="Clears the notes field for a user in the GitHub whitelist JSON.", guild=discord.Object(id=GUILD_ID))
+@app_commands.describe(user="The user whose notes to clear")
+@has_role(REQUIRED_ROLE_ID)
+@is_in_guild(GUILD_ID)
+async def clearnotes(interaction: discord.Interaction, user: discord.User):
+    await interaction.response.defer(ephemeral=True)
+
+    try:
+        async with aiohttp.ClientSession() as session:
+            # Fetch current JSON content from GitHub
+            async with session.get(API_URL, headers=headers) as get_resp:
+                if get_resp.status != 200:
+                    return await interaction.followup.send(f"Failed to fetch whitelist data: HTTP {get_resp.status}", ephemeral=True)
+                data = await get_resp.json()
+                content_b64 = data["content"]
+                sha = data["sha"]
+                users = json.loads(base64.b64decode(content_b64).decode("utf-8"))
+
+            # Find user by DiscordId and clear notes
+            discord_id_str = str(user.id)
+            found = False
+            for entry in users:
+                if str(entry.get("DiscordId")) == discord_id_str:
+                    entry["Notes"] = "false"  # or "" if you prefer
+                    found = True
+                    break
+
+            if not found:
+                return await interaction.followup.send(f"No user found with Discord ID {user.mention}.", ephemeral=True)
+
+            # Prepare updated content and encode
+            updated_content = json.dumps(users, indent=4)
+            updated_b64 = base64.b64encode(updated_content.encode()).decode("utf-8")
+
+            # Commit payload
+            commit_payload = {
+                "message": f"Cleared notes for user: {user} ({discord_id_str})",
+                "content": updated_b64,
+                "branch": BRANCH,
+                "sha": sha
+            }
+
+            async with session.put(API_URL, headers=headers, json=commit_payload) as put_resp:
+                if put_resp.status != 200:
+                    err_text = await put_resp.text()
+                    return await interaction.followup.send(f"Failed to commit changes: HTTP {put_resp.status}\n{err_text}", ephemeral=True)
+
+            await interaction.followup.send(f"Notes cleared for {user.mention}.", ephemeral=True)
+
+    except Exception as e:
+        await interaction.followup.send(f"Error: {e}", ephemeral=True)
 
 
 # --- Error Handler ---
