@@ -13,25 +13,29 @@ from discord.ext import commands, tasks
 from discord.app_commands import errors as app_errors
 from discord import app_commands, InteractionResponded, ui, Interaction
 import asyncio
-from typing import Optional
+from typing import Optional, Dict, Any
 from datetime import datetime, timezone, timedelta
 import json
 import base64
 import re
 import io
 import csv
-from discord.ui import Modal, TextInput, View, Button, LayoutView, Container, TextDisplay, ActionRow, Section, Thumbnail, File
+import difflib
+from discord.ui import Modal, TextInput, View, Button, LayoutView, Container, TextDisplay, ActionRow, Section, Thumbnail, File, Label, Select
 from collections import defaultdict
 
 import bot_api
 from bot_api import (
-    GUILD_ID, REQUIRED_ROLE_ID, REGISTRATION_CHANNEL_ID, REACTION_ROLE_CHANNEL_ID,
+    GUILD_ID, REQUIRED_ROLE_ID, REGISTRATION_CHANNEL_ID, REACTION_ROLE_CHANNEL_ID, PANEL_CHANNEL_ID, BUYER_ROLE_ID,
+    REDEEM_ALERTS_CHANNEL_ID,
     GitHubAPIError,
     fetch_raw_users, fetch_users_with_sha, fetch_api_file, fetch_raw_text,
     fetch_api_text_and_sha, commit_content, commit_users, get_current_sha,
     list_commits, get_commit,
+    fetch_permitted_keys_with_sha, commit_permitted_keys, remove_permitted_key, is_key_permitted,
+    fetch_stored_script, inject_script_key,
     find_user_by_discord_id, find_user_by_hwid, find_user_by_key, remove_user_by_discord_id, build_user_entry,
-    generate_key, generate_unique_key, is_valid_hwid, is_valid_discord_id, is_valid_date,
+    generate_key, generate_unique_key, is_valid_hwid, is_valid_discord_id,
     format_discord_timestamp, format_join_date,
     format_expiration_note, parse_expiration_note, humanize_timeleft,
     safe_respond, notify_user, notify_permission_error, has_role, is_in_guild, can_moderate,
@@ -61,6 +65,15 @@ class Client(commands.Bot):
     async def on_ready(self):
         print(f"Logged in as {self.user} ({self.user.id})")
         await bot.change_presence(activity=discord.Activity(type=discord.ActivityType.watching, name="database"))
+
+        # Re-registers the /createpanel control panel's button handlers so
+        # they keep responding after a bot restart. This does NOT resend the
+        # message -- the panel embed posted by /createpanel stays put in
+        # #panel; this just reconnects its (fixed custom_id) buttons to a
+        # live view again, since ControlPanelView(timeout=None) instances
+        # don't otherwise survive a process restart.
+        self.add_view(ControlPanelView())
+
         try:
             guild_obj = discord.Object(id=GUILD_ID)
             synced = await self.tree.sync(guild=guild_obj)
@@ -481,51 +494,108 @@ async def verifydata(interaction: discord.Interaction):
 
 # // whitelist //
 
+# Discord's String Select requires a fixed, predefined set of choices (max 25)
+# -- unlike the old free-text `rank` argument, which accepted anything.
+# Edit this list to match whatever rank tiers are actually in use.
+WHITELIST_RANKS = ["User", "Premium", "VIP", "Staff", "Admin", "Owner"]
+
+
+class WhitelistModal(Modal, title="Whitelist a User"):
+    identifier = Label(
+        text="Identifier",
+        description="Username or alias for this entry.",
+        component=TextInput(placeholder="e.g. JohnDoe", max_length=100),
+    )
+    hwid = Label(
+        text="HWID",
+        description="Pre-hashed HWID in SHA-256 (64 hex characters).",
+        component=TextInput(placeholder="64-character hex string", min_length=64, max_length=64),
+    )
+    target_user = Label(
+        text="Discord User",
+        description="Discord ID or @mention. Works even if they aren't in this server.",
+        component=TextInput(placeholder="e.g. 123456789012345678 or <@123456789012345678>", max_length=32),
+    )
+    rank = Label(
+        text="Rank",
+        description="The rank to assign this user.",
+        component=Select(
+            placeholder="Select a rank...",
+            min_values=1,
+            max_values=1,
+            required=True,
+            options=[discord.SelectOption(label=r) for r in WHITELIST_RANKS],
+        ),
+    )
+    notes = Label(
+        text="Notes",
+        description="Optional notes to keep reminders about this user.",
+        component=TextInput(style=discord.TextStyle.paragraph, placeholder="Leave blank for none", required=False, max_length=500),
+    )
+
+    async def on_submit(self, interaction: discord.Interaction):
+        identifier = self.identifier.component.value.strip()
+        hwid = self.hwid.component.value.strip()
+        rank = self.rank.component.values[0]
+        notes = (self.notes.component.value or "").strip() or None
+
+        # Checks that don't need any network calls run first, and respond
+        # immediately (without deferring) so an obviously bad submission
+        # errors right away in the modal instead of waiting on a fetch.
+
+        raw_target = self.target_user.component.value.strip()
+        mention_match = re.fullmatch(r"<@!?(\d{17,20})>", raw_target)
+        discord_id = mention_match.group(1) if mention_match else raw_target
+
+        if not is_valid_discord_id(discord_id):
+            return await send_error(
+                interaction,
+                "Invalid Discord User. Enter a valid Discord ID or @mention "
+                "(e.g. `123456789012345678` or `<@123456789012345678>`) -- this works "
+                "even if the user isn't in this server.",
+            )
+        mention = f"<@{discord_id}>"
+
+        if not is_valid_hwid(hwid):
+            return await send_error(interaction, "Invalid HWID format. Must be 64 hex characters (SHA-256).")
+
+        await interaction.response.defer(ephemeral=True)
+
+        try:
+            users, sha = await fetch_users_with_sha()
+        except GitHubAPIError as e:
+            return await send_error(interaction, str(e))
+
+        # Duplicate checks
+
+        existing = find_user_by_discord_id(users, discord_id)
+        if existing:
+            return await send_error(interaction, f"{mention} is already whitelisted as **{existing.get('Identifier', 'Unknown')}**.")
+
+        existing = find_user_by_hwid(users, hwid)
+        if existing:
+            return await send_error(interaction, f"This HWID is already whitelisted under **{existing.get('Identifier', 'Unknown')}** (<@{existing.get('DiscordId')}>).")
+
+        generated_key = generate_unique_key(users)
+
+        try:
+            users.append(build_user_entry(hwid, identifier, rank, discord_id, generated_key, notes))
+            await commit_users(users, sha, f"Whitelist user: {identifier} ({discord_id})")
+        except GitHubAPIError as e:
+            return await send_error(interaction, str(e))
+
+        await send_success(
+            interaction,
+            f"**{identifier}** ({mention}) has been whitelisted.",
+            fields=[("HWID", f"||`{hwid}`||", False)],
+        )
+
+
 @bot.tree.command(name="whitelist", description="Adds a user to the database.", guild=discord.Object(id=GUILD_ID))
-@app_commands.describe(identifier="Username or alias", hwid="Pre-hashed HWID in SHA-256", user="Discord user to whitelist", rank="User rank", notes="Notes to keep reminders about this user")
 @has_role(REQUIRED_ROLE_ID)
 @is_in_guild(GUILD_ID)
-async def whitelist(interaction: discord.Interaction, identifier: str, hwid: str, user: discord.User, rank: str, notes: str = None):
-    await interaction.response.defer(ephemeral=True)
-
-    discord_id = str(user.id)
-
-    # Checks
-
-    if not is_valid_hwid(hwid):
-        return await send_error(interaction, "Invalid HWID format. Must be 64 hex characters (SHA-256).")
-
-    if notes is not None and not notes.strip():
-        return await send_error(interaction, "Notes must be left blank or a non-empty string.")
-
-    try:
-        users, sha = await fetch_users_with_sha()
-    except GitHubAPIError as e:
-        return await send_error(interaction, str(e))
-
-    # Duplicate checks
-
-    existing = find_user_by_discord_id(users, discord_id)
-    if existing:
-        return await send_error(interaction, f"{user.mention} is already whitelisted as **{existing.get('Identifier', 'Unknown')}**.")
-
-    existing = find_user_by_hwid(users, hwid)
-    if existing:
-        return await send_error(interaction, f"This HWID is already whitelisted under **{existing.get('Identifier', 'Unknown')}** (<@{existing.get('DiscordId')}>).")
-
-    generated_key = generate_unique_key(users)
-
-    try:
-        users.append(build_user_entry(hwid, identifier, rank, discord_id, generated_key, notes))
-        await commit_users(users, sha, f"Whitelist user: {identifier} ({discord_id})")
-    except GitHubAPIError as e:
-        return await send_error(interaction, str(e))
-
-    await send_success(
-        interaction,
-        f"**{identifier}** has been whitelisted.",
-        fields=[("HWID", f"||`{hwid}`||", False)],
-    )
+async def whitelist(interaction: discord.Interaction):
+    await interaction.response.send_modal(WhitelistModal())
 
 # // unwhitelist //
 
@@ -627,34 +697,146 @@ async def editwhitelist(interaction: discord.Interaction):
 
 # // edituser //
 
-@bot.tree.command(name="edituser", description="Edits a specific field of a whitelisted user.", guild=discord.Object(id=GUILD_ID))
-@app_commands.describe(user="User to edit", field="Field to edit", value="New value for the field")
-@app_commands.choices(field=[
-    app_commands.Choice(name="HWID", value="HWID"),
-    app_commands.Choice(name="Identifier", value="Identifier"),
-    app_commands.Choice(name="Rank", value="Rank"),
-    app_commands.Choice(name="JoinDate", value="JoinDate"),
-    app_commands.Choice(name="DiscordId", value="DiscordId"),
-    app_commands.Choice(name="Key", value="Key"),
-    app_commands.Choice(name="Notes", value="Notes")
-])
+class EditUserCommandModal(Modal):
+    """Multi-field edit modal opened by /edituser. Unlike WhitelistModal
+    (a brand new, always-empty entry), this needs to be pre-filled with the
+    target's *current* values, which aren't known until the command runs --
+    so the Label-wrapped fields are built per-instance in __init__ and
+    added with add_item(), rather than declared as static class attributes.
+
+    Which Discord user's entry this is editing is already fixed by the
+    /edituser `user` argument, so the modal doesn't ask that again. It does
+    still expose a "Discord User" field (styled the same free-text ID/mention
+    way as /whitelist) so a wrong DiscordId can be corrected without
+    reaching for /editwhitelist -- that's a distinct thing from "which entry
+    did we load".
+
+    Discord caps modals at 5 top-level components, so JoinDate and Key
+    are intentionally left out (same 5 fields /whitelist itself asks for);
+    those can still be changed via /editwhitelist or the Edit User button
+    on /viewwhitelist.
+    """
+
+    def __init__(self, user_entry: Dict[str, Any]):
+        title = f"Edit {user_entry.get('Identifier', 'User')}"
+        if len(title) > 45:
+            title = title[:42] + "..."
+        super().__init__(title=title)
+
+        # Stored so on_submit can tell "untouched" from "deliberately
+        # changed" -- see the comment above the HWID check below.
+        self.original_discord_id = str(user_entry.get("DiscordId", ""))
+        self.original_hwid = (user_entry.get("HWID") or "").strip()
+
+        self.identifier = Label(
+            text="Identifier",
+            description="Username or alias for this entry.",
+            component=TextInput(default=(user_entry.get("Identifier") or "")[:100], placeholder="e.g. JohnDoe", max_length=100),
+        )
+        self.discord_user = Label(
+            text="Discord User",
+            description="Discord ID or @mention. Works even if not in server.",
+            component=TextInput(default=self.original_discord_id[:32], placeholder="e.g. 123456789012345678 or <@123...>", max_length=32),
+        )
+        self.rank = Label(
+            text="Rank",
+            description="The rank to assign this user.",
+            component=TextInput(default=(user_entry.get("Rank") or "")[:50], placeholder="e.g. VIP", max_length=50),
+        )
+        self.hwid = Label(
+            text="HWID",
+            description="Pre-hashed HWID in SHA-256 (64 hex characters).",
+            # No min_length here (unlike /whitelist's HWID field) -- some
+            # existing entries may not hold a strict 64-char value, and a
+            # `default` that violates the field's own min/max length makes
+            # Discord reject opening the modal entirely. Correctness is
+            # instead enforced in on_submit.
+            component=TextInput(default=self.original_hwid[:100], placeholder="64-character hex string", max_length=100),
+        )
+        self.notes = Label(
+            text="Notes",
+            description="Optional notes to keep reminders about this user.",
+            component=TextInput(style=discord.TextStyle.paragraph, default=(user_entry.get("Notes") or "")[:500], placeholder="Leave blank for none", required=False, max_length=500),
+        )
+
+        for field in (self.identifier, self.discord_user, self.rank, self.hwid, self.notes):
+            self.add_item(field)
+
+    async def on_submit(self, interaction: discord.Interaction):
+        identifier = self.identifier.component.value.strip()
+        rank = self.rank.component.value.strip()
+        hwid = self.hwid.component.value.strip()
+        notes = (self.notes.component.value or "").strip() or None
+
+        raw_target = self.discord_user.component.value.strip()
+        mention_match = re.fullmatch(r"<@!?(\d{17,20})>", raw_target)
+        discord_id = mention_match.group(1) if mention_match else raw_target
+
+        # Checks that don't need any network calls run first, and respond
+        # immediately (without deferring) so a bad submission errors right
+        # away in the modal instead of waiting on a fetch.
+
+        if not is_valid_discord_id(discord_id):
+            return await send_error(
+                interaction,
+                "Invalid Discord User. Enter a valid Discord ID or @mention "
+                "(e.g. `123456789012345678` or `<@123456789012345678>`).",
+            )
+
+        # Only enforce the HWID format if it was actually changed, so a
+        # legacy/malformed value left untouched doesn't block edits to the
+        # other fields.
+        if hwid != self.original_hwid and not is_valid_hwid(hwid):
+            return await send_error(interaction, "Invalid HWID format. Must be 64 hex characters (SHA-256).")
+
+        mention = f"<@{discord_id}>"
+
+        await interaction.response.defer(ephemeral=True)
+
+        try:
+            users, sha = await fetch_users_with_sha()
+        except GitHubAPIError as e:
+            return await send_error(interaction, str(e))
+
+        entry = find_user_by_discord_id(users, self.original_discord_id)
+        if not entry:
+            return await send_error(interaction, "This user's whitelist entry no longer exists (it may have been removed by someone else).")
+
+        if discord_id != self.original_discord_id:
+            collision = find_user_by_discord_id(users, discord_id)
+            if collision and collision is not entry:
+                return await send_error(interaction, f"{mention} is already whitelisted as **{collision.get('Identifier', 'Unknown')}**.")
+
+        if hwid != self.original_hwid:
+            collision = find_user_by_hwid(users, hwid)
+            if collision and collision is not entry:
+                return await send_error(interaction, f"This HWID is already whitelisted under **{collision.get('Identifier', 'Unknown')}** (<@{collision.get('DiscordId')}>).")
+
+        entry["Identifier"] = identifier
+        entry["DiscordId"] = discord_id
+        entry["Rank"] = rank
+        entry["HWID"] = hwid
+        entry["Notes"] = notes
+
+        try:
+            await commit_users(users, sha, f"Edited whitelist user: {identifier} ({discord_id})")
+        except GitHubAPIError as e:
+            return await send_error(interaction, str(e))
+
+        await send_success(
+            interaction,
+            f"**{identifier}** ({mention}) has been updated.",
+            fields=[("HWID", f"||`{hwid}`||", False)],
+        )
+
+
+@bot.tree.command(name="edituser", description="Edits a whitelisted user's info.", guild=discord.Object(id=GUILD_ID))
+@app_commands.describe(user="User to edit")
 @has_role(REQUIRED_ROLE_ID)
 @is_in_guild(GUILD_ID)
-async def edituser(interaction: discord.Interaction, user: discord.User, field: app_commands.Choice[str], value: str):
-    await interaction.response.defer(ephemeral=True)
-
-    field_name = field.value
-
-    # Input checks per field
-    if field_name == "HWID" and not is_valid_hwid(value):
-        return await send_error(interaction, "Invalid HWID format. Must be 64 hex characters and in SHA-256.")
-    if field_name == "JoinDate" and not is_valid_date(value):
-        return await send_error(interaction, "Invalid JoinDate format. Use mm/dd/yyyy, hh:mm:ss AM/PM (e.g. 6/19/2026, 3:24:53 AM).")
-    if field_name == "DiscordId" and not is_valid_discord_id(value):
-        return await send_error(interaction, "Invalid Discord ID format.")
-
+async def edituser(interaction: discord.Interaction, user: discord.User):
     try:
-        users, sha = await fetch_users_with_sha()
+        users, _sha = await fetch_users_with_sha()
     except GitHubAPIError as e:
         return await send_error(interaction, str(e))
 
@@ -662,14 +844,7 @@ async def edituser(interaction: discord.Interaction, user: discord.User, field: 
     if not user_entry:
         return await send_error(interaction, f"User {user.mention} not found in whitelist.")
 
-    user_entry[field_name] = value
-
-    try:
-        await commit_users(users, sha, f"Edit whitelist user {user} - set {field_name} to {value}")
-    except GitHubAPIError as e:
-        return await send_error(interaction, str(e))
-
-    await send_success(interaction, f"Updated {field_name} for {user.mention} to:\n```{value}```")
+    await interaction.response.send_modal(EditUserCommandModal(user_entry))
 
 # // genkey //
 
@@ -795,20 +970,55 @@ async def rollback(interaction: discord.Interaction, sha: str):
     raw_url = f"https://raw.githubusercontent.com/{bot_api.OWNER}/{bot_api.REPO}/{sha}/{bot_api.FILE_PATH}"
 
     try:
-        old_content = await fetch_raw_text(raw_url)
-        json.loads(old_content)
+        restored_content = await fetch_raw_text(raw_url)
+        json.loads(restored_content)
     except GitHubAPIError as e:
         return await send_error(interaction, str(e))
     except json.JSONDecodeError as e:
         return await send_error(interaction, f"Error loading commit content: {e}")
 
     try:
-        current_sha = await get_current_sha()
-        await commit_content(old_content, current_sha, f"Rollback Users.json to commit {sha}")
+        current_content, current_sha = await fetch_api_text_and_sha()
+        await commit_content(restored_content, current_sha, f"Rollback Users.json to commit {sha}")
     except GitHubAPIError as e:
         return await send_error(interaction, str(e))
 
-    await send_success(interaction, f"Successfully rolled back the database to commit `{sha}`.")
+    # Diff what's being replaced against what was just restored, so staff
+    # can see exactly what the rollback changed without cross-referencing
+    # /commithistory or GitHub directly.
+    diff_lines = list(difflib.unified_diff(
+        current_content.splitlines(),
+        restored_content.splitlines(),
+        fromfile="Users.json (before rollback)",
+        tofile=f"Users.json (rolled back to {sha[:7]})",
+        lineterm="",
+    ))
+
+    description = f"Successfully rolled back the database to commit `{sha}`."
+    diff_file = None
+    diff_filename = None
+
+    if not diff_lines:
+        description += "\n\nNo changes -- content is identical to the current version."
+    else:
+        diff_text = "\n".join(diff_lines)
+        # Keep well under Discord's message/embed limits; attach as a file
+        # instead of truncating if the diff doesn't fit inline.
+        if len(diff_text) <= 1800:
+            description += f"\n\n```diff\n{diff_text}\n```"
+        else:
+            diff_filename = f"rollback_{sha[:7]}.diff"
+            description += f"\n\nDiff too large to display inline ({len(diff_lines)} lines) — see attached file below."
+            diff_file = discord.File(io.BytesIO(diff_text.encode()), filename=diff_filename)
+
+    if diff_file:
+        # Components V2 layout (same helper /export uses) so the text always
+        # renders above the attached file, instead of relying on Discord's
+        # default embed/attachment ordering.
+        layout = file_success_layout(description, diff_filename)
+        await interaction.followup.send(view=layout, file=diff_file, ephemeral=True)
+    else:
+        await send_success(interaction, description)
 
 # // commithistory //
 
@@ -2310,6 +2520,435 @@ async def clearnotes(interaction: discord.Interaction, user: discord.User):
         return await send_error(interaction, str(e))
 
     await send_success(interaction, f"Notes cleared for {user.mention}.")
+
+
+# // createpanel //
+
+CONTROL_PANEL_TITLE = "### Control Panel"
+CONTROL_PANEL_DESCRIPTION = "Click the buttons below to redeem your key, get the script, or get your role."
+
+# Fixed custom_ids so Discord routes button presses back to these handlers
+# even after a bot restart (see ControlPanelView + Client.on_ready).
+PANEL_REDEEM_KEY_ID = "panel_redeem_key"
+PANEL_GET_SCRIPT_ID = "panel_get_script"
+PANEL_GET_ROLE_ID = "panel_get_role"
+PANEL_RESET_HWID_ID = "panel_reset_hwid"
+PANEL_GET_INFO_ID = "panel_get_info"
+
+
+# // createpanel - redeem alerts //
+
+async def send_redeem_alert(embed: discord.Embed, view: Optional[View] = None):
+    """Best-effort delivery to the Redeem Alerts channel for the control
+    panel's Redeem Key flow (successful redemptions + HWID-breach attempts).
+    A missing channel or delivery failure here is logged and swallowed
+    rather than surfaced to the redeeming user -- their redemption already
+    succeeded or failed on its own, independent of whether staff got
+    notified about it."""
+    channel = bot.get_channel(REDEEM_ALERTS_CHANNEL_ID)
+    if not channel:
+        print(f"Redeem Alerts channel not found (REDEEM_ALERTS_CHANNEL_ID={REDEEM_ALERTS_CHANNEL_ID}). Set it in bot_api.py.")
+        return
+
+    try:
+        if view is not None:
+            await channel.send(embed=embed, view=view)
+        else:
+            await channel.send(embed=embed)
+    except Exception as e:
+        print(f"Failed to send alert to Redeem Alerts channel: {e}")
+
+
+class HWIDBreachAlertView(View):
+    """Attached to the "Potential Breach" alert posted when a Redeem Key
+    attempt reuses an HWID that's already whitelisted under a different
+    Discord account. The button bans BOTH accounts involved -- the
+    attempting redeemer (for trying to use someone else's HWID) and the
+    existing owner of that HWID (presumed to have shared/leaked their
+    access) -- and unwhitelists the owner's Users.json entry. Only the
+    owner's entry gets removed since the attempting redeemer never
+    actually gets whitelisted in this scenario (find_user_by_hwid blocks
+    the redemption before anything is committed).
+
+    Unlike ControlPanelView, this isn't re-registered in on_ready, so the
+    button only stays clickable until the next bot restart -- past that,
+    fall back to /unwhitelist + /ban manually using the IDs in the embed."""
+
+    def __init__(self, owner_discord_id: str, owner_identifier: str, hwid: str, attempting_discord_id: str):
+        super().__init__(timeout=None)
+        self.owner_discord_id = owner_discord_id
+        self.owner_identifier = owner_identifier
+        self.hwid = hwid
+        self.attempting_discord_id = attempting_discord_id
+
+        button = Button(label="❌ Unwhitelist & Ban Both", style=discord.ButtonStyle.danger, custom_id="breach_unwhitelist_ban")
+        button.callback = self.unwhitelist_and_ban
+        self.add_item(button)
+
+    async def _ban(self, interaction: discord.Interaction, discord_id: str, reason: str) -> str:
+        """Bans a single Discord ID (member or not), DMs them a best-effort
+        notice, and returns a one-line result string for the summary."""
+        try:
+            user = await bot.fetch_user(int(discord_id))
+        except (discord.NotFound, ValueError):
+            user = None
+
+        if user:
+            try:
+                await notify_user(user, "banned", interaction.user, reason, interaction.guild.name)
+            except Exception as e:
+                print(f"Failed to DM {user}: {e}")
+
+        try:
+            await interaction.guild.ban(discord.Object(id=int(discord_id)), reason=reason)
+        except discord.Forbidden:
+            return f"❌ Failed to ban `{discord_id}` (missing permissions)"
+        except discord.HTTPException as e:
+            return f"❌ Failed to ban `{discord_id}`: {e}"
+
+        return f"✅ Banned {user.mention if user else f'`{discord_id}`'}"
+
+    async def unwhitelist_and_ban(self, interaction: discord.Interaction):
+        if REQUIRED_ROLE_ID not in [role.id for role in interaction.user.roles]:
+            return await send_error(interaction, "You do not have the required permissions to do this.")
+
+        await interaction.response.defer(ephemeral=True)
+
+        results = []
+
+        # Unwhitelist the owner's entry -- the attempting redeemer never had
+        # one to begin with, since the duplicate-HWID check blocks the
+        # redemption before it's committed.
+        try:
+            users, sha = await fetch_users_with_sha()
+            filtered, removed = remove_user_by_discord_id(users, self.owner_discord_id)
+            if removed:
+                await commit_users(filtered, sha, f"Unwhitelisted (HWID breach): {self.owner_identifier} ({self.owner_discord_id})")
+                results.append(f"✅ Unwhitelisted **{self.owner_identifier}**")
+            else:
+                results.append(f"⚠️ No whitelist entry found for **{self.owner_identifier}** (may already be removed)")
+        except GitHubAPIError as e:
+            results.append(f"❌ Failed to unwhitelist **{self.owner_identifier}**: {e}")
+
+        # Ban both accounts, each in its own try/except (via _ban) so a
+        # failure on one doesn't block the other.
+        owner_reason = f"HWID breach -- HWID shared/leaked, actioned by {interaction.user}"
+        attempting_reason = f"HWID breach -- attempted redemption using another user's HWID, actioned by {interaction.user}"
+
+        results.append(await self._ban(interaction, self.owner_discord_id, owner_reason))
+        if self.attempting_discord_id != self.owner_discord_id:
+            results.append(await self._ban(interaction, self.attempting_discord_id, attempting_reason))
+
+        # Mark the alert as handled so it can't be actioned twice, and
+        # record who resolved it directly on the original embed.
+        for item in self.children:
+            item.disabled = True
+        self.children[0].label = "Resolved"
+
+        try:
+            resolved_embed = interaction.message.embeds[0]
+            resolved_embed.color = discord.Color.dark_grey()
+            resolved_embed.add_field(name="Resolved By", value=f"{interaction.user.mention} (`{interaction.user.id}`)", inline=False)
+            await interaction.message.edit(embed=resolved_embed, view=self)
+        except Exception as e:
+            print(f"Failed to update breach alert message: {e}")
+
+        await send_success(interaction, "\n".join(results), title="Breach Action Complete")
+
+
+class RedeemKeyModal(Modal, title="Redeem Key"):
+    """Self-service equivalent of /register + /whitelist: the user supplies
+    their key and pre-hashed HWID (same SHA-256 format enforced everywhere
+    else in this file, via is_valid_hwid), the key is checked against
+    permittedKeys.txt, and -- if valid -- a new Users.json entry is
+    committed for them directly, with no moderator step in between. On
+    success, the redeemed key is also removed from permittedKeys.txt so it
+    can't be used again."""
+
+    key = Label(
+        text="Key",
+        description="The key you were given to redeem.",
+        component=TextInput(placeholder="Enter your key", max_length=100),
+    )
+    hwid = Label(
+        text="HWID",
+        description="Pre-hashed HWID in SHA-256 (64 hex characters). Run /gethwid for help getting yours.",
+        component=TextInput(placeholder="64-character hex string", min_length=64, max_length=64),
+    )
+
+    async def on_submit(self, interaction: discord.Interaction):
+        key = self.key.component.value.strip()
+        hwid = self.hwid.component.value.strip()
+
+        # Format checks that don't need any network calls run first, so an
+        # obviously malformed HWID errors immediately instead of waiting on
+        # two GitHub fetches.
+        if not is_valid_hwid(hwid):
+            return await send_error(interaction, "Invalid HWID format. Must be 64 hex characters (SHA-256).")
+
+        await interaction.response.defer(ephemeral=True)
+
+        try:
+            permitted_keys, keys_sha = await fetch_permitted_keys_with_sha()
+        except GitHubAPIError as e:
+            return await send_error(interaction, str(e))
+
+        if not is_key_permitted(key, permitted_keys):
+            return await send_error(interaction, "That key is invalid. Please double-check it and try again.")
+
+        try:
+            users, sha = await fetch_users_with_sha()
+        except GitHubAPIError as e:
+            return await send_error(interaction, str(e))
+
+        discord_id_str = str(interaction.user.id)
+
+        existing = find_user_by_discord_id(users, discord_id_str)
+        if existing:
+            return await send_error(interaction, "You have already redeemed a key and are whitelisted.")
+
+        existing_hwid = find_user_by_hwid(users, hwid)
+        if existing_hwid:
+            owner_identifier = existing_hwid.get("Identifier", "Unknown")
+            owner_discord_id = str(existing_hwid.get("DiscordId", ""))
+
+            breach_embed = build_embed(
+                title="🚨 Potential Breach: Duplicate HWID",
+                description=(
+                    f"{interaction.user.mention} attempted to redeem a key using an HWID that's "
+                    f"already whitelisted under a different account. No user should ever have "
+                    f"someone else's HWID -- this likely means **{owner_identifier}**'s access "
+                    "was shared or leaked."
+                ),
+                color=discord.Color.orange(),
+                fields=[
+                    ("Attempting User", f"{interaction.user.mention} (`{discord_id_str}`)", False),
+                    ("HWID Owner", f"**{owner_identifier}** (`{owner_discord_id}`)", False),
+                    ("HWID", f"||`{hwid}`||", False),
+                    ("Key Attempted", f"||`{key}`||", False),
+                ],
+                timestamp=datetime.now(timezone.utc),
+            )
+            await send_redeem_alert(breach_embed, HWIDBreachAlertView(owner_discord_id, owner_identifier, hwid, discord_id_str))
+
+            return await send_error(
+                interaction,
+                f"This HWID is already whitelisted under **{owner_identifier}**.",
+            )
+
+        existing_key = find_user_by_key(users, key)
+        if existing_key:
+            return await send_error(interaction, "This key has already been redeemed by someone else.")
+
+        identifier = interaction.user.name
+        rank = "User"
+        join_date = format_join_date()
+
+        try:
+            users.append(build_user_entry(hwid, identifier, rank, discord_id_str, key, notes=None, join_date=join_date))
+            await commit_users(users, sha, f"Redeemed key for user: {identifier} ({discord_id_str})")
+        except GitHubAPIError as e:
+            return await send_error(interaction, str(e))
+
+        redeemed_embed = build_embed(
+            title="✅ Key Redeemed",
+            color=discord.Color.green(),
+            fields=[
+                ("User", f"{interaction.user.mention} (`{discord_id_str}`)", False),
+                ("Identifier", identifier, True),
+                ("Rank", rank, True),
+                ("Key", f"||`{key}`||", False),
+                ("HWID", f"||`{hwid}`||", False),
+            ],
+            timestamp=datetime.now(timezone.utc),
+        )
+        await send_redeem_alert(redeemed_embed)
+
+        success_fields = [
+            ("Identifier", identifier, True),
+            ("Rank", rank, True),
+            ("Join Date", format_discord_timestamp(join_date), True),
+            ("HWID", f"||`{hwid}`||", False),
+        ]
+
+        # The user is already whitelisted at this point regardless of what
+        # happens next, so a failure here shouldn't be reported as a plain
+        # error (that would look like the whole redemption failed). Instead
+        # tell them it succeeded and flag the leftover key for a moderator
+        # to clean up manually -- find_user_by_key above already guards
+        # against it being redeemed twice in the meantime.
+        try:
+            updated_keys = remove_permitted_key(permitted_keys, key)
+            await commit_permitted_keys(updated_keys, keys_sha, f"Removed redeemed key for user: {identifier} ({discord_id_str})")
+        except GitHubAPIError as e:
+            return await send_success(
+                interaction,
+                f"Your key has been redeemed, **{identifier}**! You've been added to the whitelist.\n\n"
+                f"⚠️ The key could not be automatically removed from permittedKeys.txt ({e}). "
+                "A moderator should remove it manually to prevent reuse.",
+                fields=success_fields,
+            )
+
+        await send_success(
+            interaction,
+            f"Your key has been redeemed, **{identifier}**! You've been added to the whitelist.",
+            fields=success_fields,
+        )
+
+
+class ControlPanelView(LayoutView):
+    """Persistent Components V2 control panel posted by /createpanel into
+    #panel. Every button uses a fixed custom_id and this view is constructed
+    with timeout=None, so as long as it's re-registered via bot.add_view()
+    in on_ready, the buttons keep working indefinitely -- including across
+    bot restarts -- without the panel message itself ever needing to be
+    resent or edited."""
+
+    def __init__(self):
+        super().__init__(timeout=None)
+
+        container = Container(
+            TextDisplay(CONTROL_PANEL_TITLE),
+            TextDisplay(CONTROL_PANEL_DESCRIPTION),
+            accent_color=discord.Color.blurple(),
+        )
+
+        row = ActionRow()
+
+        redeem_button = Button(label="Redeem Key", style=discord.ButtonStyle.success, custom_id=PANEL_REDEEM_KEY_ID)
+        redeem_button.callback = self.redeem_key
+        row.add_item(redeem_button)
+
+        script_button = Button(label="Get Script", style=discord.ButtonStyle.primary, custom_id=PANEL_GET_SCRIPT_ID)
+        script_button.callback = self.get_script
+        row.add_item(script_button)
+
+        role_button = Button(label="Get Role", style=discord.ButtonStyle.primary, custom_id=PANEL_GET_ROLE_ID)
+        role_button.callback = self.get_role
+        row.add_item(role_button)
+
+        hwid_button = Button(label="Reset HWID", style=discord.ButtonStyle.secondary, custom_id=PANEL_RESET_HWID_ID)
+        hwid_button.callback = self.under_construction
+        row.add_item(hwid_button)
+
+        info_button = Button(label="Get Info", style=discord.ButtonStyle.secondary, custom_id=PANEL_GET_INFO_ID)
+        info_button.callback = self.under_construction
+        row.add_item(info_button)
+
+        container.add_item(row)
+        self.add_item(container)
+
+    async def redeem_key(self, interaction: discord.Interaction):
+        # Sending a modal must be the interaction's very first response (it
+        # can't follow a defer()), so this whitelist check has to happen
+        # before responding at all. fetch_users_with_sha() (Contents API) is
+        # used here rather than fetch_raw_users() -- the raw CDN endpoint
+        # can lag behind a real commit for a while (the same caching /verifydata
+        # exists to catch), which was causing this check to false-positive
+        # off a stale copy of Users.json. The sha isn't needed here since
+        # this is read-only, so it's just discarded.
+        try:
+            users, _sha = await fetch_users_with_sha()
+        except GitHubAPIError as e:
+            return await send_error(interaction, str(e))
+
+        if find_user_by_discord_id(users, str(interaction.user.id)):
+            return await send_error(interaction, "You are already whitelisted and cannot redeem another key.")
+
+        await interaction.response.send_modal(RedeemKeyModal())
+
+    async def get_script(self, interaction: discord.Interaction):
+        await interaction.response.defer(ephemeral=True)
+
+        try:
+            users, _sha = await fetch_users_with_sha()
+        except GitHubAPIError as e:
+            return await send_error(interaction, str(e))
+
+        entry = find_user_by_discord_id(users, str(interaction.user.id))
+        if not entry:
+            return await send_error(interaction, "You need to redeem a key before you can get your script.")
+
+        key = entry.get("Key")
+        if not key:
+            return await send_error(interaction, "Your whitelist entry doesn't have a key on file. Contact a moderator.")
+
+        try:
+            script_text = await fetch_stored_script()
+        except GitHubAPIError as e:
+            return await send_error(interaction, str(e))
+
+        try:
+            script_text = inject_script_key(script_text, key)
+        except ValueError as e:
+            return await send_error(interaction, str(e))
+
+        filename = "script.lua"
+        file = discord.File(io.BytesIO(script_text.encode("utf-8")), filename=filename)
+
+        # Components V2 File item, same pattern as /export's file_success_layout:
+        # the message text goes in its own Container, and the attachment is
+        # referenced separately via attachment://<filename> so it renders as
+        # its own component beneath the text rather than a bare attachment.
+        layout = LayoutView(timeout=None)
+        layout.add_item(Container(
+            TextDisplay("### 📜 Your Script"),
+            TextDisplay("Here's your personalized script, keyed to your account. Keep it to yourself."),
+            accent_color=discord.Color.blue(),
+        ))
+        layout.add_item(File(f"attachment://{filename}"))
+
+        await interaction.followup.send(view=layout, file=file, ephemeral=True)
+
+    async def get_role(self, interaction: discord.Interaction):
+        await interaction.response.defer(ephemeral=True)
+
+        # Same Contents-API whitelist check used by redeem_key/get_script --
+        # avoids the raw CDN endpoint's caching lag (see fetch_users_with_sha
+        # note above in redeem_key).
+        try:
+            users, _sha = await fetch_users_with_sha()
+        except GitHubAPIError as e:
+            return await send_error(interaction, str(e))
+
+        entry = find_user_by_discord_id(users, str(interaction.user.id))
+        if not entry:
+            return await send_error(interaction, "You need to redeem a key before you can get your role.")
+
+        role = interaction.guild.get_role(BUYER_ROLE_ID)
+        if not role:
+            return await send_error(interaction, "Buyer role not found. Set BUYER_ROLE_ID in bot_api.py to your Buyer role's ID.")
+
+        if role in interaction.user.roles:
+            return await send_error(interaction, f"You already have the {role.mention} role.")
+
+        await interaction.user.add_roles(role, reason="Whitelisted user claimed Buyer role via control panel")
+        await send_success(interaction, f"You've been given the {role.mention} role.")
+
+    # Reset HWID / Get Info both route here for now -- swap each one out for
+    # its own handler as that functionality gets built.
+    async def under_construction(self, interaction: discord.Interaction):
+        embed = build_embed(
+            title="🚧 Under Construction",
+            description="This feature isn't available yet. Check back soon!",
+            color=discord.Color.orange(),
+        )
+        await safe_respond(interaction, embed=embed, ephemeral=True)
+
+
+@bot.tree.command(name="createpanel", description="Posts the control panel in the panel channel.", guild=discord.Object(id=GUILD_ID))
+@has_role(REQUIRED_ROLE_ID)
+@is_in_guild(GUILD_ID)
+async def createpanel(interaction: discord.Interaction):
+    await interaction.response.defer(ephemeral=True)
+
+    channel = bot.get_channel(PANEL_CHANNEL_ID)
+    if not channel:
+        return await send_error(interaction, "Panel channel not found. Set PANEL_CHANNEL_ID in bot_api.py to your #panel channel's ID.")
+
+    await channel.send(view=ControlPanelView())
+
+    await send_success(interaction, f"Control panel posted in {channel.mention}.")
 
 
 # --- Error Handler ---

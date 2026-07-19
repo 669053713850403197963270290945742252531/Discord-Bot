@@ -36,6 +36,13 @@ GUILD_ID = 1263334150018961559
 REQUIRED_ROLE_ID = 1368809009456615434
 REGISTRATION_CHANNEL_ID = 1325394667918987266
 REACTION_ROLE_CHANNEL_ID = 1403125677925863484
+PANEL_CHANNEL_ID = 1528224800579915806
+# Role granted by the control panel's "Get Role" button to whitelisted users.
+BUYER_ROLE_ID = 1405278377912303778
+# Staff-only channel that receives "Key Redeemed" and "Potential Breach"
+# alerts from the control panel's Redeem Key flow. Replace 0 with your
+# actual Private Alerts channel's ID.
+REDEEM_ALERTS_CHANNEL_ID = 1528301092826517595
 
 # Timezone JoinDate values are displayed/stored in (handles EST/EDT automatically)
 LOCAL_TZ = ZoneInfo("America/New_York")
@@ -54,6 +61,21 @@ BRANCH = "main"
 
 RAW_URL = f"https://raw.githubusercontent.com/{OWNER}/{REPO}/refs/heads/{BRANCH}/{FILE_PATH}"
 API_URL = f"https://api.github.com/repos/{OWNER}/{REPO}/contents/{FILE_PATH}?ref={BRANCH}"
+
+# permittedKeys.txt -- one key per line, checked (read-only) by /createpanel's
+# "Redeem Key" flow. Lives in the same repo/branch as Users.json.
+PERMITTED_KEYS_FILE_PATH = "permittedKeys.txt"
+PERMITTED_KEYS_RAW_URL = f"https://raw.githubusercontent.com/{OWNER}/{REPO}/refs/heads/{BRANCH}/{PERMITTED_KEYS_FILE_PATH}"
+PERMITTED_KEYS_API_URL = f"https://api.github.com/repos/{OWNER}/{REPO}/contents/{PERMITTED_KEYS_FILE_PATH}?ref={BRANCH}"
+
+# storedscript.lua -- the base script /createpanel's "Get Script" button hands
+# out, with each user's Key spliced into its getgenv().script_key line. Lives
+# in the same repo/branch as Users.json. No write-back yet (that'll come with
+# a future "edit stored script" command), so only a Contents API read exists
+# for now.
+STORED_SCRIPT_FILE_PATH = "storedscript.lua"
+STORED_SCRIPT_RAW_URL = f"https://raw.githubusercontent.com/{OWNER}/{REPO}/refs/heads/{BRANCH}/{STORED_SCRIPT_FILE_PATH}"
+STORED_SCRIPT_API_URL = f"https://api.github.com/repos/{OWNER}/{REPO}/contents/{STORED_SCRIPT_FILE_PATH}?ref={BRANCH}"
 
 # Alias kept so any code that still refers to the old name keeps working.
 GITHUB_FILE_URL = RAW_URL
@@ -214,6 +236,121 @@ async def get_commit(sha: str, session: Optional[aiohttp.ClientSession] = None) 
     finally:
         if should_close:
             await sess.close()
+
+
+# =========================================================================
+# Permitted keys (permittedKeys.txt)
+# =========================================================================
+
+async def fetch_permitted_keys(session: Optional[aiohttp.ClientSession] = None) -> List[str]:
+    """
+    Fetches permittedKeys.txt from the Celestial GitHub repo and returns the
+    permitted keys, one per line (blank lines ignored). Read straight off the
+    raw CDN like fetch_raw_users(), since validating a redeemed key only ever
+    needs to check membership -- nothing here writes back to this file.
+    """
+    text = await fetch_raw_text(PERMITTED_KEYS_RAW_URL, session)
+    return [line.strip() for line in text.splitlines() if line.strip()]
+
+
+async def fetch_permitted_keys_with_sha(session: Optional[aiohttp.ClientSession] = None) -> Tuple[List[str], str]:
+    """
+    Fetches permittedKeys.txt + its sha via the Contents API, parsed into a
+    list of keys. Unlike fetch_permitted_keys(), use this whenever a
+    redeemed key is about to be removed from the file, since writing it back
+    (commit_permitted_keys) needs the current sha.
+    """
+    sess, should_close = await _get_session(session)
+    try:
+        async with sess.get(PERMITTED_KEYS_API_URL, headers=HEADERS) as resp:
+            if resp.status != 200:
+                raise GitHubAPIError(f"Failed to fetch permittedKeys.txt metadata (HTTP {resp.status})", resp.status)
+            data = await resp.json()
+    finally:
+        if should_close:
+            await sess.close()
+
+    sha = data["sha"]
+    text = base64.b64decode(data["content"]).decode("utf-8")
+    keys = [line.strip() for line in text.splitlines() if line.strip()]
+    return keys, sha
+
+
+async def commit_permitted_keys(keys: List[str], sha: str, message: str, session: Optional[aiohttp.ClientSession] = None) -> Dict[str, Any]:
+    """Serializes `keys` back to permittedKeys.txt (one per line) and commits it."""
+    content_str = "\n".join(keys) + ("\n" if keys else "")
+    sess, should_close = await _get_session(session)
+    try:
+        payload = {
+            "message": message,
+            "content": base64.b64encode(content_str.encode()).decode("utf-8"),
+            "branch": BRANCH,
+            "sha": sha,
+        }
+        async with sess.put(PERMITTED_KEYS_API_URL, headers=HEADERS, json=payload) as resp:
+            if resp.status != 200:
+                err = await resp.text()
+                raise GitHubAPIError(f"Failed to commit permittedKeys.txt changes (HTTP {resp.status}): {err}", resp.status)
+            return await resp.json()
+    finally:
+        if should_close:
+            await sess.close()
+
+
+def remove_permitted_key(permitted_keys: List[str], key: str) -> List[str]:
+    """Returns a new list with every exact match of `key` removed, ready to hand to commit_permitted_keys()."""
+    return [k for k in permitted_keys if k != key]
+
+
+def is_key_permitted(key: str, permitted_keys: List[str]) -> bool:
+    """Exact (case-sensitive) membership check against fetch_permitted_keys()'s result."""
+    return key in permitted_keys
+
+
+# =========================================================================
+# Stored script (storedscript.lua)
+# =========================================================================
+
+async def fetch_stored_script(session: Optional[aiohttp.ClientSession] = None) -> str:
+    """
+    Fetches storedscript.lua from the Celestial GitHub repo via the Contents
+    API rather than the raw CDN -- same reasoning as fetch_users_with_sha()
+    vs. fetch_raw_users(): the raw endpoint can serve a stale copy for a
+    while after an edit, and "Get Script" should always hand out whatever
+    the current script actually is.
+    """
+    sess, should_close = await _get_session(session)
+    try:
+        async with sess.get(STORED_SCRIPT_API_URL, headers=HEADERS) as resp:
+            if resp.status != 200:
+                raise GitHubAPIError(f"Failed to fetch storedscript.lua (HTTP {resp.status})", resp.status)
+            data = await resp.json()
+    finally:
+        if should_close:
+            await sess.close()
+    return base64.b64decode(data["content"]).decode("utf-8")
+
+
+# Matches a `getgenv().script_key = "..."` (or '...') line so its value can
+# be swapped out for a specific user's key. Non-greedy + backreference to
+# the opening quote so it doesn't over-match into the rest of the file.
+SCRIPT_KEY_RE = re.compile(r'(getgenv\(\)\.script_key\s*=\s*)(["\'])(.*?)\2')
+
+
+def inject_script_key(script_text: str, key: str) -> str:
+    """
+    Returns a copy of `script_text` with the value inside its
+    getgenv().script_key = "..." line replaced by `key`, so each user gets a
+    script keyed to their own account. Raises ValueError if no such line is
+    found (e.g. storedscript.lua was edited into an unexpected format).
+    """
+    def _replace(match: re.Match) -> str:
+        return f"{match.group(1)}{match.group(2)}{key}{match.group(2)}"
+
+    new_text, count = SCRIPT_KEY_RE.subn(_replace, script_text, count=1)
+    if count == 0:
+        raise ValueError("`storedscript.lua` doesn't contain a `getgenv().script_key` line to inject the key into.")
+    return new_text
 
 
 # =========================================================================
