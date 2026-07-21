@@ -65,23 +65,21 @@ BRANCH = "main"
 RAW_URL = f"https://raw.githubusercontent.com/{OWNER}/{REPO}/refs/heads/{BRANCH}/{FILE_PATH}"
 API_URL = f"https://api.github.com/repos/{OWNER}/{REPO}/contents/{FILE_PATH}?ref={BRANCH}"
 
+STORAGE_REPO = "Discord-Bot"
+STORAGE_BRANCH = "main"
+
 # permittedKeys.txt -- one key per line, checked (read-only) by /createpanel's
-# "Redeem Key" flow. Lives in the same repo/branch as Users.json.
-PERMITTED_KEYS_FILE_PATH = "permittedKeys.txt"
-PERMITTED_KEYS_RAW_URL = f"https://raw.githubusercontent.com/{OWNER}/{REPO}/refs/heads/{BRANCH}/{PERMITTED_KEYS_FILE_PATH}"
-PERMITTED_KEYS_API_URL = f"https://api.github.com/repos/{OWNER}/{REPO}/contents/{PERMITTED_KEYS_FILE_PATH}?ref={BRANCH}"
+# "Redeem Key" flow.
+PERMITTED_KEYS_FILE_PATH = "storage/permittedKeys.txt"
+PERMITTED_KEYS_RAW_URL = f"https://raw.githubusercontent.com/{OWNER}/{STORAGE_REPO}/refs/heads/{STORAGE_BRANCH}/{PERMITTED_KEYS_FILE_PATH}"
+PERMITTED_KEYS_API_URL = f"https://api.github.com/repos/{OWNER}/{STORAGE_REPO}/contents/{PERMITTED_KEYS_FILE_PATH}?ref={STORAGE_BRANCH}"
 
 # storedscript.lua -- the base script /createpanel's "Get Script" button hands
-# out, with each user's Key spliced into its getgenv().script_key line. Lives
-# in the same repo/branch as Users.json. No write-back yet (that'll come with
-# a future "edit stored script" command), so only a Contents API read exists
-# for now.
-STORED_SCRIPT_FILE_PATH = "storedscript.lua"
-STORED_SCRIPT_RAW_URL = f"https://raw.githubusercontent.com/{OWNER}/{REPO}/refs/heads/{BRANCH}/{STORED_SCRIPT_FILE_PATH}"
-STORED_SCRIPT_API_URL = f"https://api.github.com/repos/{OWNER}/{REPO}/contents/{STORED_SCRIPT_FILE_PATH}?ref={BRANCH}"
-
-# Alias kept so any code that still refers to the old name keeps working.
-GITHUB_FILE_URL = RAW_URL
+# out, with each user's Key spliced into its getgenv().script_key line.
+# /updatescript writes this back via commit_stored_script().
+STORED_SCRIPT_FILE_PATH = "storage/storedscript.lua"
+STORED_SCRIPT_RAW_URL = f"https://raw.githubusercontent.com/{OWNER}/{STORAGE_REPO}/refs/heads/{STORAGE_BRANCH}/{STORED_SCRIPT_FILE_PATH}"
+STORED_SCRIPT_API_URL = f"https://api.github.com/repos/{OWNER}/{STORAGE_REPO}/contents/{STORED_SCRIPT_FILE_PATH}?ref={STORAGE_BRANCH}"
 
 HEADERS = {
     "Authorization": f"Bearer {GITHUB_TOKEN}",
@@ -378,7 +376,7 @@ async def commit_permitted_keys(keys: List[str], sha: str, message: str, session
         payload = {
             "message": message,
             "content": base64.b64encode(content_str.encode()).decode("utf-8"),
-            "branch": BRANCH,
+            "branch": STORAGE_BRANCH,
             "sha": sha,
         }
         async with sess.put(PERMITTED_KEYS_API_URL, headers=HEADERS, json=payload) as resp:
@@ -454,7 +452,7 @@ async def commit_stored_script(script_text: str, sha: str, message: str, session
         payload = {
             "message": message,
             "content": base64.b64encode(script_text.encode()).decode("utf-8"),
-            "branch": BRANCH,
+            "branch": STORAGE_BRANCH,
             "sha": sha,
         }
         async with sess.put(STORED_SCRIPT_API_URL, headers=HEADERS, json=payload) as resp:
@@ -711,6 +709,27 @@ def parse_expiration_note(notes: Optional[str]) -> Optional[datetime]:
         return datetime.strptime(match.group(1), "%m/%d/%Y, %I:%M:%S %p").replace(tzinfo=LOCAL_TZ)
     except ValueError:
         return None
+
+
+def is_notes_locked(entry: Dict[str, Any]) -> bool:
+    """
+    True if `entry`'s Notes field currently holds an unexpired temporary-
+    whitelist expiration marker (see format_expiration_note /
+    parse_expiration_note above).
+
+    While this is True, nothing should overwrite or clear this entry's
+    Notes field -- not to blank, and not to some other custom value --
+    since that field is the *only* record of when this entry's temporary
+    whitelist expires. Silently overwriting it (e.g. via /edituser,
+    /clearnotes, the Edit User button on /viewwhitelist, or a raw
+    /editwhitelist JSON edit) would leave the temp-whitelist system with no
+    way to know when to auto-remove this entry.
+
+    Returns False (unlocked) once the marker has expired -- an expired temp
+    whitelist's Notes are just as removable/editable as a normal note.
+    """
+    expires_at = parse_expiration_note(entry.get("Notes"))
+    return expires_at is not None and expires_at > datetime.now(timezone.utc)
 
 
 def humanize_timeleft(delta: timedelta, *, suffix: bool = True) -> str:

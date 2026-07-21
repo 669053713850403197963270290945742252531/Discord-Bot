@@ -21,7 +21,7 @@ import re
 import io
 import csv
 import difflib
-from discord.ui import Modal, TextInput, View, Button, LayoutView, Container, TextDisplay, ActionRow, Section, Thumbnail, File, Label, Select
+from discord.ui import Modal, TextInput, View, Button, LayoutView, Container, TextDisplay, ActionRow, Section, Thumbnail, File, Label, Select, Checkbox
 from collections import defaultdict
 
 import bot_api
@@ -37,7 +37,7 @@ from bot_api import (
     find_user_by_discord_id, find_user_by_hwid, find_user_by_key, remove_user_by_discord_id, build_user_entry,
     generate_key, generate_unique_key, is_valid_hwid, is_valid_discord_id,
     format_discord_timestamp, format_join_date,
-    format_expiration_note, parse_expiration_note, humanize_timeleft,
+    format_expiration_note, parse_expiration_note, humanize_timeleft, is_notes_locked,
     RESET_HWID_COOLDOWN, hwid_reset_cooldown_remaining,
     get_cached_users, refresh_users_cache,
     safe_respond, notify_user, notify_permission_error, has_role, is_in_guild, can_moderate,
@@ -498,11 +498,6 @@ async def myinfo(interaction: discord.Interaction):
     embed.add_field(name="Last HWID Reset", value=format_discord_timestamp(user_data.get("LastHwidReset")), inline=True)
     embed.add_field(name="Total HWID Resets", value=str(user_data.get("totalHwidResets", 0)), inline=True)
 
-    # Only add Notes if it's not the string "false"
-    notes = user_data.get("Notes")
-    if notes and notes.lower() != "false":
-        embed.add_field(name="Notes", value=notes, inline=True)
-
     await interaction.followup.send(embed=embed, ephemeral=True)
 
 # // verifydata
@@ -572,6 +567,17 @@ class WhitelistModal(Modal, title="Whitelist a User"):
         description="Optional notes to keep reminders about this user.",
         component=TextInput(style=discord.TextStyle.paragraph, placeholder="Leave blank for none", required=False, max_length=500),
     )
+
+    def __init__(self, target: Optional[discord.Member] = None):
+        if target is not None:
+            super().__init__(title=f"Whitelist {target.display_name}"[:45])
+        else:
+            super().__init__()
+        if target is not None:
+            # Pre-fill from the "Whitelist User" context menu command so the
+            # already-known target doesn't need to be re-typed; still
+            # editable in case the wrong user was right-clicked.
+            self.target_user.component.default = str(target.id)
 
     async def on_submit(self, interaction: discord.Interaction):
         identifier = self.identifier.component.value.strip()
@@ -688,14 +694,49 @@ class EditWhitelistModal(Modal):
         new_content = self.json_input.value.strip()
 
         try:
-            json.loads(new_content)
+            new_users = json.loads(new_content)
         except json.JSONDecodeError as e:
             await send_error(interaction, f"Invalid JSON: {e}")
             return
 
-        # Fetch latest sha again to avoid race conditions, then commit
+        # Fetch the latest content (not just the sha) to avoid race
+        # conditions on the commit *and* to check the Notes-lock guard below
+        # against genuinely current data, not whatever this modal happened
+        # to be pre-filled with when it was opened.
         try:
-            sha = await get_current_sha()
+            current_users, sha = await fetch_users_with_sha()
+        except GitHubAPIError as e:
+            await send_error(interaction, str(e))
+            return
+
+        # Block this edit from silently overwriting/clearing the Notes
+        # field of any entry that's currently temporarily whitelisted --
+        # same guard as /edituser, /clearnotes, and the Edit User button,
+        # just applied here across every entry in the pasted JSON at once.
+        # An entry being removed entirely (a legitimate unwhitelist-style
+        # edit) is fine; only a *changed* Notes value on an entry that
+        # still exists is blocked.
+        if isinstance(new_users, list):
+            locked_violations = []
+            for old_entry in current_users:
+                if not is_notes_locked(old_entry):
+                    continue
+                discord_id = old_entry.get("DiscordId")
+                new_entry = find_user_by_discord_id(new_users, discord_id)
+                if new_entry is not None and (new_entry.get("Notes") or None) != (old_entry.get("Notes") or None):
+                    locked_violations.append(f"<@{discord_id}> ({old_entry.get('Identifier', 'Unknown')})")
+
+            if locked_violations:
+                await send_error(
+                    interaction,
+                    "This edit changes the Notes field of a currently temporarily whitelisted user, which "
+                    "isn't allowed -- Notes stores the auto-removal timestamp the temp-whitelist system "
+                    "relies on. Remove those changes and resubmit.",
+                    fields=[("Affected users", ", ".join(locked_violations), False)],
+                )
+                return
+
+        try:
             await commit_content(new_content, sha, f"Edit whitelist by {interaction.user}")
         except GitHubAPIError as e:
             await send_error(interaction, str(e))
@@ -851,6 +892,14 @@ class EditUserCommandModal(Modal):
             collision = find_user_by_hwid(users, hwid)
             if collision and collision is not entry:
                 return await send_error(interaction, f"This HWID is already whitelisted under **{collision.get('Identifier', 'Unknown')}** (<@{collision.get('DiscordId')}>).")
+
+        if is_notes_locked(entry) and notes != (entry.get("Notes") or None):
+            return await send_error(
+                interaction,
+                f"{mention}'s Notes field can't be changed right now -- they're currently temporarily "
+                "whitelisted, and Notes stores the auto-removal timestamp the temp-whitelist system "
+                "relies on. It'll unlock once the temporary whitelist expires or is removed.",
+            )
 
         entry["Identifier"] = identifier
         entry["DiscordId"] = discord_id
@@ -1313,18 +1362,43 @@ class EditUserModal(Modal):
         self.add_item(self.notes)
 
     async def on_submit(self, interaction: discord.Interaction):
+        new_notes = self.notes.value or None
+        discord_id = self.user_data.get("DiscordId")
+
+        try:
+            existing, sha = await fetch_users_with_sha()
+        except GitHubAPIError as e:
+            await send_error(interaction, str(e))
+            return
+
+        # Re-fetched fresh (rather than trusting the possibly-stale
+        # self.user_data this modal was opened with) so the Notes-lock check
+        # below can't be bypassed by data that's gone stale since the
+        # whitelist view was last built/refreshed.
+        entry = find_user_by_discord_id(existing, discord_id)
+        if not entry:
+            await send_error(interaction, "This user's whitelist entry no longer exists (it may have been removed by someone else).")
+            return
+
+        if is_notes_locked(entry) and new_notes != (entry.get("Notes") or None):
+            await send_error(
+                interaction,
+                f"**{entry.get('Identifier', 'This user')}**'s Notes field can't be changed right now -- "
+                "they're currently temporarily whitelisted, and Notes stores the auto-removal timestamp "
+                "the temp-whitelist system relies on. It'll unlock once the temporary whitelist expires "
+                "or is removed.",
+            )
+            return
+
         # Update user data dictionary with form values
 
         self.user_data["Identifier"] = self.identifier.value
         self.user_data["Rank"] = self.rank.value
         self.user_data["HWID"] = self.hwid.value or "N/A"
         self.user_data["Key"] = self.key.value or "N/A"
-        self.user_data["Notes"] = self.notes.value or None
+        self.user_data["Notes"] = new_notes
 
         try:
-            existing, sha = await fetch_users_with_sha()
-
-            discord_id = self.user_data.get("DiscordId")
             for i, u in enumerate(existing):
                 if u.get("DiscordId") == discord_id:
                     existing[i] = self.user_data
@@ -1562,16 +1636,8 @@ HWID_INSTRUCTIONS = (
 @app_commands.describe(identifier="Your identifier (username, alias, etc.)", hwid="Pre-hashed HWID in SHA-256, obtained from the executor")
 @has_role(REQUIRED_ROLE_ID)
 @is_in_guild(GUILD_ID)
-async def register(interaction: discord.Interaction, identifier: str, hwid: Optional[str] = None):
+async def register(interaction: discord.Interaction, identifier: str, hwid: str):
     await interaction.response.defer(ephemeral=True)
-
-    if not hwid:
-        embed = discord.Embed(
-            title="🔑 HWID Required",
-            description=HWID_INSTRUCTIONS,
-            color=discord.Color.orange(),
-        )
-        return await interaction.edit_original_response(embed=embed)
 
     discord_id_str = str(interaction.user.id)
 
@@ -1636,6 +1702,21 @@ async def register(interaction: discord.Interaction, identifier: str, hwid: Opti
             ("HWID", f"||`{hwid}`||", False),
         ],
     )
+
+# // hwidhelp //
+
+@bot.tree.command(name="hwidhelp", description="Shows instructions for getting your HWID.", guild=discord.Object(id=GUILD_ID))
+@has_role(REQUIRED_ROLE_ID)
+@is_in_guild(GUILD_ID)
+async def hwidhelp(interaction: discord.Interaction):
+    await interaction.response.defer(ephemeral=True)
+
+    embed = discord.Embed(
+        title="🔑 HWID Required",
+        description=HWID_INSTRUCTIONS,
+        color=discord.Color.orange(),
+    )
+    await interaction.edit_original_response(embed=embed)
 
 # // checkregistration
 
@@ -2235,6 +2316,27 @@ async def tempwhitelist(interaction: discord.Interaction, user: discord.User, hw
         fields=[("HWID", f"||`{hwid}`||", False)],
     )
 
+    guild_name = interaction.guild.name
+    expires_ts = int(expiration_time.timestamp())
+    minute_label = "minute" if minutes == 1 else "minutes"
+
+    # DM the user an embed confirming their temporary whitelist, matching
+    # the embed style used everywhere else in the bot (ban/kick/mute
+    # notify_user, etc.) instead of a plain-text message.
+    try:
+        granted_embed = discord.Embed(
+            title=f"You've been temporarily whitelisted in {guild_name}",
+            description=f"You now have whitelist access to **{guild_name}** for a limited time.",
+            color=discord.Color.gold(),
+            timestamp=datetime.now(timezone.utc),
+        )
+        granted_embed.add_field(name="Duration", value=f"{minutes} {minute_label}", inline=True)
+        granted_embed.add_field(name="Expires", value=f"<t:{expires_ts}:F>\n<t:{expires_ts}:R>", inline=True)
+        granted_embed.set_footer(text=f"Granted by: {interaction.user}")
+        await user.send(embed=granted_embed)
+    except Exception as e:
+        print(f"Could not DM temp whitelist grant to {user}: {e}")
+
     async def notify_and_remove():
         try:
             notify_time = expiration_time - timedelta(minutes=5)
@@ -2242,7 +2344,14 @@ async def tempwhitelist(interaction: discord.Interaction, user: discord.User, hw
             if notify_time > now:
                 await asyncio.sleep((notify_time - now).total_seconds())
                 try:
-                    await user.send("Your temporary whitelist will expire in 5 minutes.")
+                    expiring_embed = discord.Embed(
+                        title="Temporary Whitelist Expiring Soon",
+                        description=f"Your temporary whitelist access to **{guild_name}** will expire in 5 minutes.",
+                        color=discord.Color.orange(),
+                        timestamp=datetime.now(timezone.utc),
+                    )
+                    expiring_embed.add_field(name="Expires", value=f"<t:{expires_ts}:F>\n<t:{expires_ts}:R>", inline=False)
+                    await user.send(embed=expiring_embed)
                 except Exception:
                     pass
 
@@ -2260,7 +2369,13 @@ async def tempwhitelist(interaction: discord.Interaction, user: discord.User, hw
             active_temp_whitelists.pop(discord_id, None)
 
             try:
-                await user.send("Your temporary whitelist has expired and access has now been removed.")
+                removed_embed = discord.Embed(
+                    title="Temporary Whitelist Access Removed",
+                    description=f"Your temporary whitelist has expired and your access to **{guild_name}** has now been removed.",
+                    color=discord.Color.red(),
+                    timestamp=datetime.now(timezone.utc),
+                )
+                await user.send(embed=removed_embed)
             except Exception:
                 pass
         except asyncio.CancelledError:
@@ -2562,6 +2677,14 @@ async def clearnotes(interaction: discord.Interaction, user: discord.User):
     if not entry:
         return await send_error(interaction, f"No user found with Discord ID {user.mention}.")
 
+    if is_notes_locked(entry):
+        return await send_error(
+            interaction,
+            f"{user.mention}'s Notes field can't be cleared right now -- they're currently temporarily "
+            "whitelisted, and Notes stores the auto-removal timestamp the temp-whitelist system relies "
+            "on. It'll unlock once the temporary whitelist expires or is removed.",
+        )
+
     entry["Notes"] = None
 
     try:
@@ -2824,7 +2947,7 @@ class RedeemKeyModal(Modal, title="Redeem Key"):
     )
     hwid = Label(
         text="HWID",
-        description="Pre-hashed HWID in SHA-256 (64 hex characters). Run /gethwid for help getting yours.",
+        description="Pre-hashed HWID in SHA-256 (64 hex characters). Run /hwidhelp for help getting yours.",
         component=TextInput(placeholder="64-character hex string", min_length=64, max_length=64),
     )
 
@@ -2957,7 +3080,7 @@ class ResetHWIDModal(Modal, title="Reset HWID"):
 
     hwid = Label(
         text="HWID",
-        description="Pre-hashed HWID in SHA-256 (64 hex characters). Run /gethwid for help getting yours.",
+        description="Pre-hashed HWID in SHA-256 (64 hex characters). Run /hwidhelp for help getting yours.",
         component=TextInput(placeholder="64-character hex string", min_length=64, max_length=64),
     )
 
@@ -3258,11 +3381,6 @@ class ControlPanelView(LayoutView):
         embed.add_field(name="Last HWID Reset", value=format_discord_timestamp(user_data.get("LastHwidReset")), inline=True)
         embed.add_field(name="Total HWID Resets", value=str(user_data.get("totalHwidResets", 0)), inline=True)
 
-        # Only add Notes if it's not the string "false"
-        notes = user_data.get("Notes")
-        if notes and notes.lower() != "false":
-            embed.add_field(name="Notes", value=notes, inline=True)
-
         await interaction.followup.send(embed=embed, ephemeral=True)
 
 
@@ -3326,6 +3444,250 @@ async def updatescript(interaction: discord.Interaction, script: discord.Attachm
         "`storedscript.lua` has been updated. **Get Script** will now hand out this version, keyed to each user.",
         fields=[("New Script", f"```lua\n{script_text}\n```", False)],
     )
+
+
+# --- User Context Menu Commands ---
+#
+# 15 right-click (member list) commands mirroring the slash commands above,
+# so the most common moderation/whitelist actions don't require typing out
+# a slash command and looking up a user manually. Discord caps a single
+# guild at 15 USER-type context menu commands, so this list is
+# intentionally exactly that many.
+#
+# Each one below calls straight into the matching slash command's
+# `.callback` (the plain async function discord.py stores on every
+# app_commands.Command) so the actual logic -- validation, GitHub writes,
+# DMs, etc. -- lives in exactly one place and can't drift between the two
+# entry points. Slash commands that take extra arguments (reason, hwid,
+# minutes, ...) can't be given those via a context menu click, so a small
+# Modal collects them first and then forwards to the same `.callback`.
+
+# // Ban User //
+
+class BanContextModal(Modal):
+    """Reason + optional duration + a Preserve Messages checkbox for the Ban
+    User context menu command, mirroring /ban's `reason`/`duration`/
+    `preserve_messages` options. Uses a Components V2 Checkbox (rather than
+    a text field) for preserve_messages since it's a plain on/off toggle --
+    defaults checked (messages preserved), matching /ban's own default."""
+
+    reason = Label(
+        text="Reason",
+        component=TextInput(required=False, max_length=200, placeholder="None"),
+    )
+    duration = Label(
+        text="Duration in minutes",
+        description="Leave blank for a permanent ban.",
+        component=TextInput(required=False, max_length=10, placeholder="e.g. 60"),
+    )
+    preserve_messages = Label(
+        text="Preserve Messages",
+        description="Checked = keep the user's messages. Unchecked = delete their recent messages.",
+        component=Checkbox(default=True),
+    )
+
+    def __init__(self, target: discord.Member):
+        super().__init__(title=f"Ban {target.display_name}"[:45])
+        self.target = target
+
+    async def on_submit(self, interaction: discord.Interaction):
+        reason = (self.reason.component.value or "").strip() or "None"
+        duration_raw = (self.duration.component.value or "").strip()
+        duration = None
+        if duration_raw:
+            if not duration_raw.isdigit() or int(duration_raw) <= 0:
+                return await send_error(interaction, "Duration must be a positive whole number of minutes.")
+            duration = int(duration_raw)
+        preserve_messages = self.preserve_messages.component.value
+        await ban.callback(interaction, self.target, reason=reason, duration=duration, preserve_messages=preserve_messages)
+
+
+@bot.tree.context_menu(name="Ban User", guild=discord.Object(id=GUILD_ID))
+@has_role(REQUIRED_ROLE_ID)
+@is_in_guild(GUILD_ID)
+async def ctx_ban_user(interaction: discord.Interaction, target: discord.Member):
+    await interaction.response.send_modal(BanContextModal(target))
+
+# // Kick User //
+
+class KickContextModal(Modal):
+    def __init__(self, target: discord.Member):
+        super().__init__(title=f"Kick {target.display_name}"[:45])
+        self.target = target
+        self.reason = TextInput(label="Reason", required=False, max_length=200, placeholder="Unspecified")
+        self.add_item(self.reason)
+
+    async def on_submit(self, interaction: discord.Interaction):
+        reason = (self.reason.value or "").strip() or "Unspecified"
+        await kick.callback(interaction, self.target, reason=reason)
+
+
+@bot.tree.context_menu(name="Kick User", guild=discord.Object(id=GUILD_ID))
+@has_role(REQUIRED_ROLE_ID)
+@is_in_guild(GUILD_ID)
+async def ctx_kick_user(interaction: discord.Interaction, target: discord.Member):
+    await interaction.response.send_modal(KickContextModal(target))
+
+# // Mute User //
+
+class MuteContextModal(Modal):
+    def __init__(self, target: discord.Member):
+        super().__init__(title=f"Mute {target.display_name}"[:45])
+        self.target = target
+        self.reason = TextInput(label="Reason", required=False, max_length=200, placeholder="Unspecified")
+        self.add_item(self.reason)
+
+    async def on_submit(self, interaction: discord.Interaction):
+        reason = (self.reason.value or "").strip() or "Unspecified"
+        await mute.callback(interaction, self.target, reason=reason)
+
+
+@bot.tree.context_menu(name="Mute User", guild=discord.Object(id=GUILD_ID))
+@has_role(REQUIRED_ROLE_ID)
+@is_in_guild(GUILD_ID)
+async def ctx_mute_user(interaction: discord.Interaction, target: discord.Member):
+    await interaction.response.send_modal(MuteContextModal(target))
+
+# // Unmute User //
+
+@bot.tree.context_menu(name="Unmute User", guild=discord.Object(id=GUILD_ID))
+@has_role(REQUIRED_ROLE_ID)
+@is_in_guild(GUILD_ID)
+async def ctx_unmute_user(interaction: discord.Interaction, target: discord.Member):
+    await unmute.callback(interaction, target)
+
+# // Whitelist User //
+
+@bot.tree.context_menu(name="Whitelist User", guild=discord.Object(id=GUILD_ID))
+@has_role(REQUIRED_ROLE_ID)
+@is_in_guild(GUILD_ID)
+async def ctx_whitelist_user(interaction: discord.Interaction, target: discord.Member):
+    await interaction.response.send_modal(WhitelistModal(target=target))
+
+# // Edit User //
+
+@bot.tree.context_menu(name="Edit User", guild=discord.Object(id=GUILD_ID))
+@has_role(REQUIRED_ROLE_ID)
+@is_in_guild(GUILD_ID)
+async def ctx_edit_user(interaction: discord.Interaction, target: discord.Member):
+    # /edituser already just fetches the entry and opens a modal itself, so
+    # there's no extra input to collect here first.
+    await edituser.callback(interaction, target)
+
+# // Unwhitelist User //
+
+@bot.tree.context_menu(name="Unwhitelist User", guild=discord.Object(id=GUILD_ID))
+@has_role(REQUIRED_ROLE_ID)
+@is_in_guild(GUILD_ID)
+async def ctx_unwhitelist_user(interaction: discord.Interaction, target: discord.Member):
+    await unwhitelist.callback(interaction, target)
+
+# // Fetch User Info //
+
+@bot.tree.context_menu(name="Fetch User Info", guild=discord.Object(id=GUILD_ID))
+@has_role(REQUIRED_ROLE_ID)
+@is_in_guild(GUILD_ID)
+async def ctx_fetch_user(interaction: discord.Interaction, target: discord.Member):
+    await fetchuser.callback(interaction, target)
+
+# // Check Temp Whitelist //
+
+@bot.tree.context_menu(name="Check Temp Whitelist", guild=discord.Object(id=GUILD_ID))
+@has_role(REQUIRED_ROLE_ID)
+@is_in_guild(GUILD_ID)
+async def ctx_check_temp(interaction: discord.Interaction, target: discord.Member):
+    await checktemp.callback(interaction, target)
+
+# // Clear User Notes //
+
+@bot.tree.context_menu(name="Clear User Notes", guild=discord.Object(id=GUILD_ID))
+@has_role(REQUIRED_ROLE_ID)
+@is_in_guild(GUILD_ID)
+async def ctx_clear_notes(interaction: discord.Interaction, target: discord.Member):
+    await clearnotes.callback(interaction, target)
+
+# // Force Reset HWID //
+
+class ForceResetHwidContextModal(Modal):
+    def __init__(self, target: discord.Member):
+        super().__init__(title=f"Reset HWID: {target.display_name}"[:45])
+        self.target = target
+        self.hwid = TextInput(label="New HWID (SHA-256, 64 hex chars)", max_length=100, placeholder="64-character hex string")
+        self.add_item(self.hwid)
+
+    async def on_submit(self, interaction: discord.Interaction):
+        # forceresethwid.callback already validates the HWID format and
+        # reports a clear error itself, so it's passed straight through.
+        await forceresethwid.callback(interaction, self.target, self.hwid.value.strip())
+
+
+@bot.tree.context_menu(name="Force Reset HWID", guild=discord.Object(id=GUILD_ID))
+@has_role(REQUIRED_ROLE_ID)
+@is_in_guild(GUILD_ID)
+async def ctx_force_reset_hwid(interaction: discord.Interaction, target: discord.Member):
+    await interaction.response.send_modal(ForceResetHwidContextModal(target))
+
+# // Reset HWID Cooldown //
+
+@bot.tree.context_menu(name="Reset HWID Cooldown", guild=discord.Object(id=GUILD_ID))
+@has_role(REQUIRED_ROLE_ID)
+@is_in_guild(GUILD_ID)
+async def ctx_reset_hwid_cooldown(interaction: discord.Interaction, target: discord.Member):
+    await resethwidcooldown.callback(interaction, target)
+
+# // Toggle Bot Access //
+
+@bot.tree.context_menu(name="Toggle Bot Access", guild=discord.Object(id=GUILD_ID))
+@has_role(REQUIRED_ROLE_ID)
+@is_in_guild(GUILD_ID)
+async def ctx_toggle_access(interaction: discord.Interaction, target: discord.Member):
+    await toggleaccess.callback(interaction, target)
+
+# // Grant Temp Bot Access //
+
+class TempAccessContextModal(Modal):
+    def __init__(self, target: discord.Member):
+        super().__init__(title=f"Bot Access: {target.display_name}"[:45])
+        self.target = target
+        self.minutes = TextInput(label="Duration in minutes", max_length=10, placeholder="e.g. 30")
+        self.add_item(self.minutes)
+
+    async def on_submit(self, interaction: discord.Interaction):
+        raw = self.minutes.value.strip()
+        if not raw.isdigit() or int(raw) <= 0:
+            return await send_error(interaction, "Duration must be a positive whole number of minutes.")
+        await tempaccess.callback(interaction, self.target, int(raw))
+
+
+@bot.tree.context_menu(name="Grant Temp Bot Access", guild=discord.Object(id=GUILD_ID))
+@has_role(REQUIRED_ROLE_ID)
+@is_in_guild(GUILD_ID)
+async def ctx_temp_access(interaction: discord.Interaction, target: discord.Member):
+    await interaction.response.send_modal(TempAccessContextModal(target))
+
+# // Temp Whitelist User //
+
+class TempWhitelistContextModal(Modal):
+    def __init__(self, target: discord.Member):
+        super().__init__(title=f"Temp Whitelist: {target.display_name}"[:45])
+        self.target = target
+        self.hwid = TextInput(label="HWID (SHA-256, 64 hex chars)", max_length=100, placeholder="64-character hex string")
+        self.minutes = TextInput(label="Duration in minutes", max_length=10, placeholder="e.g. 60")
+        self.add_item(self.hwid)
+        self.add_item(self.minutes)
+
+    async def on_submit(self, interaction: discord.Interaction):
+        raw = self.minutes.value.strip()
+        if not raw.isdigit() or int(raw) <= 0:
+            return await send_error(interaction, "Duration must be a positive whole number of minutes.")
+        await tempwhitelist.callback(interaction, self.target, self.hwid.value.strip(), int(raw))
+
+
+@bot.tree.context_menu(name="Temp Whitelist User", guild=discord.Object(id=GUILD_ID))
+@has_role(REQUIRED_ROLE_ID)
+@is_in_guild(GUILD_ID)
+async def ctx_temp_whitelist(interaction: discord.Interaction, target: discord.Member):
+    await interaction.response.send_modal(TempWhitelistContextModal(target))
 
 
 # --- Error Handler ---
