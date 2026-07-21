@@ -40,12 +40,15 @@ PANEL_CHANNEL_ID = 1528224800579915806
 # Role granted by the control panel's "Get Role" button to whitelisted users.
 BUYER_ROLE_ID = 1405278377912303778
 # Staff-only channel that receives "Key Redeemed" and "Potential Breach"
-# alerts from the control panel's Redeem Key flow. Replace 0 with your
-# actual Private Alerts channel's ID.
+# alerts from the control panel's Redeem Key / Reset HWID flows.
 REDEEM_ALERTS_CHANNEL_ID = 1528301092826517595
 
 # Timezone JoinDate values are displayed/stored in (handles EST/EDT automatically)
 LOCAL_TZ = ZoneInfo("America/New_York")
+
+# How long a whitelisted user must wait between self-service HWID resets via
+# the control panel's "Reset HWID" button. Edit this to change the cooldown.
+RESET_HWID_COOLDOWN = timedelta(weeks=1)
 
 
 # =========================================================================
@@ -129,6 +132,75 @@ async def fetch_raw_users(session: Optional[aiohttp.ClientSession] = None) -> Li
             await sess.close()
 
 
+# =========================================================================
+# In-memory Users.json cache
+# =========================================================================
+#
+# Read-only "is this person whitelisted / off cooldown" pre-checks (e.g. the
+# control panel's Reset HWID button) used to call fetch_raw_users() live,
+# under a tight ~2s budget so the modal could still be shown as the
+# interaction's first response in time. Whenever that network call was slow
+# or errored -- which a fresh CDN connection with no pooling hits more often
+# than you'd expect -- the check silently fell back to "allow", showing the
+# modal even to non-whitelisted users. It was never a security hole (writes
+# always re-check against a fresh fetch, e.g. ResetHWIDModal.on_submit), but
+# it looked broken.
+#
+# This cache removes the network call from that critical path entirely.
+# `refresh_users_cache()` is polled periodically by a background task
+# (see main.py), and `commit_content()` below also updates it immediately
+# after any successful write -- every write path (commit_users() included)
+# funnels through commit_content(), so this covers all of them -- so it
+# never has to wait for the next poll to reflect the bot's own changes.
+# `get_cached_users()` never makes a network call and can't time out.
+
+_users_cache: Optional[List[Dict[str, Any]]] = None
+_users_cache_updated_at: Optional[datetime] = None
+
+
+def get_cached_users() -> Optional[List[Dict[str, Any]]]:
+    """Returns the last-known Users.json contents from memory, or None if the
+    cache hasn't been populated yet (e.g. the first refresh hasn't completed
+    since bot startup). Never makes a network call."""
+    return _users_cache
+
+
+def cached_users_age() -> Optional[timedelta]:
+    """How long ago the cache was last successfully refreshed, or None if
+    it's never been populated."""
+    if _users_cache_updated_at is None:
+        return None
+    return datetime.now(timezone.utc) - _users_cache_updated_at
+
+
+def set_users_cache(users: List[Dict[str, Any]]) -> None:
+    """Overwrites the in-memory cache directly. Called by commit_content()
+    (and, in turn, refresh_users_cache()) so writes and periodic refreshes
+    are reflected immediately."""
+    global _users_cache, _users_cache_updated_at
+    _users_cache = users
+    _users_cache_updated_at = datetime.now(timezone.utc)
+
+
+async def refresh_users_cache(session: Optional[aiohttp.ClientSession] = None) -> List[Dict[str, Any]]:
+    """Fetches the current Users.json via the Contents API and stores it as
+    the cache. Deliberately uses fetch_users_with_sha() here instead of the
+    faster fetch_raw_users() -- the raw.githubusercontent.com CDN endpoint
+    can lag behind the actual repo content for a while after a commit (this
+    is exactly the drift /verifydata exists to catch), and this cache backs
+    the control panel's whitelist/cooldown pre-checks (Reset HWID, Redeem
+    Key, Get Script/Role), so it needs to be right, not just fast -- this
+    runs on a 60s background loop, not an interaction's critical path, so
+    there's no reason to take the CDN's staleness risk here.
+
+    Raises GitHubAPIError on failure -- the cache is left untouched
+    (stale-but-known beats throwing it away), so callers should catch and
+    log rather than let this take down the polling loop."""
+    users, _sha = await fetch_users_with_sha(session)
+    set_users_cache(users)
+    return users
+
+
 async def fetch_raw_text(url: str, session: Optional[aiohttp.ClientSession] = None) -> str:
     """Generic raw-text GET - used for pulling file contents at an arbitrary commit SHA."""
     sess, should_close = await _get_session(session)
@@ -182,7 +254,18 @@ async def fetch_api_text_and_sha(session: Optional[aiohttp.ClientSession] = None
 
 
 async def commit_content(content_str: str, sha: str, message: str, session: Optional[aiohttp.ClientSession] = None) -> Dict[str, Any]:
-    """Commits a raw string as the new Users.json content."""
+    """Commits a raw string as the new Users.json content, then updates the
+    in-memory users cache to match.
+
+    The cache update lives here (rather than only in commit_users() below)
+    because /editwhitelist, /rollback, and /upload all commit through this
+    function directly with a hand-built content string, bypassing
+    commit_users() entirely -- previously that meant those three writes left
+    the cache stale until the next periodic refresh_users_cache_task tick,
+    so a Reset HWID click right after e.g. a /rollback could still see the
+    pre-rollback data. Centralizing the cache update here means every write
+    path is covered with no risk of a new one forgetting to keep the cache
+    in sync."""
     sess, should_close = await _get_session(session)
     try:
         payload = {
@@ -195,14 +278,25 @@ async def commit_content(content_str: str, sha: str, message: str, session: Opti
             if resp.status != 200:
                 err = await resp.text()
                 raise GitHubAPIError(f"Failed to commit changes (HTTP {resp.status}): {err}", resp.status)
-            return await resp.json()
+            result = await resp.json()
     finally:
         if should_close:
             await sess.close()
 
+    try:
+        set_users_cache(json.loads(content_str))
+    except (json.JSONDecodeError, TypeError):
+        # Shouldn't happen for any real caller (API_URL is always
+        # Users.json), but leave the existing cache alone rather than
+        # poison it with something unparseable.
+        pass
+
+    return result
+
 
 async def commit_users(users: List[Dict[str, Any]], sha: str, message: str, session: Optional[aiohttp.ClientSession] = None) -> Dict[str, Any]:
-    """Serializes `users` to indented JSON and commits it as the new Users.json."""
+    """Serializes `users` to indented JSON and commits it as the new
+    Users.json. commit_content() takes care of updating the in-memory cache."""
     content_str = json.dumps(users, indent=4)
     return await commit_content(content_str, sha, message, session)
 
@@ -331,6 +425,48 @@ async def fetch_stored_script(session: Optional[aiohttp.ClientSession] = None) -
     return base64.b64decode(data["content"]).decode("utf-8")
 
 
+async def fetch_stored_script_with_sha(session: Optional[aiohttp.ClientSession] = None) -> Tuple[str, str]:
+    """
+    Fetches storedscript.lua + its sha via the Contents API. Use this
+    (instead of fetch_stored_script()) whenever the script is about to be
+    written back -- e.g. /updatescript -- since commit_stored_script() needs
+    the current sha.
+    """
+    sess, should_close = await _get_session(session)
+    try:
+        async with sess.get(STORED_SCRIPT_API_URL, headers=HEADERS) as resp:
+            if resp.status != 200:
+                raise GitHubAPIError(f"Failed to fetch storedscript.lua metadata (HTTP {resp.status})", resp.status)
+            data = await resp.json()
+    finally:
+        if should_close:
+            await sess.close()
+
+    sha = data["sha"]
+    text = base64.b64decode(data["content"]).decode("utf-8")
+    return text, sha
+
+
+async def commit_stored_script(script_text: str, sha: str, message: str, session: Optional[aiohttp.ClientSession] = None) -> Dict[str, Any]:
+    """Commits `script_text` as the new storedscript.lua content."""
+    sess, should_close = await _get_session(session)
+    try:
+        payload = {
+            "message": message,
+            "content": base64.b64encode(script_text.encode()).decode("utf-8"),
+            "branch": BRANCH,
+            "sha": sha,
+        }
+        async with sess.put(STORED_SCRIPT_API_URL, headers=HEADERS, json=payload) as resp:
+            if resp.status != 200:
+                err = await resp.text()
+                raise GitHubAPIError(f"Failed to commit storedscript.lua changes (HTTP {resp.status}): {err}", resp.status)
+            return await resp.json()
+    finally:
+        if should_close:
+            await sess.close()
+
+
 # Matches a `getgenv().script_key = "..."` (or '...') line so its value can
 # be swapped out for a specific user's key. Non-greedy + backreference to
 # the opening quote so it doesn't over-match into the rest of the file.
@@ -351,6 +487,31 @@ def inject_script_key(script_text: str, key: str) -> str:
     if count == 0:
         raise ValueError("`storedscript.lua` doesn't contain a `getgenv().script_key` line to inject the key into.")
     return new_text
+
+
+def validate_stored_script(script_text: str) -> Optional[str]:
+    """
+    Checks that `script_text` matches the shape storedscript.lua is expected
+    to have -- exactly 2 lines, a script key line first and a loader line
+    second -- since every whitelisted user's script (via Get Script ->
+    inject_script_key()) depends on that shape. Used by /updatescript before
+    committing a replacement.
+
+    Returns None if valid, or a human-readable reason if not.
+    """
+    lines = script_text.strip().splitlines()
+    if len(lines) != 2:
+        return f"Must be exactly 2 lines (the script key line, then the loading line) -- got {len(lines)}."
+
+    key_line, load_line = lines
+
+    if not SCRIPT_KEY_RE.search(key_line):
+        return 'Line 1 must be a `getgenv().script_key = "..."` line -- Get Script relies on that to inject each user\'s key.'
+
+    if "loadstring(" not in load_line:
+        return "Line 2 must be the loading line (containing `loadstring(`)."
+
+    return None
 
 
 # =========================================================================
@@ -399,6 +560,8 @@ def build_user_entry(
         "JoinDate": join_date or format_join_date(),
         "Key": key,
         "Notes": notes,
+        "LastHwidReset": None,
+        "totalHwidResets": 0,
     }
 
 
@@ -469,27 +632,41 @@ def format_join_date(dt: Optional[datetime] = None) -> str:
     return f"{dt.month}/{dt.day}/{dt.year}, {hour_12}:{dt.minute:02d}:{dt.second:02d} {period}"
 
 
-def format_discord_timestamp(date_str: Optional[str], fmt: str = "D") -> str:
-    """Converts an 'm/d/yyyy, h:mm:ss AM/PM' string into a Discord <t:...:fmt> timestamp, falling back to the raw string on failure.
+def parse_join_date(date_str: Optional[str]) -> Optional[datetime]:
+    """Parses a JoinDate-style 'm/d/yyyy, h:mm:ss AM/PM' string back into a
+    tz-aware datetime in LOCAL_TZ. Also accepts the older 'yyyy-mm-dd'
+    format for entries created before the JoinDate format change (assumed
+    UTC, since that's how it was originally stored).
 
-    Also accepts the older 'yyyy-mm-dd' format for entries created before the JoinDate format change (assumed UTC, since that's how it was originally stored).
+    Returns None if `date_str` is empty or doesn't match either format --
+    meaning there's nothing to parse, not that something is broken.
     """
+    if not date_str:
+        return None
+
+    try:
+        return datetime.strptime(date_str, "%m/%d/%Y, %I:%M:%S %p").replace(tzinfo=LOCAL_TZ)
+    except ValueError:
+        pass
+
+    try:
+        return datetime.strptime(date_str, "%Y-%m-%d").replace(tzinfo=timezone.utc)
+    except ValueError:
+        pass
+
+    return None
+
+
+def format_discord_timestamp(date_str: Optional[str], fmt: str = "D") -> str:
+    """Converts a JoinDate-style string into a Discord <t:...:fmt> timestamp, falling back to the raw string on failure."""
     if not date_str:
         return "N/A"
 
-    try:
-        dt = datetime.strptime(date_str, "%m/%d/%Y, %I:%M:%S %p").replace(tzinfo=LOCAL_TZ)
-        return f"<t:{int(dt.timestamp())}:{fmt}>"
-    except ValueError:
-        pass
+    dt = parse_join_date(date_str)
+    if dt is None:
+        return date_str
 
-    try:
-        dt = datetime.strptime(date_str, "%Y-%m-%d").replace(tzinfo=timezone.utc)
-        return f"<t:{int(dt.timestamp())}:{fmt}>"
-    except ValueError:
-        pass
-
-    return date_str
+    return f"<t:{int(dt.timestamp())}:{fmt}>"
 
 
 # =========================================================================
@@ -536,12 +713,17 @@ def parse_expiration_note(notes: Optional[str]) -> Optional[datetime]:
         return None
 
 
-def humanize_timeleft(delta: timedelta) -> str:
+def humanize_timeleft(delta: timedelta, *, suffix: bool = True) -> str:
     """
-    Renders a timedelta as a single friendly '<value> <unit> left' string
-    using the largest whole unit that fits (e.g. '1 month left',
-    '3 weeks left', '5 seconds left'), so it reads naturally regardless of
-    whether the whitelist duration was 5 minutes or a full year.
+    Renders a timedelta as a single friendly '<value> <unit>' string using
+    the largest whole unit that fits (e.g. '1 month', '3 weeks',
+    '5 seconds'), so it reads naturally regardless of whether the whitelist
+    duration was 5 minutes or a full year.
+
+    By default appends " left" (e.g. "1 month left") for standalone use
+    like a "Time Left" field. Pass suffix=False for call sites that already
+    supply their own framing -- e.g. "You can reset your HWID again in
+    {...}" reads better as "... in 6 days." than "... in 6 days left."
 
     Month/year lengths are approximate (30/365 days) since this is a
     human-readable countdown, not a calendar calculation.
@@ -563,8 +745,23 @@ def humanize_timeleft(delta: timedelta) -> str:
         value = total_seconds // seconds_per_unit
         if value >= 1:
             label = name if value == 1 else f"{name}s"
-            return f"{value} {label} left"
+            return f"{value} {label} left" if suffix else f"{value} {label}"
     return "Expired"
+
+
+def hwid_reset_cooldown_remaining(entry: Dict[str, Any]) -> Optional[timedelta]:
+    """Returns how much time is left before `entry` can use the control
+    panel's "Reset HWID" button again, based on its LastHwidReset field and
+    RESET_HWID_COOLDOWN. Returns None if a reset is allowed right now --
+    either because LastHwidReset is missing/unparseable (never reset
+    before), or because RESET_HWID_COOLDOWN has already elapsed since the
+    last one."""
+    last_reset = parse_join_date(entry.get("LastHwidReset"))
+    if not last_reset:
+        return None
+
+    remaining = RESET_HWID_COOLDOWN - (datetime.now(timezone.utc) - last_reset)
+    return remaining if remaining.total_seconds() > 0 else None
 
 
 # =========================================================================
@@ -660,6 +857,23 @@ async def safe_respond(interaction: discord.Interaction, content: Optional[str] 
             await interaction.followup.send(content=content, **kwargs)
     except discord.NotFound:
         print("Interaction expired before it could be responded to.")
+    except discord.HTTPException as e:
+        # interaction.response.is_done() only reflects *this* Interaction
+        # object's local state, which can be wrong if some other response
+        # already reached Discord for the same underlying interaction (e.g.
+        # two bot processes briefly running at once, or a duplicate gateway
+        # dispatch) -- Discord then rejects the "initial response" slot as
+        # already used (error code 40060), even though this object never
+        # saw that happen. The followup webhook still works regardless of
+        # who used the initial response, so retry through that instead of
+        # just dropping the message.
+        if getattr(e, "code", None) == 40060:
+            try:
+                await interaction.followup.send(content=content, **kwargs)
+            except Exception as e2:
+                print(f"Failed to respond via followup after an already-acknowledged error: {e2}")
+        else:
+            print(f"Failed to respond: {e}")
     except Exception as e:
         print(f"Failed to respond: {e}")
 

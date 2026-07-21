@@ -33,11 +33,13 @@ from bot_api import (
     fetch_api_text_and_sha, commit_content, commit_users, get_current_sha,
     list_commits, get_commit,
     fetch_permitted_keys_with_sha, commit_permitted_keys, remove_permitted_key, is_key_permitted,
-    fetch_stored_script, inject_script_key,
+    fetch_stored_script, fetch_stored_script_with_sha, commit_stored_script, inject_script_key, validate_stored_script,
     find_user_by_discord_id, find_user_by_hwid, find_user_by_key, remove_user_by_discord_id, build_user_entry,
     generate_key, generate_unique_key, is_valid_hwid, is_valid_discord_id,
     format_discord_timestamp, format_join_date,
     format_expiration_note, parse_expiration_note, humanize_timeleft,
+    RESET_HWID_COOLDOWN, hwid_reset_cooldown_remaining,
+    get_cached_users, refresh_users_cache,
     safe_respond, notify_user, notify_permission_error, has_role, is_in_guild, can_moderate,
     build_embed, success_embed, error_embed, send_success, send_error, edit_or_send_error,
 )
@@ -74,6 +76,11 @@ class Client(commands.Bot):
         # don't otherwise survive a process restart.
         self.add_view(ControlPanelView())
 
+        # Guarded with is_running() since on_ready can fire again on
+        # reconnect, and tasks.loop.start() raises if it's already going.
+        if not refresh_users_cache_task.is_running():
+            refresh_users_cache_task.start()
+
         try:
             guild_obj = discord.Object(id=GUILD_ID)
             synced = await self.tree.sync(guild=guild_obj)
@@ -89,6 +96,37 @@ active_temp_whitelists = {}
 # to restore channels to their exact prior state (instead of blanket
 # unlocking) so channels that were already locked beforehand stay locked.
 lockdown_snapshots = {}
+
+# --- Users.json cache refresh task ---
+#
+# Keeps bot_api's in-memory Users.json cache warm so read-only whitelist/
+# cooldown pre-checks (e.g. the control panel's Reset HWID button, in
+# ControlPanelView.reset_hwid below) never have to make a live network call
+# on the interaction's critical path -- so they can't time out or silently
+# fail open the way the old fetch_raw_users()-with-a-2s-timeout check did.
+#
+# commit_content() (used by every write path, including commit_users() for
+# redeem/edituser/reset hwid/etc.) already updates the cache immediately on
+# every write the bot makes itself, so this loop only has to catch external
+# changes -- e.g. someone editing Users.json by hand on GitHub, or a
+# /rollback -- within USERS_CACHE_REFRESH_INTERVAL seconds. It refreshes via
+# the Contents API rather than the raw.githubusercontent.com CDN precisely
+# so that "within USERS_CACHE_REFRESH_INTERVAL seconds" is actually true --
+# the CDN endpoint can lag well past that on its own.
+USERS_CACHE_REFRESH_INTERVAL = 60  # seconds
+
+@tasks.loop(seconds=USERS_CACHE_REFRESH_INTERVAL)
+async def refresh_users_cache_task():
+    try:
+        await refresh_users_cache()
+    except GitHubAPIError as e:
+        # Leave the existing cache in place and just try again next tick --
+        # stale-but-known beats throwing away the last good copy.
+        print(f"Failed to refresh Users.json cache: {e}")
+
+@refresh_users_cache_task.before_loop
+async def before_refresh_users_cache_task():
+    await bot.wait_until_ready()
 
 # --- Commands ---
 
@@ -457,6 +495,8 @@ async def myinfo(interaction: discord.Interaction):
     embed.add_field(name="Join Date", value=format_discord_timestamp(user_data.get("JoinDate")), inline=True)
     embed.add_field(name="HWID", value=f"||{user_data.get('HWID', 'N/A')}||", inline=True)
     embed.add_field(name="Key", value=f"||{user_data.get('Key', 'N/A')}||", inline=True)
+    embed.add_field(name="Last HWID Reset", value=format_discord_timestamp(user_data.get("LastHwidReset")), inline=True)
+    embed.add_field(name="Total HWID Resets", value=str(user_data.get("totalHwidResets", 0)), inline=True)
 
     # Only add Notes if it's not the string "false"
     notes = user_data.get("Notes")
@@ -949,6 +989,8 @@ async def validatekey(interaction: discord.Interaction, key: str):
     embed.add_field(name="Rank", value=entry.get("Rank", "N/A"), inline=True)
     embed.add_field(name="Join Date", value=format_discord_timestamp(entry.get("JoinDate", "Unknown")), inline=True)
     embed.add_field(name="Discord ID", value=f"<@{entry.get('DiscordId')}>" if entry.get("DiscordId") else "N/A", inline=True)
+    embed.add_field(name="Last HWID Reset", value=format_discord_timestamp(entry.get("LastHwidReset")), inline=True)
+    embed.add_field(name="Total HWID Resets", value=str(entry.get("totalHwidResets", 0)), inline=True)
     embed.add_field(name="Key", value=f"||`{entry.get('Key')}`||", inline=False)
     embed.add_field(name="HWID", value=f"||`{entry.get('HWID')}`||", inline=False)
 
@@ -1161,6 +1203,8 @@ async def fetchuser(interaction: discord.Interaction, user: discord.User):
         ("Join Date", join_date_display),
         ("HWID", f"||{user_data.get('HWID')}||" if user_data.get("HWID") else "N/A"),
         ("Key", f"||{user_data.get('Key')}||" if user_data.get("Key") else "N/A"),
+        ("Last HWID Reset", format_discord_timestamp(user_data.get("LastHwidReset"))),
+        ("Total HWID Resets", str(user_data.get("totalHwidResets", 0))),
         ("Discord ID", f"{user_data.get('DiscordId')} ({user.mention})"),
         ("Server Join Date", server_join_display),
         ("Number of Roles", str(num_roles))
@@ -1405,6 +1449,8 @@ class WhitelistView(LayoutView):
             f"**Join Date:** {format_discord_timestamp(user_data.get('JoinDate', 'N/A'))}",
             f"**HWID:** ||`{user_data.get('HWID', '')}`||",
             f"**Key:** ||`{user_data.get('Key', '')}`||",
+            f"**Last HWID Reset:** {format_discord_timestamp(user_data.get('LastHwidReset'))}",
+            f"**Total HWID Resets:** {user_data.get('totalHwidResets', 0)}",
         ]
         notes = user_data.get("Notes")
         if notes is not None and notes != "false" and notes.strip() != "":
@@ -2087,6 +2133,8 @@ class DbSearchView(LayoutView):
             f"**Discord ID:** {discord_id} ({mention})",
             f"**HWID:** ||`{user.get('HWID', '')}`||",
             f"**Key:** ||`{user.get('Key', '')}`||",
+            f"**Last HWID Reset:** {format_discord_timestamp(user.get('LastHwidReset'))}",
+            f"**Total HWID Resets:** {user.get('totalHwidResets', 0)}",
         ]
         notes = user.get("Notes")
         if notes and notes != "false" and notes.strip() != "":
@@ -2272,6 +2320,8 @@ async def checktemp(interaction: discord.Interaction, user: discord.User):
             ("HWID", f"||{entry.get('HWID')}||" if entry.get("HWID") else "N/A", True),
             ("Key", f"||{entry.get('Key')}||" if entry.get("Key") else "N/A", True),
             ("Join Date", format_discord_timestamp(entry.get("JoinDate", "Unknown")), True),
+            ("Last HWID Reset", format_discord_timestamp(entry.get("LastHwidReset")), True),
+            ("Total HWID Resets", str(entry.get("totalHwidResets", 0)), True),
             ("Expires", f"<t:{expires_ts}:F>", True),
             ("Time Left", humanize_timeleft(remaining_), True),
         ]
@@ -2520,6 +2570,108 @@ async def clearnotes(interaction: discord.Interaction, user: discord.User):
         return await send_error(interaction, str(e))
 
     await send_success(interaction, f"Notes cleared for {user.mention}.")
+
+# // forceresethwid //
+
+@bot.tree.command(name="forceresethwid", description="Forcefully sets a whitelisted user's HWID, bypassing their reset cooldown.", guild=discord.Object(id=GUILD_ID))
+@app_commands.describe(user="The whitelisted user whose HWID to force-reset.", hwid="The user's new HWID, pre-hashed in SHA-256 (64 hex characters).")
+@has_role(REQUIRED_ROLE_ID)
+@is_in_guild(GUILD_ID)
+async def forceresethwid(interaction: discord.Interaction, user: discord.User, hwid: str):
+    # Unlike /edituser's modal (capped at 5 components, leaving no room for
+    # LastHwidReset/totalHwidResets inputs), this is a plain slash command,
+    # so it can go ahead and bump those two fields itself -- same as a
+    # self-service reset via the panel's "Reset HWID" button/ResetHWIDModal,
+    # just admin-triggered and with the cooldown ignored entirely rather
+    # than checked.
+    hwid = hwid.strip()
+
+    if not is_valid_hwid(hwid):
+        return await send_error(interaction, "Invalid HWID format. Must be 64 hex characters (SHA-256).")
+
+    await interaction.response.defer(ephemeral=True)
+
+    try:
+        users, sha = await fetch_users_with_sha()
+    except GitHubAPIError as e:
+        return await send_error(interaction, str(e))
+
+    discord_id_str = str(user.id)
+    entry = find_user_by_discord_id(users, discord_id_str)
+    if not entry:
+        return await send_error(interaction, f"{user.mention} was not found in the user database.")
+
+    old_hwid = entry.get("HWID")
+    if hwid.lower() == (old_hwid or "").lower():
+        return await send_error(interaction, f"{user.mention} already has this HWID.")
+
+    # Same duplicate-HWID guard as edituser/ResetHWIDModal -- no user should
+    # ever end up sharing another account's HWID, force-reset or not.
+    collision = find_user_by_hwid(users, hwid)
+    if collision and collision is not entry:
+        return await send_error(
+            interaction,
+            f"This HWID is already whitelisted under **{collision.get('Identifier', 'Unknown')}** (<@{collision.get('DiscordId')}>).",
+        )
+
+    entry["HWID"] = hwid
+    entry["LastHwidReset"] = format_join_date()
+    entry["totalHwidResets"] = entry.get("totalHwidResets", 0) + 1
+
+    try:
+        await commit_users(users, sha, f"Force reset HWID for user: {entry.get('Identifier', discord_id_str)} ({discord_id_str})")
+    except GitHubAPIError as e:
+        return await send_error(interaction, str(e))
+
+    # No DM to the target -- this just confirms the change to the moderator
+    # who ran the command.
+    await send_success(
+        interaction,
+        f"{user.mention}'s HWID has been force reset.",
+        fields=[
+            ("Old HWID", f"||`{old_hwid}`||", False),
+            ("New HWID", f"||`{hwid}`||", False),
+            ("Last HWID Reset", format_discord_timestamp(entry["LastHwidReset"]), False),
+            ("Total HWID Resets", str(entry["totalHwidResets"]), False),
+        ],
+    )
+
+# // resethwidcooldown //
+
+@bot.tree.command(name="resethwidcooldown", description="Clears a user's HWID reset cooldown so they can reset their own HWID again immediately.", guild=discord.Object(id=GUILD_ID))
+@app_commands.describe(user="The whitelisted user whose HWID reset cooldown to clear.")
+@has_role(REQUIRED_ROLE_ID)
+@is_in_guild(GUILD_ID)
+async def resethwidcooldown(interaction: discord.Interaction, user: discord.User):
+    await interaction.response.defer(ephemeral=True)
+
+    try:
+        users, sha = await fetch_users_with_sha()
+    except GitHubAPIError as e:
+        return await send_error(interaction, str(e))
+
+    discord_id_str = str(user.id)
+    entry = find_user_by_discord_id(users, discord_id_str)
+    if not entry:
+        return await send_error(interaction, f"{user.mention} was not found in the user database.")
+
+    # hwid_reset_cooldown_remaining() (not just checking LastHwidReset for
+    # None) so this correctly reports "nothing to clear" if the cooldown
+    # already lapsed on its own, not just if it was never set.
+    if hwid_reset_cooldown_remaining(entry) is None:
+        return await send_error(interaction, f"{user.mention} is not currently on an HWID reset cooldown.")
+
+    entry["LastHwidReset"] = None
+
+    try:
+        await commit_users(users, sha, f"Reset HWID cooldown for user: {entry.get('Identifier', discord_id_str)} ({discord_id_str})")
+    except GitHubAPIError as e:
+        return await send_error(interaction, str(e))
+
+    await send_success(
+        interaction,
+        f"{user.mention}'s HWID reset cooldown has been cleared. They can now reset their own HWID via the control panel immediately.",
+    )
 
 
 # // createpanel //
@@ -2796,6 +2948,106 @@ class RedeemKeyModal(Modal, title="Redeem Key"):
         )
 
 
+class ResetHWIDModal(Modal, title="Reset HWID"):
+    """Lets an already-whitelisted user swap in a new HWID on their own
+    entry (e.g. after a hardware change) without needing a moderator to run
+    /edituser. Gated by reset_hwid()'s whitelist + cooldown checks before
+    this modal is ever shown, and re-checked again here since the fetch
+    those checks ran on can be stale by the time the user submits."""
+
+    hwid = Label(
+        text="HWID",
+        description="Pre-hashed HWID in SHA-256 (64 hex characters). Run /gethwid for help getting yours.",
+        component=TextInput(placeholder="64-character hex string", min_length=64, max_length=64),
+    )
+
+    async def on_submit(self, interaction: discord.Interaction):
+        hwid = self.hwid.component.value.strip()
+
+        if not is_valid_hwid(hwid):
+            return await send_error(interaction, "Invalid HWID format. Must be 64 hex characters (SHA-256).")
+
+        await interaction.response.defer(ephemeral=True)
+
+        try:
+            users, sha = await fetch_users_with_sha()
+        except GitHubAPIError as e:
+            return await send_error(interaction, str(e))
+
+        discord_id_str = str(interaction.user.id)
+        entry = find_user_by_discord_id(users, discord_id_str)
+        if not entry:
+            return await send_error(interaction, "You need to redeem a key before you can reset your HWID.")
+
+        remaining = hwid_reset_cooldown_remaining(entry)
+        if remaining:
+            return await send_error(interaction, f"You can reset your HWID again in {humanize_timeleft(remaining, suffix=False)}.")
+
+        old_hwid = entry.get("HWID")
+        if hwid.lower() == (old_hwid or "").lower():
+            return await send_error(interaction, "That's already your current HWID.")
+
+        existing_hwid = find_user_by_hwid(users, hwid)
+        if existing_hwid and existing_hwid is not entry:
+            owner_identifier = existing_hwid.get("Identifier", "Unknown")
+            owner_discord_id = str(existing_hwid.get("DiscordId", ""))
+
+            breach_embed = build_embed(
+                title="🚨 Potential Breach: Duplicate HWID",
+                description=(
+                    f"{interaction.user.mention} attempted to reset their HWID to one that's "
+                    f"already whitelisted under a different account. No user should ever have "
+                    f"someone else's HWID -- this likely means **{owner_identifier}**'s access "
+                    "was shared or leaked."
+                ),
+                color=discord.Color.orange(),
+                fields=[
+                    ("Attempting User", f"{interaction.user.mention} (`{discord_id_str}`)", False),
+                    ("HWID Owner", f"**{owner_identifier}** (`{owner_discord_id}`)", False),
+                    ("HWID", f"||`{hwid}`||", False),
+                ],
+                timestamp=datetime.now(timezone.utc),
+            )
+            await send_redeem_alert(breach_embed, HWIDBreachAlertView(owner_discord_id, owner_identifier, hwid, discord_id_str))
+
+            return await send_error(
+                interaction,
+                f"This HWID is already whitelisted under **{owner_identifier}**.",
+            )
+
+        entry["HWID"] = hwid
+        entry["LastHwidReset"] = format_join_date()
+        entry["totalHwidResets"] = entry.get("totalHwidResets", 0) + 1
+
+        try:
+            await commit_users(users, sha, f"Reset HWID for user: {entry.get('Identifier', discord_id_str)} ({discord_id_str})")
+        except GitHubAPIError as e:
+            return await send_error(interaction, str(e))
+
+        reset_embed = build_embed(
+            title="🔄 HWID Reset",
+            color=discord.Color.blue(),
+            fields=[
+                ("User", f"{interaction.user.mention} (`{discord_id_str}`)", False),
+                ("Old HWID", f"||`{old_hwid}`||", False),
+                ("New HWID", f"||`{hwid}`||", False),
+                ("Total Resets", str(entry["totalHwidResets"]), False),
+            ],
+            timestamp=datetime.now(timezone.utc),
+        )
+        await send_redeem_alert(reset_embed)
+
+        await send_success(
+            interaction,
+            "Your HWID has been reset successfully.",
+            fields=[
+                ("New HWID", f"||`{hwid}`||", False),
+                ("Next Reset Available", humanize_timeleft(RESET_HWID_COOLDOWN), False),
+                ("Total Resets", str(entry["totalHwidResets"]), False),
+            ],
+        )
+
+
 class ControlPanelView(LayoutView):
     """Persistent Components V2 control panel posted by /createpanel into
     #panel. Every button uses a fixed custom_id and this view is constructed
@@ -2828,32 +3080,52 @@ class ControlPanelView(LayoutView):
         row.add_item(role_button)
 
         hwid_button = Button(label="Reset HWID", style=discord.ButtonStyle.secondary, custom_id=PANEL_RESET_HWID_ID)
-        hwid_button.callback = self.under_construction
+        hwid_button.callback = self.reset_hwid
         row.add_item(hwid_button)
 
         info_button = Button(label="Get Info", style=discord.ButtonStyle.secondary, custom_id=PANEL_GET_INFO_ID)
-        info_button.callback = self.under_construction
+        info_button.callback = self.get_info
         row.add_item(info_button)
 
         container.add_item(row)
         self.add_item(container)
 
-    async def redeem_key(self, interaction: discord.Interaction):
-        # Sending a modal must be the interaction's very first response (it
-        # can't follow a defer()), so this whitelist check has to happen
-        # before responding at all. fetch_users_with_sha() (Contents API) is
-        # used here rather than fetch_raw_users() -- the raw CDN endpoint
-        # can lag behind a real commit for a while (the same caching /verifydata
-        # exists to catch), which was causing this check to false-positive
-        # off a stale copy of Users.json. The sha isn't needed here since
-        # this is read-only, so it's just discarded.
+    async def on_error(self, interaction: discord.Interaction, error: Exception, item) -> None:
+        # The default View.on_error only logs to the console and leaves the
+        # interaction completely unanswered, which is exactly what made
+        # this bug look like a silent/dead button instead of a visible
+        # error. send_error() -> safe_respond() already picks the right
+        # response method (initial vs. followup) based on whether this
+        # interaction was already acknowledged, so this works regardless of
+        # which step in a callback the exception came from.
+        print(f"Error in ControlPanelView for item {item!r}: {error}")
         try:
-            users, _sha = await fetch_users_with_sha()
-        except GitHubAPIError as e:
-            return await send_error(interaction, str(e))
+            await send_error(interaction, "Something went wrong. Please try again, and let a moderator know if it keeps happening.")
+        except Exception as e:
+            print(f"Failed to notify user of ControlPanelView error: {e}")
 
-        if find_user_by_discord_id(users, str(interaction.user.id)):
-            return await send_error(interaction, "You are already whitelisted and cannot redeem another key.")
+    async def redeem_key(self, interaction: discord.Interaction):
+        # Sending a modal must be the interaction's very first response,
+        # within Discord's ~3 second ack window, so this can't do a live
+        # GitHub fetch first the way it used to risk doing -- that's what
+        # made this check impractical here before. get_cached_users() reads
+        # bot_api's in-memory Users.json cache (see the Reset HWID cache
+        # note above and refresh_users_cache_task in main.py) instead, which
+        # never touches the network and so can't blow the ack window.
+        #
+        # If the cache says the user already has an entry, skip the modal
+        # entirely instead of letting them fill it out for nothing.
+        # RedeemKeyModal.on_submit() still re-checks "already whitelisted"
+        # against a fresh fetch before committing anything, so it remains
+        # the single source of truth -- this is just a UX improvement, not
+        # a security boundary. If the cache hasn't been populated yet (e.g.
+        # right after a bot restart), fall back to opening the modal
+        # unconditionally, same as before.
+        users = get_cached_users()
+        if users is not None:
+            existing = find_user_by_discord_id(users, str(interaction.user.id))
+            if existing:
+                return await send_error(interaction, "You have already redeemed a key and are whitelisted.")
 
         await interaction.response.send_modal(RedeemKeyModal())
 
@@ -2925,15 +3197,73 @@ class ControlPanelView(LayoutView):
         await interaction.user.add_roles(role, reason="Whitelisted user claimed Buyer role via control panel")
         await send_success(interaction, f"You've been given the {role.mention} role.")
 
-    # Reset HWID / Get Info both route here for now -- swap each one out for
-    # its own handler as that functionality gets built.
-    async def under_construction(self, interaction: discord.Interaction):
-        embed = build_embed(
-            title="🚧 Under Construction",
-            description="This feature isn't available yet. Check back soon!",
-            color=discord.Color.orange(),
-        )
-        await safe_respond(interaction, embed=embed, ephemeral=True)
+    async def reset_hwid(self, interaction: discord.Interaction):
+        # Best-effort pre-check: skip prompting for a new HWID if the user
+        # isn't whitelisted or is still on cooldown. This has to stay fast --
+        # send_modal (like send_message) must be the interaction's first
+        # response, inside Discord's ~3 second ack window, so it reads from
+        # bot_api's in-memory Users.json cache (kept warm by
+        # refresh_users_cache_task) instead of hitting GitHub live. That
+        # cache read can't time out or fail, so unlike the old
+        # fetch_raw_users()-with-a-2s-timeout version of this check, there's
+        # no path left that silently "fails open" into showing the modal to
+        # someone who was never whitelisted.
+        #
+        # get_cached_users() can still be None very briefly right after a
+        # bot restart, before the first refresh has landed -- in that one
+        # window we fall back to opening the modal unconditionally, same as
+        # redeem_key. ResetHWIDModal.on_submit() re-checks both whitelist
+        # and cooldown against a fresh fetch regardless, so it remains the
+        # single source of truth either way.
+        users = get_cached_users()
+        if users is None:
+            return await interaction.response.send_modal(ResetHWIDModal())
+
+        discord_id_str = str(interaction.user.id)
+        entry = find_user_by_discord_id(users, discord_id_str)
+        if not entry:
+            return await send_error(interaction, "You need to redeem a key before you can reset your HWID.")
+
+        remaining = hwid_reset_cooldown_remaining(entry)
+        if remaining:
+            return await send_error(interaction, f"You can reset your HWID again in {humanize_timeleft(remaining, suffix=False)}.")
+
+        await interaction.response.send_modal(ResetHWIDModal())
+
+    async def get_info(self, interaction: discord.Interaction):
+        # Same lookup + embed as the /myinfo slash command, just triggered
+        # from the panel button instead. Always ephemeral, and always a
+        # fresh Contents-API fetch (same reasoning as get_script/get_role
+        # above) rather than the in-memory cache, since this is a
+        # user-facing info readout and should reflect the latest data.
+        await interaction.response.defer(ephemeral=True)
+
+        try:
+            users, _ = await fetch_users_with_sha()
+        except GitHubAPIError as e:
+            return await send_error(interaction, str(e))
+
+        user_data = find_user_by_discord_id(users, interaction.user.id)
+        if not user_data:
+            return await send_error(interaction, "You were not found in the user database.")
+
+        embed = discord.Embed(title=f"User Info: {interaction.user}", color=discord.Color.blue())
+        embed.set_thumbnail(url=interaction.user.display_avatar.url)
+
+        embed.add_field(name="Identifier", value=user_data.get("Identifier", "N/A"), inline=True)
+        embed.add_field(name="Rank", value=user_data.get("Rank", "N/A"), inline=True)
+        embed.add_field(name="Join Date", value=format_discord_timestamp(user_data.get("JoinDate")), inline=True)
+        embed.add_field(name="HWID", value=f"||{user_data.get('HWID', 'N/A')}||", inline=True)
+        embed.add_field(name="Key", value=f"||{user_data.get('Key', 'N/A')}||", inline=True)
+        embed.add_field(name="Last HWID Reset", value=format_discord_timestamp(user_data.get("LastHwidReset")), inline=True)
+        embed.add_field(name="Total HWID Resets", value=str(user_data.get("totalHwidResets", 0)), inline=True)
+
+        # Only add Notes if it's not the string "false"
+        notes = user_data.get("Notes")
+        if notes and notes.lower() != "false":
+            embed.add_field(name="Notes", value=notes, inline=True)
+
+        await interaction.followup.send(embed=embed, ephemeral=True)
 
 
 @bot.tree.command(name="createpanel", description="Posts the control panel in the panel channel.", guild=discord.Object(id=GUILD_ID))
@@ -2949,6 +3279,53 @@ async def createpanel(interaction: discord.Interaction):
     await channel.send(view=ControlPanelView())
 
     await send_success(interaction, f"Control panel posted in {channel.mention}.")
+
+# // updatescript //
+
+@bot.tree.command(name="updatescript", description="Updates the script /createpanel's Get Script button hands out.", guild=discord.Object(id=GUILD_ID))
+@app_commands.describe(script="New storedscript.lua contents. Must be exactly 2 lines: the script key line, then the loading line.")
+@has_role(REQUIRED_ROLE_ID)
+@is_in_guild(GUILD_ID)
+async def updatescript(interaction: discord.Interaction, script: discord.Attachment):
+    await interaction.response.defer(ephemeral=True)
+
+    if not script.filename.lower().endswith(".lua"):
+        return await send_error(interaction, "Please upload a valid `.lua` file.")
+
+    try:
+        raw_bytes = await script.read()
+    except discord.HTTPException as e:
+        return await send_error(interaction, f"Failed to download the uploaded file: {e}")
+
+    try:
+        script_text = raw_bytes.decode("utf-8")
+    except UnicodeDecodeError:
+        return await send_error(interaction, "That file isn't valid UTF-8 text.")
+
+    # Enforces the exact 2-line shape (script key line, then loading line)
+    # that Get Script's inject_script_key() depends on -- see
+    # validate_stored_script() in bot_api.py. Catches a bad upload here
+    # instead of it silently breaking every whitelisted user's Get Script
+    # click afterward.
+    error = validate_stored_script(script_text)
+    if error:
+        return await send_error(interaction, error)
+
+    try:
+        _current_text, sha = await fetch_stored_script_with_sha()
+    except GitHubAPIError as e:
+        return await send_error(interaction, str(e))
+
+    try:
+        await commit_stored_script(script_text, sha, f"Update storedscript.lua by {interaction.user}")
+    except GitHubAPIError as e:
+        return await send_error(interaction, str(e))
+
+    await send_success(
+        interaction,
+        "`storedscript.lua` has been updated. **Get Script** will now hand out this version, keyed to each user.",
+        fields=[("New Script", f"```lua\n{script_text}\n```", False)],
+    )
 
 
 # --- Error Handler ---
