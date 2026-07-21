@@ -13,7 +13,7 @@ from discord.ext import commands, tasks
 from discord.app_commands import errors as app_errors
 from discord import app_commands, InteractionResponded, ui, Interaction
 import asyncio
-from typing import Optional, Dict, Any
+from typing import Optional, Dict, Any, List
 from datetime import datetime, timezone, timedelta
 import json
 import base64
@@ -21,6 +21,7 @@ import re
 import io
 import csv
 import difflib
+import hashlib
 from discord.ui import Modal, TextInput, View, Button, LayoutView, Container, TextDisplay, ActionRow, Section, Thumbnail, File, Label, Select, Checkbox
 from collections import defaultdict
 
@@ -32,11 +33,15 @@ from bot_api import (
     fetch_raw_users, fetch_users_with_sha, fetch_api_file, fetch_raw_text,
     fetch_api_text_and_sha, commit_content, commit_users, get_current_sha,
     list_commits, get_commit,
-    fetch_permitted_keys_with_sha, commit_permitted_keys, remove_permitted_key, is_key_permitted,
+    fetch_permitted_keys_with_sha, commit_permitted_keys, remove_permitted_key, remove_permitted_keys,
+    remove_first_n_permitted_keys, is_key_permitted,
     fetch_stored_script, fetch_stored_script_with_sha, commit_stored_script, inject_script_key, validate_stored_script,
     find_user_by_discord_id, find_user_by_hwid, find_user_by_key, remove_user_by_discord_id, build_user_entry,
-    generate_key, generate_unique_key, is_valid_hwid, is_valid_discord_id,
+    revoke_buyer_role, find_removed_discord_ids,
+    generate_key, generate_unique_key, generate_unique_keys, parse_key_length_range, is_valid_hwid, is_valid_discord_id,
     format_discord_timestamp, format_join_date,
+    get_available_hash_algorithms, hash_text, SHAKE_OUTPUT_BYTES,
+    TRANSFORM_FORMAT_CHOICES, transform_text,
     format_expiration_note, parse_expiration_note, humanize_timeleft, is_notes_locked,
     RESET_HWID_COOLDOWN, hwid_reset_cooldown_remaining,
     get_cached_users, refresh_users_cache,
@@ -54,6 +59,11 @@ if not TOKEN:
 # when they gain/lose a reaction role. No slash command controls this;
 # flip it here and restart the bot.
 REACTION_ROLE_DMS_ENABLED = True
+
+# Caps /genkey's bulk `amount` option. Mainly guards against an oversized
+# permittedKeys.txt commit and against blowing well past what the inline
+# embed / fallback file can reasonably display, not a security control.
+MAX_BULK_GENKEY_AMOUNT = 100
 
 # // Intents & Setup //
 
@@ -137,6 +147,102 @@ async def before_refresh_users_cache_task():
 @is_in_guild(GUILD_ID)
 async def ping(interaction: discord.Interaction):
     await send_success(interaction, f"Pong! Latency: {round(bot.latency * 1000)}ms", title="🏓 Pong")
+
+# // hash //
+
+async def hash_algorithm_autocomplete(interaction: discord.Interaction, current: str) -> List[app_commands.Choice[str]]:
+    """
+    Populates /hash's `algorithm` option as the user types. hashlib can
+    easily expose more algorithms than Discord's 25-result autocomplete cap
+    (especially once OpenSSL's extras are counted), so this narrows to
+    substring matches against whatever's typed so far instead of always
+    showing the same first 25 alphabetically -- typing "sha" surfaces every
+    sha1/sha2/sha3/shake variant instead of getting stuck on "blake2b".
+    """
+    algorithms = get_available_hash_algorithms()
+    query = current.lower().strip()
+    matches = [a for a in algorithms if query in a] if query else algorithms
+    return [app_commands.Choice(name=a, value=a) for a in matches[:25]]
+
+
+@bot.tree.command(name="hash", description="Hashes text using a chosen algorithm (MD5, SHA-2, SHA-3, BLAKE2, SHAKE, etc).", guild=discord.Object(id=GUILD_ID))
+@app_commands.describe(text="The text to hash", algorithm="Hash algorithm to use -- start typing to search the full list")
+@app_commands.autocomplete(algorithm=hash_algorithm_autocomplete)
+@has_role(REQUIRED_ROLE_ID)
+@is_in_guild(GUILD_ID)
+async def hash_cmd(interaction: discord.Interaction, text: str, algorithm: str):
+    algo = algorithm.lower().strip()
+    available = get_available_hash_algorithms()
+
+    if algo not in available:
+        # Autocomplete only *suggests* valid values -- Discord still lets a
+        # user submit whatever raw text they typed instead of picking a
+        # suggestion, so this re-validates rather than trusting the input.
+        suggestion = difflib.get_close_matches(algo, available, n=1)
+        hint = f" Did you mean `{suggestion[0]}`?" if suggestion else " Start typing to see the list of supported algorithms."
+        return await send_error(interaction, f"`{algorithm}` isn't a supported hash algorithm.{hint}")
+
+    try:
+        digest = hash_text(algo, text)
+    except (TypeError, ValueError) as e:
+        return await send_error(interaction, f"Failed to hash text with `{algo}`: {e}")
+
+    def _safe_codeblock(value: str, limit: int = 1000) -> str:
+        # Truncate to stay under Discord's 1024-char embed field limit, and
+        # break up any literal ``` in the input so it can't prematurely
+        # close the surrounding code block.
+        value = value.replace("```", "``\u200b`")
+        if len(value) > limit:
+            value = value[:limit] + "… (truncated)"
+        return value
+
+    algorithm_label = f"`{algo}`"
+    if algo.startswith("shake_"):
+        algorithm_label += f" (SHAKE / XOF -- shown at {SHAKE_OUTPUT_BYTES * 8}-bit output length)"
+
+    embed = build_embed(
+        title="🔐 Hash Result",
+        color=discord.Color.blue(),
+        fields=[
+            ("Algorithm", algorithm_label, False),
+            ("Before", f"```{_safe_codeblock(text)}```", False),
+            ("After", f"```{_safe_codeblock(digest)}```", False),
+        ],
+    )
+    await safe_respond(interaction, embed=embed, ephemeral=True)
+
+# // transform //
+
+@bot.tree.command(name="transform", description="Transforms text into a stylized Unicode format (superscript, cursive, zalgo, and more).", guild=discord.Object(id=GUILD_ID))
+@app_commands.describe(text="The text to transform", format="Style to transform the text into")
+@app_commands.choices(format=[app_commands.Choice(name=name, value=value) for name, value in TRANSFORM_FORMAT_CHOICES])
+@has_role(REQUIRED_ROLE_ID)
+@is_in_guild(GUILD_ID)
+async def transform_cmd(interaction: discord.Interaction, text: str, format: app_commands.Choice[str]):
+    try:
+        result = transform_text(format.value, text)
+    except ValueError as e:
+        return await send_error(interaction, str(e))
+
+    def _safe_codeblock(value: str, limit: int = 1000) -> str:
+        # Truncate to stay under Discord's 1024-char embed field limit, and
+        # break up any literal ``` in the input/output so it can't
+        # prematurely close the surrounding code block.
+        value = value.replace("```", "``\u200b`")
+        if len(value) > limit:
+            value = value[:limit] + "… (truncated)"
+        return value
+
+    embed = build_embed(
+        title="🎨 Transform Result",
+        color=discord.Color.blue(),
+        fields=[
+            ("Format", f"`{format.name}`", False),
+            ("Before", f"```{_safe_codeblock(text)}```", False),
+            ("After", f"```{_safe_codeblock(result)}```", False),
+        ],
+    )
+    await safe_respond(interaction, embed=embed, ephemeral=True)
 
 # // ban //
 
@@ -471,6 +577,42 @@ async def dm(interaction: discord.Interaction, target: discord.User, message: st
     except Exception as e:
         await send_error(interaction, f"Unexpected error: {e}")
 
+# // ghostping //
+
+@bot.tree.command(name="ghostping", description="Sends a user's mention in this channel and deletes it immediately.", guild=discord.Object(id=GUILD_ID))
+@app_commands.describe(user="User to ghost ping")
+@has_role(REQUIRED_ROLE_ID)
+@is_in_guild(GUILD_ID)
+async def ghostping(interaction: discord.Interaction, user: discord.User):
+    # The only real latency here is two sequential Discord API calls: send,
+    # then delete. Delete needs the message ID that only comes back in
+    # send()'s own response, so the two can't be run concurrently with
+    # asyncio.gather() or similar -- delete strictly depends on send's
+    # result. What asyncio buys here is that nothing else competes for the
+    # event loop between the two calls below: no interaction ack, no embed
+    # building, no logging -- literally send immediately followed by
+    # delete, so the mention is live for exactly as long as these two HTTP
+    # round trips take and not a moment longer.
+    #
+    # channel.send() is used directly (rather than
+    # interaction.response.send_message() + interaction.original_response())
+    # since send() already hands back the created Message with its id
+    # populated -- no extra fetch needed just to get something to delete.
+    try:
+        msg = await interaction.channel.send(
+            user.mention,
+            allowed_mentions=discord.AllowedMentions(users=True, everyone=False, roles=False),
+        )
+        await msg.delete()
+    except discord.Forbidden:
+        return await send_error(interaction, "Missing permissions to send or delete messages in this channel.")
+    except discord.HTTPException as e:
+        return await send_error(interaction, f"Failed to ghost ping: {e}")
+
+    # Only reached after the ping is already gone, so this can't add any
+    # delay to the window it was actually visible for.
+    await send_success(interaction, f"Ghost pinged {user.mention}.")
+
 # // myinfo //
 
 @bot.tree.command(name="myinfo", description="Fetches your whitelist information from the database.", guild=discord.Object(id=GUILD_ID))
@@ -669,6 +811,8 @@ async def unwhitelist(interaction: discord.Interaction, user: discord.User):
     except GitHubAPIError as e:
         return await send_error(interaction, str(e))
 
+    await revoke_buyer_role(interaction.guild, discord_id)
+
     await send_success(interaction, f"{user.mention} has been removed from the whitelist.")
 
 # // editwhitelist //
@@ -741,6 +885,9 @@ class EditWhitelistModal(Modal):
         except GitHubAPIError as e:
             await send_error(interaction, str(e))
             return
+
+        for discord_id in find_removed_discord_ids(current_users, new_users):
+            await revoke_buyer_role(interaction.guild, discord_id)
 
         await send_success(interaction, "Whitelist updated successfully.")
 
@@ -937,17 +1084,179 @@ async def edituser(interaction: discord.Interaction, user: discord.User):
 
 # // genkey //
 
-@bot.tree.command(name="genkey", description="Generates a unique and random key using a strict alogrithm.", guild=discord.Object(id=GUILD_ID))
+@bot.tree.command(name="genkey", description="Generates one or more unique, random keys.", guild=discord.Object(id=GUILD_ID))
+@app_commands.describe(
+    amount="How many keys to generate",
+    allow_redemption="Commit the generated keys to permittedKeys.txt so they're redeemable via the control panel",
+    length="Key length: a single number (e.g. 20) or a range (e.g. 5-10). Defaults to 25-40.",
+)
 @has_role(REQUIRED_ROLE_ID)
 @is_in_guild(GUILD_ID)
-async def genkey(interaction: discord.Interaction):
+async def genkey(interaction: discord.Interaction, amount: int, allow_redemption: bool = False, length: Optional[str] = None):
+    if amount < 1:
+        return await send_error(interaction, "`amount` must be at least 1.")
+    if amount > MAX_BULK_GENKEY_AMOUNT:
+        return await send_error(interaction, f"`amount` can't exceed {MAX_BULK_GENKEY_AMOUNT} at once.")
+
+    if length is not None:
+        try:
+            min_length, max_length = parse_key_length_range(length)
+        except ValueError as e:
+            return await send_error(interaction, str(e))
+    else:
+        min_length, max_length = 25, 40  # generate_key()'s own defaults
+
     await interaction.response.defer(ephemeral=True)
 
-    key = generate_key()
-    embed = discord.Embed(title="🔐 Generated Key", description=f"||`{key}`||", color=discord.Color.purple())
-    embed.set_footer(text="Keep this key safe and only share to one specific individual.")
+    try:
+        users, _users_sha = await fetch_users_with_sha()
+    except GitHubAPIError as e:
+        return await send_error(interaction, str(e))
 
-    await interaction.followup.send(embed=embed, ephemeral=True)
+    # Always cross-checked against both already-assigned Keys and whatever's
+    # currently sitting in permittedKeys.txt (fetched via the sha-returning
+    # variant regardless of allow_redemption, since it's needed for the
+    # commit below anyway when allow_redemption is True, and costs nothing
+    # extra to read from when it's False).
+    try:
+        permitted_keys, keys_sha = await fetch_permitted_keys_with_sha()
+    except GitHubAPIError as e:
+        return await send_error(interaction, str(e))
+
+    existing_keys = {u.get("Key") for u in users if u.get("Key")} | set(permitted_keys)
+    new_keys = generate_unique_keys(amount, existing_keys, min_length, max_length)
+
+    if allow_redemption:
+        try:
+            await commit_permitted_keys(
+                permitted_keys + new_keys,
+                keys_sha,
+                f"Bulk generated {len(new_keys)} key(s) for redemption by {interaction.user}",
+            )
+        except GitHubAPIError as e:
+            return await send_error(interaction, str(e))
+
+    footer_text = (
+        "Committed to permittedKeys.txt -- redeemable now via the control panel."
+        if allow_redemption else
+        "Not committed -- not yet redeemable via the control panel."
+    )
+
+    keys_block = "\n".join(f"||`{k}`||" for k in new_keys)
+    title = f"🔐 Generated {len(new_keys)} Key{'s' if len(new_keys) != 1 else ''}"
+
+    # Same inline-vs-file fallback /rollback's diff view uses: spoiler-tagged
+    # inline text is nicer when it fits, but a large amount/length combo can
+    # blow past Discord's message/embed limits, so fall back to an attached
+    # file rather than truncating the list of keys.
+    if len(keys_block) <= 1800:
+        embed = discord.Embed(title=title, description=keys_block, color=discord.Color.purple())
+        embed.set_footer(text=footer_text)
+        await interaction.followup.send(embed=embed, ephemeral=True)
+    else:
+        filename = "SPOILER_generated_keys.txt"
+        file = discord.File(io.BytesIO(("\n".join(new_keys) + "\n").encode()), filename=filename)
+        layout = file_success_layout(f"**{title}**\n{footer_text}", filename)
+        await interaction.followup.send(view=layout, file=file, ephemeral=True)
+
+# // getkeys //
+
+@bot.tree.command(name="getkeys", description="Displays every key currently available for redemption.", guild=discord.Object(id=GUILD_ID))
+@has_role(REQUIRED_ROLE_ID)
+@is_in_guild(GUILD_ID)
+async def getkeys(interaction: discord.Interaction):
+    await interaction.response.defer(ephemeral=True)
+
+    # fetch_permitted_keys_with_sha() (Contents API) rather than
+    # fetch_permitted_keys() (raw CDN) even though nothing here writes back
+    # -- same reasoning as everywhere else this distinction shows up in this
+    # file: this command's whole purpose is showing the live, current list,
+    # so it shouldn't risk the CDN's staleness (e.g. right after a
+    # /genkey ... allow_redemption:True or a /clearkeys).
+    try:
+        permitted_keys, _sha = await fetch_permitted_keys_with_sha()
+    except GitHubAPIError as e:
+        return await send_error(interaction, str(e))
+
+    if not permitted_keys:
+        return await send_success(interaction, "No keys are currently available for redemption.")
+
+    keys_block = "\n".join(f"||`{k}`||" for k in permitted_keys)
+    title = f"🔑 {len(permitted_keys)} Available Key{'s' if len(permitted_keys) != 1 else ''}"
+
+    # Same inline-vs-file fallback /genkey uses -- see the global error
+    # handler's "or fewer in length" branch for the safety net covering
+    # whatever slips past this (it isn't a substitute for this check, since
+    # a file is a much better experience than an error for a long list).
+    if len(keys_block) <= 1800:
+        embed = discord.Embed(title=title, description=keys_block, color=discord.Color.purple())
+        await interaction.followup.send(embed=embed, ephemeral=True)
+    else:
+        filename = "SPOILER_available_keys.txt"
+        file = discord.File(io.BytesIO(("\n".join(permitted_keys) + "\n").encode()), filename=filename)
+        layout = file_success_layout(f"**{title}**", filename)
+        await interaction.followup.send(view=layout, file=file, ephemeral=True)
+
+# // clearkeys //
+
+@bot.tree.command(name="clearkeys", description="Removes keys from permittedKeys.txt -- provide a list of keys, or a number to clear, not both.", guild=discord.Object(id=GUILD_ID))
+@app_commands.describe(
+    keys="Space/comma separated list of exact keys to remove",
+    amount="Number of keys to remove (earliest entries first) -- use instead of `keys`, not with it",
+)
+@has_role(REQUIRED_ROLE_ID)
+@is_in_guild(GUILD_ID)
+async def clearkeys(interaction: discord.Interaction, keys: Optional[str] = None, amount: Optional[int] = None):
+    if keys is not None and amount is not None:
+        return await send_error(interaction, "Provide either `keys` or `amount`, not both.")
+    if keys is None and amount is None:
+        return await send_error(interaction, "Provide either `keys` or `amount`.")
+    if amount is not None and amount < 1:
+        return await send_error(interaction, "`amount` must be at least 1.")
+
+    await interaction.response.defer(ephemeral=True)
+
+    try:
+        permitted_keys, sha = await fetch_permitted_keys_with_sha()
+    except GitHubAPIError as e:
+        return await send_error(interaction, str(e))
+
+    if not permitted_keys:
+        return await send_error(interaction, "There's nothing to clear -- permittedKeys.txt is already empty.")
+
+    if keys is not None:
+        requested = [k.strip() for k in re.split(r"[,\s]+", keys.strip()) if k.strip()]
+        if not requested:
+            return await send_error(interaction, "No valid keys were provided.")
+        remaining, removed = remove_permitted_keys(permitted_keys, requested)
+        not_found = [k for k in requested if k not in removed]
+    else:
+        remaining, removed = remove_first_n_permitted_keys(permitted_keys, amount)
+        not_found = []
+
+    if not removed:
+        return await send_error(interaction, "None of the provided keys were found in permittedKeys.txt.")
+
+    try:
+        await commit_permitted_keys(remaining, sha, f"Cleared {len(removed)} key(s) by {interaction.user}")
+    except GitHubAPIError as e:
+        return await send_error(interaction, str(e))
+
+    fields = [
+        ("Removed", str(len(removed)), True),
+        ("Remaining", str(len(remaining)), True),
+    ]
+    if not_found:
+        not_found_display = ", ".join(f"||`{k}`||" for k in not_found)
+        if len(not_found_display) > 1000:
+            not_found_display = f"{len(not_found)} key(s) not found (too many to list)."
+        fields.append(("Not Found", not_found_display, False))
+
+    await send_success(
+        interaction,
+        f"Cleared {len(removed)} key{'s' if len(removed) != 1 else ''} from permittedKeys.txt.",
+        fields=fields,
+    )
 
 # // export //
 
@@ -1073,6 +1382,16 @@ async def rollback(interaction: discord.Interaction, sha: str):
         await commit_content(restored_content, current_sha, f"Rollback Users.json to commit {sha}")
     except GitHubAPIError as e:
         return await send_error(interaction, str(e))
+
+    # A rollback can implicitly "unwhitelist" anyone added after the commit
+    # being rolled back to -- they're not targeted individually the way
+    # /unwhitelist is, so this diffs the before/after lists to find them.
+    try:
+        removed_ids = find_removed_discord_ids(json.loads(current_content), json.loads(restored_content))
+    except json.JSONDecodeError:
+        removed_ids = []
+    for discord_id in removed_ids:
+        await revoke_buyer_role(interaction.guild, discord_id)
 
     # Diff what's being replaced against what was just restored, so staff
     # can see exactly what the rollback changed without cross-referencing
@@ -1462,6 +1781,8 @@ class DeleteUserConfirmView(LayoutView):
             await commit_users(existing, sha, f"Deleted whitelist user: {self.identifier} ({self.discord_id})")
         except GitHubAPIError as e:
             return await send_error(interaction, str(e))
+
+        await revoke_buyer_role(interaction.guild, self.discord_id)
 
         view.users = existing
         # Keep the user on the same page index; only clamp if that entry no
@@ -2102,10 +2423,16 @@ async def upload(interaction: Interaction, file: discord.Attachment):
     content_str = json.dumps(users_data, indent=4)
 
     try:
-        sha = await get_current_sha()
+        current_users, sha = await fetch_users_with_sha()
         await commit_content(content_str, sha, f"Upload Users.json by {interaction.user}")
     except GitHubAPIError as e:
         return await send_error(interaction, str(e))
+
+    # A bulk upload can implicitly "unwhitelist" anyone missing from the
+    # uploaded file -- they're not targeted individually the way
+    # /unwhitelist is, so this diffs the before/after lists to find them.
+    for discord_id in find_removed_discord_ids(current_users, users_data):
+        await revoke_buyer_role(interaction.guild, discord_id)
 
     await interaction.followup.send(
         view=status_layout("✅ Success", "Users.json uploaded successfully.", discord.Color.green()),
@@ -2365,6 +2692,8 @@ async def tempwhitelist(interaction: discord.Interaction, user: discord.User, hw
                 await commit_users(current_whitelist, current_sha, f"Temp whitelist expired: {user.name} ({discord_id})")
             except GitHubAPIError:
                 return
+
+            await revoke_buyer_role(interaction.guild, discord_id)
 
             active_temp_whitelists.pop(discord_id, None)
 
@@ -2899,6 +3228,7 @@ class HWIDBreachAlertView(View):
             filtered, removed = remove_user_by_discord_id(users, self.owner_discord_id)
             if removed:
                 await commit_users(filtered, sha, f"Unwhitelisted (HWID breach): {self.owner_identifier} ({self.owner_discord_id})")
+                await revoke_buyer_role(interaction.guild, self.owner_discord_id)
                 results.append(f"✅ Unwhitelisted **{self.owner_identifier}**")
             else:
                 results.append(f"⚠️ No whitelist entry found for **{self.owner_identifier}** (may already be removed)")
@@ -3719,6 +4049,33 @@ async def on_app_command_error(interaction: discord.Interaction, error: app_comm
             "The response was too large to display (Discord limits embeds to 6,000 characters total). "
             "Try narrowing your request so it returns less data.",
         )
+        return
+
+    # Catch Discord's per-field "Must be X or fewer in length" HTTPException
+    # (also error code 50035, Invalid Form Body) -- distinct from the
+    # whole-embed 6000-character check above: this one fires when a single
+    # field (an embed's description/title/a field value, or message content)
+    # individually exceeds its own limit, e.g. /getkeys or /genkey building
+    # a keys list that's short enough to pass the "under 6000 total" check
+    # but still blows past a single embed description's own 4096 cap. The
+    # inline-vs-file fallbacks those commands use are meant to avoid this in
+    # the first place -- this is just the safety net for whatever slips
+    # past that (or any other command that hits the same shape of error).
+    if isinstance(original, discord.HTTPException) and "or fewer in length" in str(original):
+        match = re.search(r"In ([\w.]+): Must be (\d+) or fewer in length", str(original))
+        if match:
+            field, limit = match.group(1), match.group(2)
+            await send_error(
+                interaction,
+                f"That response was too long for Discord ({field} is limited to {limit} characters). "
+                "Try narrowing your request so it returns less text.",
+            )
+        else:
+            await send_error(
+                interaction,
+                "That response exceeded one of Discord's character limits. Try narrowing your request "
+                "so it returns less text.",
+            )
         return
 
     # Catch-all for any other Discord API errors (rate limits, malformed
