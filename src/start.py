@@ -10,13 +10,27 @@ requirements.txt` and filling in `.env`).
 import sys
 import os
 import re
+import shutil
 import traceback
+from pathlib import Path
 
 # So `import api` / `import commands` resolve as top-level packages no
-# matter what directory this is launched from -- both live directly under
-# this file (src/api, src/commands), so it's src itself that needs to be on
-# sys.path, not its parent.
+# matter what directory this is launched from
 sys.path.insert(0, os.path.dirname(os.path.abspath(__file__)))
+
+
+
+def _clear_pycache():
+    """
+    Deletes every __pycache__ folder under src/ before anything in this
+    package gets imported.
+    """
+    src_dir = Path(__file__).resolve().parent
+    for pycache_dir in src_dir.rglob("__pycache__"):
+        shutil.rmtree(pycache_dir, ignore_errors=True)
+ 
+ 
+_clear_pycache()
 
 from keep_alive import keep_alive
 
@@ -56,10 +70,47 @@ EXTENSIONS = (
 )
 
 
+EXTENSION_MAX_COMMANDS = {
+    "commands.info": 2,
+    "commands.utility": 2,
+    "commands.moderation": 9,
+    "commands.whitelist": 12,
+    "commands.keys_hwid": 8,
+    "commands.database": 7,
+    "commands.panel": 2,
+    "commands.access": 4,
+    "commands.reaction_roles": 1,
+    "commands.context_menus": 15,
+}
+TOTAL_DEFINED_COMMANDS = sum(EXTENSION_MAX_COMMANDS.values())  # 62
+
+
 class Client(commands.Bot):
     async def setup_hook(self):
+        guild_obj = discord.Object(id=config.GUILD_ID)
+        total_extensions = len(EXTENSIONS)
+        loaded_extensions = 0
+
         for extension in EXTENSIONS:
-            await self.load_extension(extension)
+            before = len(self.tree.get_commands(guild=guild_obj))
+            print(f"Loading extension: {extension}")
+            try:
+                await self.load_extension(extension)
+            except Exception:
+                print(f"FAILED to load extension: {extension}")
+                traceback.print_exc()
+                continue
+            loaded_extensions += 1
+            after = len(self.tree.get_commands(guild=guild_obj))
+            added = after - before
+            max_for_ext = EXTENSION_MAX_COMMANDS.get(extension, added)
+            print(f"Loaded extension:  {extension} ({added}/{max_for_ext} commands loaded)")
+
+        registered_commands = len(self.tree.get_commands(guild=guild_obj))
+        print(
+            f"All {loaded_extensions}/{total_extensions} extensions loaded, "
+            f"{registered_commands}/{TOTAL_DEFINED_COMMANDS} commands registered."
+        )
 
     async def on_ready(self):
         print(f"Logged in as {self.user} ({self.user.id})")
