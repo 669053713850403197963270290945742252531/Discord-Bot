@@ -7,6 +7,7 @@ Run from the repo root with `python src/start.py` (after `pip install -r
 requirements.txt` and filling in `.env`).
 """
 
+import asyncio
 import sys
 import os
 import re
@@ -45,7 +46,7 @@ from discord import app_commands
 from discord.app_commands import errors as app_errors
 
 from api import config
-from api.github import GitHubAPIError, refresh_users_cache, register_refresh_task
+from api.github import GitHubAPIError, refresh_users_cache, register_refresh_task, register_bot_loop
 from api.discord_helpers import send_error, notify_permission_error
 from commands.panel import ControlPanelView
 
@@ -91,6 +92,15 @@ TOTAL_DEFINED_COMMANDS = sum(EXTENSION_MAX_COMMANDS.values())  # 70
 
 class Client(commands.Bot):
     async def setup_hook(self):
+        # First thing, before anything else here: hand api.github the now-
+        # running event loop so keep_alive.py's /github-webhook route (which
+        # runs in its own Flask thread, outside this loop) can schedule
+        # refresh_users_cache() calls onto it via
+        # trigger_cache_refresh_threadsafe(). Doing this before extensions
+        # load keeps the startup window where an early webhook would find no
+        # loop registered as small as possible.
+        register_bot_loop(asyncio.get_running_loop())
+
         guild_obj = discord.Object(id=config.GUILD_ID)
         total_extensions = len(EXTENSIONS)
         loaded_extensions = 0
@@ -152,13 +162,20 @@ bot = Client(command_prefix="!", intents=intents)
 #
 # commit_content() (used by every write path, including commit_users() for
 # redeem/edituser/reset hwid/etc.) already updates the cache immediately on
-# every write the bot makes itself, so this loop only has to catch external
-# changes -- e.g. someone editing Users.json by hand on GitHub, or a
-# /rollback -- within USERS_CACHE_REFRESH_INTERVAL seconds. It refreshes via
-# the Contents API rather than the raw.githubusercontent.com CDN precisely
-# so that "within USERS_CACHE_REFRESH_INTERVAL seconds" is actually true --
-# the CDN endpoint can lag well past that on its own.
-USERS_CACHE_REFRESH_INTERVAL = 60  # seconds
+# every write the bot makes itself. External changes -- someone editing
+# Users.json by hand on GitHub, or a /rollback -- are now caught the moment
+# they happen by keep_alive.py's /github-webhook route (see
+# trigger_cache_refresh_threadsafe() in api/github.py), so this loop is no
+# longer the primary way the cache learns about those. It's kept as a slow
+# fallback safety net for whatever the webhook can't be relied on for --
+# GitHub webhook delivery failures, this host being unreachable/restarting
+# when the push happened, the webhook not being configured at all, etc. --
+# so a missed webhook self-heals within a bounded time instead of leaving
+# the cache stale indefinitely. Because it's a safety net rather than the
+# main path, the interval is long (minutes, not seconds) -- there's no
+# lag/cost tradeoff to tune here the way there was before the webhook
+# existed.
+USERS_CACHE_REFRESH_INTERVAL = 15 * 60  # seconds -- fallback only; see above
 
 
 @tasks.loop(seconds=USERS_CACHE_REFRESH_INTERVAL)

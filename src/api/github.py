@@ -5,6 +5,7 @@ commit" dance -- this module centralizes all of that so command files only
 have to describe *what* changes, not *how* to talk to GitHub.
 """
 
+import asyncio
 import base64
 import json
 import re
@@ -217,6 +218,54 @@ def next_cache_refresh() -> Optional[datetime]:
     if _refresh_task is None:
         return None
     return _refresh_task.next_iteration
+
+
+# --- Webhook-triggered refresh ---
+#
+# keep_alive.py's /github-webhook route runs inside Flask's own thread (via
+# app.run() in a Thread -- see keep_alive()), completely outside the bot's
+# asyncio event loop. It can't just `await refresh_users_cache()` directly
+# -- there's no running loop on that thread to await it on. Instead, once
+# the bot's real event loop exists (registered below via register_bot_loop,
+# called from Client.setup_hook in start.py), the webhook thread hands the
+# refresh off to it with asyncio.run_coroutine_threadsafe, which is the
+# supported way to schedule a coroutine onto a loop from another thread.
+_bot_loop: Optional[asyncio.AbstractEventLoop] = None
+
+
+def register_bot_loop(loop: asyncio.AbstractEventLoop) -> None:
+    """Called once from start.py (Client.setup_hook) with the bot's running
+    event loop, so trigger_cache_refresh_threadsafe() below has somewhere
+    to schedule onto."""
+    global _bot_loop
+    _bot_loop = loop
+
+
+async def _webhook_triggered_refresh() -> None:
+    """The coroutine actually scheduled by trigger_cache_refresh_threadsafe.
+    Mirrors refresh_users_cache_task's own error handling in start.py -- a
+    failed refresh just leaves the existing cache in place; the next push
+    (or the periodic fallback poll) will catch it."""
+    try:
+        await refresh_users_cache()
+        print("Users.json cache refreshed via GitHub webhook.")
+    except GitHubAPIError as e:
+        print(f"Failed to refresh Users.json cache from webhook: {e}")
+
+
+def trigger_cache_refresh_threadsafe() -> bool:
+    """Schedules a cache refresh onto the bot's event loop from any other
+    thread -- meant to be called from keep_alive.py's webhook route once
+    it's confirmed Users.json actually changed. Returns True once
+    scheduling succeeds (the refresh itself still happens asynchronously,
+    not before this returns), or False if the bot's loop hasn't been
+    registered yet (e.g. a webhook arrives in the brief window before
+    setup_hook runs) -- callers should treat False as "the periodic
+    fallback poll will pick this up instead", not as an error."""
+    if _bot_loop is None:
+        return False
+    asyncio.run_coroutine_threadsafe(_webhook_triggered_refresh(), _bot_loop)
+    return True
 
 
 # =========================================================================

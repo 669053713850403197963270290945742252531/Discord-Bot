@@ -10,7 +10,7 @@ from api import config
 from api.discord_helpers import has_role, is_in_guild, send_error, build_embed
 from api.github import (
     GitHubAPIError, fetch_users_with_sha,
-    get_cached_users, cached_users_updated_at, next_cache_refresh,
+    get_cached_users, cached_users_updated_at,
 )
 from api.time_utils import format_discord_timestamp
 from api.users import find_user_by_discord_id
@@ -78,17 +78,11 @@ class Info(commands.Cog):
 
         if live_users == cached_users:
             return {"status": "✅ Synced -- matches the live Users.json file.", "color": discord.Color.green()}
-        return {"status": "⚠️ Out of sync with Users.json (will self-correct at the next update below).", "color": discord.Color.orange()}
+        return {"status": "⚠️ Out of sync with Users.json (will self-correct once the cache next refreshes).", "color": discord.Color.orange()}
 
     def _build_status_embed(self, sync_state: dict, *, live: bool = True) -> discord.Embed:
         updated_at = cached_users_updated_at()
         last_updated = f"<t:{int(updated_at.timestamp())}:R>" if updated_at else "Never"
-
-        next_refresh = next_cache_refresh()
-        next_update = (
-            f"<t:{int(next_refresh.timestamp())}:R>" if next_refresh
-            else "Not scheduled (background task not running yet)"
-        )
 
         footer = (
             "Live status -- updates automatically for ~14 minutes" if live
@@ -105,7 +99,6 @@ class Info(commands.Cog):
                 ("🌐 Guilds", str(len(self.bot.guilds)), True),
                 ("📦 User Cache", sync_state["status"], False),
                 ("🕒 Cache Last Updated", last_updated, True),
-                ("⏭️ Next Cache Update", next_update, True),
                 ("🧩 Commands Registered", str(len(self.bot.tree.get_commands(guild=GUILD))), True),
                 ("📚 discord.py", discord.__version__, True),
                 ("🐍 Python", platform.python_version(), True),
@@ -115,15 +108,14 @@ class Info(commands.Cog):
     async def _botstatus_tracker(self, message: discord.WebhookMessage, sync_state: dict):
         """Keeps /botstatus's own response current.
 
-        Without this, Cache Last Updated / Next Cache Update are frozen at
-        whatever they were the instant the command ran: Discord renders
-        <t:...:R> relative to the *viewer's current time*, so a frozen
-        "in 45 seconds" naturally decays into "45 seconds ago" once that
-        instant passes -- even though the real next_cache_refresh() has long
-        since moved forward to a new future time. Re-editing the message
-        with fresh values on a timer is the only way to keep it honest, the
-        same way keys_hwid.py's temp-whitelist tracker keeps its "Time Left"
-        field honest.
+        Without this, Cache Last Updated is frozen at whatever it was the
+        instant the command ran: Discord renders <t:...:R> relative to the
+        *viewer's current time*, so a frozen "45 seconds ago" only gets
+        further out of date as real time passes, and never picks up a
+        refresh that lands after the command was run. Re-editing the
+        message with fresh values on a timer is the only way to keep it
+        honest, the same way keys_hwid.py's temp-whitelist tracker keeps its
+        "Time Left" field honest.
 
         Also watches cached_users_updated_at() for changes: when it moves,
         a background refresh just landed, so this flips a stale "Out of
