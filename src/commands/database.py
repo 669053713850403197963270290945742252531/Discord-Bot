@@ -1,6 +1,5 @@
 import base64
 import csv
-import difflib
 import io
 import json
 from datetime import datetime, timezone
@@ -11,7 +10,10 @@ from discord.ext import commands
 from discord.ui import LayoutView, Container, TextDisplay, ActionRow, Button
 
 from api import config
-from api.discord_helpers import has_role, is_in_guild, send_success, send_error, file_success_layout, status_layout
+from api.discord_helpers import (
+    has_role, is_in_guild, send_error, file_success_layout, status_layout,
+    build_unified_diff, send_diff_result,
+)
 from api.github import (
     GitHubAPIError, fetch_raw_text, fetch_api_text_and_sha, fetch_api_file,
     commit_content, fetch_users_with_sha, list_commits, get_commit,
@@ -124,34 +126,20 @@ class Database(commands.Cog):
 
         # Diff what's being replaced against what was just restored, so
         # staff can see exactly what the rollback changed.
-        diff_lines = list(difflib.unified_diff(
-            current_content.splitlines(),
-            restored_content.splitlines(),
+        diff_lines = build_unified_diff(
+            current_content,
+            restored_content,
             fromfile="Users.json (before rollback)",
             tofile=f"Users.json (rolled back to {sha[:7]})",
-            lineterm="",
-        ))
+        )
 
-        description = f"Successfully rolled back the database to commit `{sha}`."
-        diff_file = None
-        diff_filename = None
-
-        if not diff_lines:
-            description += "\n\nNo changes -- content is identical to the current version."
-        else:
-            diff_text = "\n".join(diff_lines)
-            if len(diff_text) <= 1800:
-                description += f"\n\n```diff\n{diff_text}\n```"
-            else:
-                diff_filename = f"rollback_{sha[:7]}.diff"
-                description += f"\n\nDiff too large to display inline ({len(diff_lines)} lines) — see attached file below."
-                diff_file = discord.File(io.BytesIO(diff_text.encode()), filename=diff_filename)
-
-        if diff_file:
-            layout = file_success_layout(description, diff_filename)
-            await interaction.followup.send(view=layout, file=diff_file, ephemeral=True)
-        else:
-            await send_success(interaction, description)
+        await send_diff_result(
+            interaction,
+            diff_lines,
+            description=f"Successfully rolled back the database to commit `{sha}`.",
+            no_changes_message="No changes -- content is identical to the current version.",
+            filename=f"rollback_{sha[:7]}.diff",
+        )
 
     @app_commands.command(name="commithistory", description="View the recent commit history.")
     @app_commands.guilds(GUILD)

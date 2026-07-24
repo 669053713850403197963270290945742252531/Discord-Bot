@@ -42,23 +42,6 @@ async def _get_session(session: Optional[aiohttp.ClientSession]):
 # Users.json
 # =========================================================================
 
-async def fetch_raw_users(session: Optional[aiohttp.ClientSession] = None) -> List[Dict[str, Any]]:
-    """
-    Reads Users.json straight off the raw.githubusercontent.com CDN.
-    Fast and simple, but has no `sha` -- only use this for read-only commands.
-    """
-    sess, should_close = await _get_session(session)
-    try:
-        async with sess.get(config.RAW_URL, headers=config.HEADERS) as resp:
-            if resp.status != 200:
-                raise GitHubAPIError(f"Failed to fetch raw Users.json (HTTP {resp.status})", resp.status)
-            text = await resp.text()
-            return json.loads(text)
-    finally:
-        if should_close:
-            await sess.close()
-
-
 async def fetch_raw_text(url: str, session: Optional[aiohttp.ClientSession] = None) -> str:
     """Generic raw-text GET -- used for pulling file contents at an arbitrary commit SHA."""
     sess, should_close = await _get_session(session)
@@ -181,12 +164,10 @@ def get_cached_users() -> Optional[List[Dict[str, Any]]]:
     return _users_cache
 
 
-def cached_users_age() -> Optional[timedelta]:
-    """How long ago the cache was last successfully refreshed, or None if
-    it's never been populated."""
-    if _users_cache_updated_at is None:
-        return None
-    return datetime.now(timezone.utc) - _users_cache_updated_at
+def cached_users_updated_at() -> Optional[datetime]:
+    """The exact UTC timestamp of the last successful cache refresh, or None
+    if it's never been populated."""
+    return _users_cache_updated_at
 
 
 def set_users_cache(users: List[Dict[str, Any]]) -> None:
@@ -200,13 +181,7 @@ def set_users_cache(users: List[Dict[str, Any]]) -> None:
 
 async def refresh_users_cache(session: Optional[aiohttp.ClientSession] = None) -> List[Dict[str, Any]]:
     """Fetches the current Users.json via the Contents API and stores it as
-    the cache. Deliberately uses fetch_users_with_sha() here instead of the
-    faster fetch_raw_users() -- the raw.githubusercontent.com CDN endpoint
-    can lag behind the actual repo content for a while after a commit (this
-    is exactly the drift /verifydata exists to catch), and this cache backs
-    the control panel's whitelist/cooldown pre-checks, so it needs to be
-    right, not just fast -- this runs on a periodic background loop, not an
-    interaction's critical path.
+    the cache.
 
     Raises GitHubAPIError on failure -- the cache is left untouched
     (stale-but-known beats throwing it away), so callers should catch and
@@ -214,6 +189,34 @@ async def refresh_users_cache(session: Optional[aiohttp.ClientSession] = None) -
     users, _sha = await fetch_users_with_sha(session)
     set_users_cache(users)
     return users
+
+
+# The actual `@tasks.loop` object lives in start.py (it needs the `bot`
+# instance to guard start()/before_loop against on_ready firing twice). That
+# module can't be imported from here, or from any command module, without
+# also re-running its top-level side effects (keep_alive(), constructing a
+# second Client, etc.) -- it's the entry point, not a library. So start.py
+# hands us a reference once the loop object exists, and anything that wants
+# to report "when does the cache refresh next" (e.g. /botstatus) reads it
+# back through here instead.
+_refresh_task = None
+
+
+def register_refresh_task(task) -> None:
+    """Called once from start.py with the refresh_users_cache_task loop
+    object, so next_cache_refresh() below has something to read."""
+    global _refresh_task
+    _refresh_task = task
+
+
+def next_cache_refresh() -> Optional[datetime]:
+    """When the background task is next scheduled to refresh the cache, or
+    None if the task hasn't been registered yet (shouldn't happen once the
+    bot is running) or isn't currently running (e.g. before the bot's first
+    on_ready)."""
+    if _refresh_task is None:
+        return None
+    return _refresh_task.next_iteration
 
 
 # =========================================================================
@@ -251,23 +254,10 @@ async def get_commit(sha: str, session: Optional[aiohttp.ClientSession] = None) 
 # Permitted keys (permittedKeys.txt)
 # =========================================================================
 
-async def fetch_permitted_keys(session: Optional[aiohttp.ClientSession] = None) -> List[str]:
-    """
-    Fetches permittedKeys.txt and returns the permitted keys, one per line
-    (blank lines ignored). Read straight off the raw CDN like
-    fetch_raw_users(), since validating a redeemed key only ever needs to
-    check membership -- nothing here writes back to this file.
-    """
-    text = await fetch_raw_text(config.PERMITTED_KEYS_RAW_URL, session)
-    return [line.strip() for line in text.splitlines() if line.strip()]
-
-
 async def fetch_permitted_keys_with_sha(session: Optional[aiohttp.ClientSession] = None) -> Tuple[List[str], str]:
     """
     Fetches permittedKeys.txt + its sha via the Contents API, parsed into a
-    list of keys. Unlike fetch_permitted_keys(), use this whenever a
-    redeemed key is about to be removed from the file, since writing it back
-    (commit_permitted_keys) needs the current sha.
+    list of keys.
     """
     sess, should_close = await _get_session(session)
     try:
@@ -336,21 +326,14 @@ def remove_first_n_permitted_keys(permitted_keys: List[str], n: int) -> Tuple[Li
     return permitted_keys[n:], permitted_keys[:n]
 
 
-def is_key_permitted(key: str, permitted_keys: List[str]) -> bool:
-    """Exact (case-sensitive) membership check against fetch_permitted_keys()'s result."""
-    return key in permitted_keys
-
-
 # =========================================================================
 # Stored script (storedscript.lua)
 # =========================================================================
 
 async def fetch_stored_script(session: Optional[aiohttp.ClientSession] = None) -> str:
     """
-    Fetches storedscript.lua via the Contents API rather than the raw CDN --
-    same reasoning as fetch_users_with_sha() vs. fetch_raw_users(): the raw
-    endpoint can serve a stale copy for a while after an edit, and "Get
-    Script" should always hand out whatever the current script actually is.
+    Fetches storedscript.lua via the Contents API: "Get Script"
+    should always hand out whatever the current script actually is.
     """
     sess, should_close = await _get_session(session)
     try:

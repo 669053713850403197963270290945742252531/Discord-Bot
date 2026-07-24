@@ -12,6 +12,8 @@ stays a manageable size:
     time_utils.py       date formatting/parsing + temp-whitelist expiration
     hashing.py         /hash algorithm utilities
     transforms.py       /transform's stylized-Unicode text styles
+    encoding.py         /encode and /decode's algorithms + Identify heuristic
+    ciphers.py          /cipher and /decipher's classical cipher algorithms
     discord_helpers.py embeds, interaction responders, permission checks
 
 Everything below is re-exported here too, so cogs can do either
@@ -32,13 +34,14 @@ from .config import (
 
 from .github import (
     GitHubAPIError,
-    fetch_raw_users, fetch_raw_text, fetch_api_file, get_current_sha,
+    fetch_raw_text, fetch_api_file, get_current_sha,
     fetch_users_with_sha, fetch_api_text_and_sha, commit_content, commit_users,
-    get_cached_users, cached_users_age, set_users_cache, refresh_users_cache,
+    get_cached_users, cached_users_updated_at,
+    set_users_cache, refresh_users_cache,
+    register_refresh_task, next_cache_refresh,
     list_commits, get_commit,
-    fetch_permitted_keys, fetch_permitted_keys_with_sha, commit_permitted_keys,
+    fetch_permitted_keys_with_sha, commit_permitted_keys,
     remove_permitted_key, remove_permitted_keys, remove_first_n_permitted_keys,
-    is_key_permitted,
     fetch_stored_script, fetch_stored_script_with_sha, commit_stored_script,
     inject_script_key, validate_stored_script,
 )
@@ -63,6 +66,10 @@ from .time_utils import (
 from .hashing import get_available_hash_algorithms, hash_text, SHAKE_OUTPUT_BYTES
 
 from .transforms import TRANSFORM_FORMAT_CHOICES, transform_text
+
+from .encoding import ENCODING_ALGORITHMS, ENCODING_CHOICES, IDENTIFY_CHOICE_VALUE, encode_text, decode_text, identify_encoding
+
+from .ciphers import CIPHER_ALGORITHMS, CIPHER_CHOICES, cipher_text, decipher_text
 
 from .discord_helpers import (
     build_embed, success_embed, error_embed,

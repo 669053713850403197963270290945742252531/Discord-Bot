@@ -1,7 +1,7 @@
 """
 Entry point. Everything else in this package is a library (api/) or an
 extension (commands/); this is the only file that actually constructs the
-Client, wires the 10 extensions into it, and calls bot.run().
+Client, wires the 11 extensions into it, and calls bot.run().
 
 Run from the repo root with `python src/start.py` (after `pip install -r
 requirements.txt` and filling in `.env`).
@@ -45,7 +45,7 @@ from discord import app_commands
 from discord.app_commands import errors as app_errors
 
 from api import config
-from api.github import GitHubAPIError, refresh_users_cache
+from api.github import GitHubAPIError, refresh_users_cache, register_refresh_task
 from api.discord_helpers import send_error, notify_permission_error
 from commands.panel import ControlPanelView
 
@@ -59,6 +59,8 @@ intents.members = True
 EXTENSIONS = (
     "commands.info",
     "commands.utility",
+    "commands.genpass",
+    "commands.ciphers",
     "commands.moderation",
     "commands.whitelist",
     "commands.keys_hwid",
@@ -72,17 +74,19 @@ EXTENSIONS = (
 
 EXTENSION_MAX_COMMANDS = {
     "commands.info": 2,
-    "commands.utility": 2,
+    "commands.utility": 6,
+    "commands.genpass": 1,
+    "commands.ciphers": 2,
     "commands.moderation": 9,
     "commands.whitelist": 12,
-    "commands.keys_hwid": 8,
+    "commands.keys_hwid": 9,
     "commands.database": 7,
     "commands.panel": 2,
     "commands.access": 4,
     "commands.reaction_roles": 1,
     "commands.context_menus": 15,
 }
-TOTAL_DEFINED_COMMANDS = sum(EXTENSION_MAX_COMMANDS.values())  # 62
+TOTAL_DEFINED_COMMANDS = sum(EXTENSION_MAX_COMMANDS.values())  # 70
 
 
 class Client(commands.Bot):
@@ -144,8 +148,7 @@ bot = Client(command_prefix="!", intents=intents)
 # Keeps api.github's in-memory Users.json cache warm so read-only whitelist/
 # cooldown pre-checks (e.g. the control panel's Reset HWID button) never
 # have to make a live network call on the interaction's critical path -- so
-# they can't time out or silently fail open the way the old fetch_raw_users()
-# -with-a-2s-timeout check did.
+# they can't time out or silently fail.
 #
 # commit_content() (used by every write path, including commit_users() for
 # redeem/edituser/reset hwid/etc.) already updates the cache immediately on
@@ -171,6 +174,14 @@ async def refresh_users_cache_task():
 @refresh_users_cache_task.before_loop
 async def before_refresh_users_cache_task():
     await bot.wait_until_ready()
+
+
+# Hand api.github a reference to the loop object itself (not a copy of its
+# schedule) so next_cache_refresh() always reflects its live state --
+# registering here, right after the loop is defined, is enough even though
+# .start() doesn't happen until on_ready, since next_iteration is read
+# lazily each time next_cache_refresh() is called.
+register_refresh_task(refresh_users_cache_task)
 
 
 # --- Error Handlers ---

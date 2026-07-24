@@ -6,6 +6,8 @@ layouts reused by multiple commands (a "here's a file" success layout and a
 plain no-button status layout).
 """
 
+import difflib
+import io
 from datetime import datetime, timezone
 from typing import Any, List, Optional, Tuple
 
@@ -303,3 +305,55 @@ def status_layout(title: str, description: str, color: discord.Color) -> LayoutV
         accent_color=color,
     ))
     return layout
+
+
+# =========================================================================
+# Diff rendering (shared by /rollback and /diff)
+# =========================================================================
+
+def build_unified_diff(before_text: str, after_text: str, *, fromfile: str, tofile: str) -> List[str]:
+    """Thin wrapper around difflib.unified_diff with the line-splitting/
+    lineterm convention used everywhere in this codebase, so every command
+    that diffs two blobs of text produces diffs the exact same way."""
+    return list(difflib.unified_diff(
+        before_text.splitlines(),
+        after_text.splitlines(),
+        fromfile=fromfile,
+        tofile=tofile,
+        lineterm="",
+    ))
+
+
+async def send_diff_result(
+    interaction: discord.Interaction,
+    diff_lines: List[str],
+    *,
+    description: str,
+    no_changes_message: str = "No changes -- the two are identical.",
+    filename: str = "diff.diff",
+    inline_char_limit: int = 1800,
+    ephemeral: bool = True,
+):
+    """
+    Renders a unified diff the same way /rollback originally did: inline in
+    a ```diff``` block when it's small enough to fit, or as an attached
+    .diff file when it isn't. Shared by /rollback and /diff so both stay in
+    sync if this rendering ever changes.
+    """
+    if not diff_lines:
+        await send_success(interaction, f"{description}\n\n{no_changes_message}", ephemeral=ephemeral)
+        return
+
+    diff_text = "\n".join(diff_lines)
+
+    if len(diff_text) <= inline_char_limit:
+        await send_success(interaction, f"{description}\n\n```diff\n{diff_text}\n```", ephemeral=ephemeral)
+        return
+
+    full_description = (
+        f"{description}\n\nDiff too large to display inline ({len(diff_lines)} lines) "
+        "-- see attached file below."
+    )
+    diff_file = discord.File(io.BytesIO(diff_text.encode()), filename=filename)
+    layout = file_success_layout(full_description, filename)
+    await interaction.followup.send(view=layout, file=diff_file, ephemeral=ephemeral)
