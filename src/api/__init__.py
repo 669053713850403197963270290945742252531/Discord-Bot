@@ -39,6 +39,7 @@ from .github import (
     get_cached_users, cached_users_updated_at,
     set_users_cache, refresh_users_cache,
     register_refresh_task, next_cache_refresh,
+    register_bot_loop, trigger_cache_refresh_threadsafe,
     list_commits, get_commit,
     fetch_permitted_keys_with_sha, commit_permitted_keys,
     remove_permitted_key, remove_permitted_keys, remove_first_n_permitted_keys,

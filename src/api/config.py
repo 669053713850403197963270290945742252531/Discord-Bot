@@ -82,3 +82,12 @@ HEADERS = {
     "Authorization": f"Bearer {GITHUB_TOKEN}",
     "Accept": "application/vnd.github+json",
 }
+
+# Shared secret for keep_alive.py's /github-webhook route -- must match the
+# "Secret" configured on the GitHub push webhook (repo Settings > Webhooks)
+# so incoming requests can be verified as actually coming from GitHub (via
+# the X-Hub-Signature-256 header) rather than anyone who finds the URL.
+# Optional: if unset, the webhook route refuses all requests (fails closed)
+# rather than accepting unverifiable ones, and the bot falls back to the
+# periodic poll in start.py alone.
+GITHUB_WEBHOOK_SECRET = os.getenv("GITHUB_WEBHOOK_SECRET")
