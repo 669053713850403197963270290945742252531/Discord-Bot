@@ -91,3 +91,15 @@ HEADERS = {
 # rather than accepting unverifiable ones, and the bot falls back to the
 # periodic poll in start.py alone.
 GITHUB_WEBHOOK_SECRET = os.getenv("GITHUB_WEBHOOK_SECRET")
+
+# Used by api/webhook_sync.py to figure out where this process is currently
+# reachable, so it can keep the GitHub webhook's Payload URL pointed at the
+# right place without manual editing on every restart. See that module for
+# the full explanation of when each of these is actually used.
+#
+# Render sets RENDER_EXTERNAL_URL itself at runtime for every web service,
+# so this is only a fallback for the (essentially never) case that's unset.
+RENDER_FALLBACK_URL = os.getenv("RENDER_FALLBACK_URL", "https://discord-bot-lee1.onrender.com")
+# The local ngrok agent's own API -- exists automatically whenever `ngrok
+# http ...` is running, no auth needed since it's localhost-only.
+NGROK_API_URL = os.getenv("NGROK_API_URL", "http://127.0.0.1:4040/api/tunnels")
