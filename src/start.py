@@ -47,6 +47,7 @@ from discord.app_commands import errors as app_errors
 
 from api import config
 from api.github import GitHubAPIError, refresh_users_cache, register_refresh_task, register_bot_loop
+from api.webhook_sync import sync_webhook_url
 from api.discord_helpers import send_error, notify_permission_error
 from commands.panel import ControlPanelView
 
@@ -100,6 +101,13 @@ class Client(commands.Bot):
         # load keeps the startup window where an early webhook would find no
         # loop registered as small as possible.
         register_bot_loop(asyncio.get_running_loop())
+
+        # Fire-and-forget: points the GitHub webhook's Payload URL at
+        # wherever this process is reachable right now (Render's own URL,
+        # or the local ngrok tunnel) -- see api/webhook_sync.py. Backgrounded
+        # rather than awaited so a slow/unreachable GitHub API or ngrok
+        # can't delay the rest of startup; it logs its own outcome.
+        asyncio.create_task(sync_webhook_url())
 
         guild_obj = discord.Object(id=config.GUILD_ID)
         total_extensions = len(EXTENSIONS)
