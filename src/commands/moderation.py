@@ -1,5 +1,6 @@
 import asyncio
 from datetime import datetime, timezone, timedelta
+from typing import Optional, Union
 
 import discord
 from discord import app_commands
@@ -195,6 +196,414 @@ async def _unmute_impl(interaction: discord.Interaction, target: discord.Member,
         await send_error(interaction, "Missing permissions to remove roles.")
 
 
+# =========================================================================
+# /slowmode, /togglelock, and /togglelockdown -- grouped here since they
+# all work by editing @everyone channel-permission overwrites (or
+# slowmode_delay).
+#
+# /slowmode, /togglelock, and /togglelockdown all behave correctly across
+# every non-thread, non-category channel type: text, voice, stage, and
+# forum. Threads and categories are excluded on purpose -- threads already
+# have Discord's own native lock/slowmode controls that don't go through
+# @everyone overwrites, and categories have no "post a message" concept of
+# their own to lock or throttle. Forum channels are fully disabled by also
+# denying `send_messages` -- which Discord's own permission UI labels
+# "Create Posts" for a forum channel, since there's no separate bit for it
+# -- on top of the thread-reply perms.
+#
+# /togglelockdown was moved here from access.py, since access.py is scoped
+# to Bot Access role commands rather than general moderation.
+#
+# The /togglelock here supersedes an older, text-channel-only /togglelock
+# that used to live in access.py.
+#
+# Both commands also accept an optional `duration` (minutes), which
+# schedules an automatic unlock/lockdown-lift after that time, and an
+# optional `message`, which gets posted as a public announcement embed
+# (title depends on the command, and on whether it just locked or unlocked).
+# =========================================================================
+
+# Forum/media channels resolve to ForumChannel, and announcement channels
+# resolve to TextChannel, in discord.py -- so this tuple already covers
+# every "postable" channel type without needing to list those separately.
+_SLOWMODE_LOCK_CHANNEL_TYPES = (discord.TextChannel, discord.VoiceChannel, discord.StageChannel, discord.ForumChannel)
+
+# Type alias for the channel option on both commands -- restricts Discord's
+# channel picker to exactly the types above (categories/threads won't show
+# up as options at all, rather than being selectable and then rejected).
+_LockableChannel = Union[discord.TextChannel, discord.VoiceChannel, discord.StageChannel, discord.ForumChannel]
+
+# Discord's own hard ceiling on slowmode_delay (6 hours), enforced here too
+# so a bad value gets caught before it's sent off to the API.
+_MAX_SLOWMODE_SECONDS = 21600
+
+
+def _unsupported_channel_message(channel) -> str:
+    """Friendlier-than-generic explanation for why a given channel can't be
+    targeted, used by both /slowmode and /lock."""
+    if isinstance(channel, discord.Thread):
+        return f"{channel.mention} is a thread -- use Discord's built-in thread Slowmode/Lock controls instead."
+    if isinstance(channel, discord.CategoryChannel):
+        return f"{channel.mention} is a category -- lock or set slowmode on its channels individually instead."
+    mention = getattr(channel, "mention", "That channel")
+    return f"{mention} doesn't support this command."
+
+
+def _format_slowmode(seconds: int) -> str:
+    """Renders a slowmode_delay value the way Discord's own UI would --
+    e.g. 90 -> '1 minute, 30 seconds', 0 -> 'Off'."""
+    if seconds <= 0:
+        return "Off"
+
+    remaining = seconds
+    parts = []
+    for name, unit_seconds in (("hour", 3600), ("minute", 60), ("second", 1)):
+        value, remaining = divmod(remaining, unit_seconds)
+        if value:
+            parts.append(f"{value} {name}{'s' if value != 1 else ''}")
+    return ", ".join(parts)
+
+
+async def _slowmode_impl(interaction: discord.Interaction, seconds: int, channel: Optional[_LockableChannel] = None):
+    target = channel or interaction.channel
+
+    if not isinstance(target, _SLOWMODE_LOCK_CHANNEL_TYPES):
+        await send_error(interaction, _unsupported_channel_message(target))
+        return
+
+    if not 0 <= seconds <= _MAX_SLOWMODE_SECONDS:
+        await send_error(interaction, f"Slowmode must be between 0 and {_MAX_SLOWMODE_SECONDS} seconds (6 hours).")
+        return
+
+    try:
+        await target.edit(slowmode_delay=seconds, reason=f"Slowmode set by {interaction.user}")
+        await send_success(
+            interaction,
+            f"Slowmode for {target.mention} set to **{_format_slowmode(seconds)}**.",
+        )
+    except discord.Forbidden:
+        await send_error(interaction, f"Missing permissions to edit {target.mention}.")
+    except discord.HTTPException as e:
+        await send_error(interaction, f"Failed to set slowmode: {e}")
+
+
+def _lock_perms(channel) -> tuple:
+    """Which @everyone overwrite permissions get denied to lock a given
+    channel type. Voice/stage lock on `connect` (same as /togglelockdown);
+    forums lock on `send_messages` (the "Create Posts" toggle in a forum
+    channel's permission UI) plus the thread-reply perms, so a locked forum
+    can neither start new posts nor reply in existing ones."""
+    if isinstance(channel, (discord.VoiceChannel, discord.StageChannel)):
+        return ("connect", "send_messages")
+    if isinstance(channel, discord.ForumChannel):
+        return ("send_messages", "create_public_threads", "create_private_threads", "send_messages_in_threads")
+    return ("send_messages",)
+
+
+_LOCK_ANNOUNCEMENT_TITLES = {
+    ("togglelock", "locked"): "Channel Locked",
+    ("togglelock", "unlocked"): "Channel Unlocked",
+    ("togglelockdown", "locked"): "Server Locked Down",
+    ("togglelockdown", "unlocked"): "Server Unlocked",
+}
+
+
+def _lock_announcement_embed(title: str, message: str, *, duration: Optional[int] = None) -> discord.Embed:
+    """Public-facing embed for a lock/unlock/lockdown announcement. `duration`
+    only makes sense to show alongside a "locked" title -- callers pass None
+    for unlock announcements."""
+    color = discord.Color.green() if "Unlock" in title else discord.Color.orange()
+    embed = discord.Embed(title=title, description=message, color=color, timestamp=datetime.now(timezone.utc))
+
+    if duration:
+        minute_label = "minute" if duration == 1 else "minutes"
+        unlock_time = datetime.now(timezone.utc) + timedelta(minutes=duration)
+        timestamp = int(unlock_time.timestamp())
+        embed.add_field(name="Duration", value=f"{duration} {minute_label}", inline=True)
+        embed.add_field(name="Unlocks", value=f"<t:{timestamp}:F>\n<t:{timestamp}:T> (<t:{timestamp}:R>)", inline=True)
+
+    return embed
+
+
+async def _send_lock_announcement(channel, *, title: str, message: str, duration: Optional[int] = None):
+    """Posts a public (non-ephemeral) announcement embed to `channel` --
+    used by /togglelock and /togglelockdown, both on manual toggle and on
+    automatic duration expiry. Best-effort: the actual permission change has
+    already happened by the time this is called, so failures here are
+    logged rather than surfaced as a command error.
+
+    ForumChannel has no top-level message to send an embed into -- unlike
+    every other channel type this module deals with, it has no `send()` at
+    all. The closest equivalent there is a new post (thread), so the
+    announcement becomes that post's starter message instead. That post is
+    then locked so it stays a read-only announcement: per Discord's own
+    thread model, `locked` alone only controls who can *unarchive* a
+    thread -- what actually stops members from posting in it is `archived`,
+    so both need to be set together, not just `locked`."""
+    if channel is None:
+        return
+    embed = _lock_announcement_embed(title, message, duration=duration)
+    try:
+        if isinstance(channel, discord.ForumChannel):
+            thread_with_message = await channel.create_thread(name=title, embed=embed, reason="Lock/lockdown announcement")
+            try:
+                await thread_with_message.thread.edit(archived=True, locked=True, reason="Lock/lockdown announcement -- read-only")
+            except Exception as e:
+                print(f"Failed to lock lock-announcement post in {getattr(channel, 'name', channel)}: {e}")
+        else:
+            await channel.send(embed=embed)
+    except discord.Forbidden:
+        print(f"Missing permissions to send lock announcement in {getattr(channel, 'name', channel)}")
+    except Exception as e:
+        print(f"Failed to send lock announcement in {getattr(channel, 'name', channel)}: {e}")
+
+
+# Pending auto-unlock tasks scheduled by a `duration` on /togglelock, keyed
+# by channel id. Popped and cancelled the moment that channel's lock state
+# changes again for any reason, so a stale timer never fires after someone
+# has already manually toggled it back.
+_lock_duration_tasks: dict = {}
+
+
+async def _togglelock_impl(
+    interaction: discord.Interaction,
+    channel: Optional[_LockableChannel] = None,
+    duration: Optional[int] = None,
+    message: Optional[str] = None,
+):
+    target = channel or interaction.channel
+
+    if not isinstance(target, _SLOWMODE_LOCK_CHANNEL_TYPES):
+        await send_error(interaction, _unsupported_channel_message(target))
+        return
+
+    everyone_role = interaction.guild.default_role
+    overwrite = target.overwrites_for(everyone_role)
+    perm_names = _lock_perms(target)
+
+    # Locked means *any* of the relevant perms are explicitly denied -- not
+    # necessarily all of them, since a channel could've been locked before a
+    # permission was added to _lock_perms, or had one perm manually restored
+    # by staff in between.
+    is_locked = any(getattr(overwrite, perm) is False for perm in perm_names)
+
+    # Whatever timer was previously scheduled for this channel no longer
+    # applies once its lock state is about to change again.
+    pending_task = _lock_duration_tasks.pop(target.id, None)
+    if pending_task:
+        pending_task.cancel()
+
+    if is_locked:
+        # None clears the explicit deny rather than granting an explicit
+        # allow, so @everyone falls back to whatever it would otherwise have
+        # (role perms, category sync, etc.) -- same convention the old
+        # access.py /togglelock used.
+        for perm in perm_names:
+            setattr(overwrite, perm, None)
+        action = "unlocked"
+    else:
+        for perm in perm_names:
+            setattr(overwrite, perm, False)
+        action = "locked"
+
+    verb = "unlock" if is_locked else "lock"
+    try:
+        await target.set_permissions(everyone_role, overwrite=overwrite, reason=f"Channel {action} by {interaction.user}")
+    except discord.Forbidden:
+        await send_error(interaction, f"Missing permissions to {verb} {target.mention}.")
+        return
+    except discord.HTTPException as e:
+        await send_error(interaction, f"Failed to {verb} {target.mention}: {e}")
+        return
+
+    # Duration only means anything when this toggle just locked the channel;
+    # flag it rather than silently ignoring it if it was passed on an unlock.
+    ignored_duration = duration is not None and action == "unlocked"
+    confirmation_fields = [("Note", "Duration is ignored when unlocking.", False)] if ignored_duration else None
+    await send_success(interaction, f"{target.mention} has been {action}.", fields=confirmation_fields)
+
+    if message:
+        await _send_lock_announcement(
+            target,
+            title=_LOCK_ANNOUNCEMENT_TITLES[("togglelock", action)],
+            message=message,
+            duration=duration if action == "locked" else None,
+        )
+
+    if action == "locked" and duration:
+        async def _auto_unlock():
+            await asyncio.sleep(duration * 60)
+            _lock_duration_tasks.pop(target.id, None)
+            fresh_overwrite = target.overwrites_for(everyone_role)
+            for perm in perm_names:
+                setattr(fresh_overwrite, perm, None)
+            try:
+                await target.set_permissions(everyone_role, overwrite=fresh_overwrite, reason="Lock duration expired")
+                await _send_lock_announcement(
+                    target,
+                    title=_LOCK_ANNOUNCEMENT_TITLES[("togglelock", "unlocked")],
+                    message="Lock duration expired -- channel automatically unlocked.",
+                )
+            except Exception as e:
+                print(f"Failed to auto-unlock {target.name}: {e}")
+
+        _lock_duration_tasks[target.id] = interaction.client.loop.create_task(_auto_unlock())
+
+
+# Forum channels are now included here too (see the module-level note above
+# on Create Posts), so lockdown reaches every "postable" channel type --
+# same coverage as _SLOWMODE_LOCK_CHANNEL_TYPES / /togglelock.
+LOCKDOWN_CHANNEL_TYPES = (discord.TextChannel, discord.VoiceChannel, discord.StageChannel, discord.ForumChannel)
+
+# Snapshot of each channel's @everyone overwrite permissions from right
+# before /togglelockdown was last enabled. Non-empty while lockdown is
+# active; used to restore channels to their exact prior state (instead of
+# blanket unlocking) so channels that were already locked beforehand stay
+# locked.
+_lockdown_snapshots: dict = {}
+
+# Pending auto-lift task for /togglelockdown's `duration`, or None if no
+# lockdown timer is currently scheduled. Cancelled the moment lockdown state
+# changes again for any reason, same convention as _lock_duration_tasks.
+_lockdown_duration_task: Optional[asyncio.Task] = None
+
+
+def _lockdown_perms(channel: discord.abc.GuildChannel) -> tuple:
+    """Which @everyone overwrite permissions get locked/restored for a given
+    channel type. Identical to /togglelock's per-channel-type rules, so this
+    just delegates to _lock_perms rather than duplicating them."""
+    return _lock_perms(channel)
+
+
+async def _lockdown_apply(channels, everyone_role) -> int:
+    """Locks every channel in `channels`, snapshotting each one's prior
+    @everyone overwrite state first so it can be restored exactly later."""
+    count = 0
+    for channel in channels:
+        overwrite = channel.overwrites_for(everyone_role)
+        perm_names = _lockdown_perms(channel)
+
+        _lockdown_snapshots[channel.id] = {perm: getattr(overwrite, perm) for perm in perm_names}
+
+        changed = False
+        for perm_name in perm_names:
+            if getattr(overwrite, perm_name) is not False:
+                setattr(overwrite, perm_name, False)
+                changed = True
+
+        if changed:
+            try:
+                await channel.set_permissions(everyone_role, overwrite=overwrite, reason="Server lockdown enabled")
+                count += 1
+            except discord.Forbidden:
+                print(f"Missing permissions to lock {channel.name}")
+            except Exception as e:
+                print(f"Failed to lock {channel.name}: {e}")
+    return count
+
+
+async def _lockdown_restore(channels, everyone_role) -> int:
+    """Restores every channel in `channels` to its pre-lockdown @everyone
+    overwrite state (from _lockdown_snapshots), then clears the snapshots.
+    Used both when lockdown is manually toggled off and when its `duration`
+    expires on its own."""
+    count = 0
+    for channel in channels:
+        snapshot = _lockdown_snapshots.get(channel.id)
+        if snapshot is None:
+            continue  # channel didn't exist yet / wasn't touched during lockdown
+
+        overwrite = channel.overwrites_for(everyone_role)
+        changed = False
+        for perm_name, original_value in snapshot.items():
+            if getattr(overwrite, perm_name) != original_value:
+                setattr(overwrite, perm_name, original_value)
+                changed = True
+
+        if changed:
+            try:
+                await channel.set_permissions(everyone_role, overwrite=overwrite, reason="Server lockdown disabled")
+                count += 1
+            except discord.Forbidden:
+                print(f"Missing permissions to restore {channel.name}")
+            except Exception as e:
+                print(f"Failed to restore {channel.name}: {e}")
+
+    _lockdown_snapshots.clear()
+    return count
+
+
+async def _togglelockdown_impl(
+    interaction: discord.Interaction,
+    duration: Optional[int] = None,
+    message: Optional[str] = None,
+):
+    global _lockdown_duration_task
+
+    # Defer immediately -- looping + editing permissions on every
+    # channel in the server can easily take longer than the 3 second
+    # window Discord gives an interaction before it expires.
+    await interaction.response.defer(ephemeral=True)
+
+    guild = interaction.guild
+    everyone_role = guild.default_role
+
+    channels = [ch for ch in guild.channels if isinstance(ch, LOCKDOWN_CHANNEL_TYPES)]
+    if not channels:
+        return await send_error(interaction, "No text, voice, stage, or forum channels found.")
+
+    # Whatever timer was previously scheduled no longer applies once
+    # lockdown state is about to change again.
+    if _lockdown_duration_task:
+        _lockdown_duration_task.cancel()
+        _lockdown_duration_task = None
+
+    if _lockdown_snapshots:
+        # Lockdown is currently active -> disable it by restoring each
+        # channel to whatever state it actually had *before* lockdown was
+        # enabled, rather than blanket-unlocking everything. This keeps
+        # channels that were already manually locked beforehand locked.
+        count = await _lockdown_restore(channels, everyone_role)
+        action = "unlocked"
+    else:
+        # Not currently in lockdown -> enable it.
+        count = await _lockdown_apply(channels, everyone_role)
+        action = "locked"
+
+    # Duration only means anything when this toggle just enabled lockdown;
+    # flag it rather than silently ignoring it if it was passed on a lift.
+    ignored_duration = duration is not None and action == "unlocked"
+    confirmation_fields = [("Note", "Duration is ignored when unlocking.", False)] if ignored_duration else None
+    await send_success(interaction, f"{action.capitalize()} {count} channel(s).", fields=confirmation_fields)
+
+    # There's no single "the channel" a lockdown applies to, so the public
+    # announcement (if any) is posted wherever the command was run rather
+    # than fanned out across every affected channel.
+    announce_channel = interaction.channel
+    if message:
+        await _send_lock_announcement(
+            announce_channel,
+            title=_LOCK_ANNOUNCEMENT_TITLES[("togglelockdown", action)],
+            message=message,
+            duration=duration if action == "locked" else None,
+        )
+
+    if action == "locked" and duration:
+        async def _auto_unlockdown():
+            global _lockdown_duration_task
+            await asyncio.sleep(duration * 60)
+            _lockdown_duration_task = None
+            current_channels = [ch for ch in guild.channels if isinstance(ch, LOCKDOWN_CHANNEL_TYPES)]
+            await _lockdown_restore(current_channels, everyone_role)
+            await _send_lock_announcement(
+                announce_channel,
+                title=_LOCK_ANNOUNCEMENT_TITLES[("togglelockdown", "unlocked")],
+                message="Lockdown duration expired -- server automatically unlocked.",
+            )
+
+        _lockdown_duration_task = interaction.client.loop.create_task(_auto_unlockdown())
+
+
 class Moderation(commands.Cog):
     def __init__(self, bot: commands.Bot):
         self.bot = bot
@@ -256,25 +665,34 @@ class Moderation(commands.Cog):
 
     @app_commands.command(name="purge", description="Deletes the specified amount of messages in the current channel.")
     @app_commands.guilds(GUILD)
-    @app_commands.describe(amount="Number of messages to delete")
+    @app_commands.describe(amount="Number of messages to delete (1-100)")
     @has_role(config.REQUIRED_ROLE_ID)
     @is_in_guild(config.GUILD_ID)
-    async def purge(self, interaction: discord.Interaction, amount: int):
-        if amount < 1 or amount > 100:
-            await interaction.response.defer(ephemeral=True)
-            return
+    async def purge(self, interaction: discord.Interaction, amount: app_commands.Range[int, 1, 100]):
+        # Range[int, 1, 100] pushes the 1-100 bound onto Discord's own slash
+        # command validation, so an out-of-range value can't even be
+        # submitted -- no wasted round trip rejecting it server-side like
+        # the old manual `if amount < 1 or amount > 100` check used to.
+
+        # Defer before purge()'s internal fetch-then-bulk-delete round trip,
+        # since that occasionally runs past Discord's 3 second
+        # initial-response window on a full 100-message purge. thinking=True
+        # (the default) so there's visible feedback while it works, instead
+        # of the old thinking=False-then-silently-delete trick that made it
+        # look like the command hadn't done anything at all.
+        await interaction.response.defer(ephemeral=True)
 
         try:
-            await interaction.response.defer(thinking=False, ephemeral=True)
-            await interaction.channel.purge(limit=amount)
-
-            # Delete the deferred response so it looks like nothing happened
-            try:
-                await interaction.delete_original_response()
-            except discord.NotFound:
-                pass
+            deleted = await interaction.channel.purge(limit=amount, reason=f"Purged by {interaction.user}")
         except discord.Forbidden:
-            pass
+            await send_error(interaction, "Missing permissions to purge messages in this channel.")
+            return
+        except Exception as e:
+            await send_error(interaction, str(e))
+            return
+
+        count = len(deleted)
+        await send_success(interaction, f"Purged {count} {'message' if count == 1 else 'messages'}.")
 
     @app_commands.command(name="kick", description="Kicks a member from the server.")
     @app_commands.guilds(GUILD)
@@ -346,6 +764,56 @@ class Moderation(commands.Cog):
             return await send_error(interaction, f"Failed to ghost ping: {e}")
 
         await send_success(interaction, f"Ghost pinged {user.mention}.")
+
+    @app_commands.command(name="slowmode", description="Sets slowmode for a channel (text, voice, stage, or forum).")
+    @app_commands.guilds(GUILD)
+    @app_commands.describe(
+        seconds="Slowmode delay in seconds (0 disables it, max 21600 / 6 hours)",
+        channel="Channel to set slowmode for (defaults to the current channel)",
+    )
+    @has_role(config.REQUIRED_ROLE_ID)
+    @is_in_guild(config.GUILD_ID)
+    async def slowmode(
+        self,
+        interaction: discord.Interaction,
+        seconds: app_commands.Range[int, 0, 21600],
+        channel: Optional[_LockableChannel] = None,
+    ):
+        await _slowmode_impl(interaction, seconds, channel)
+
+    @app_commands.command(name="togglelock", description="Toggles the lock/unlock state of a channel (text, voice, stage, or forum).")
+    @app_commands.guilds(GUILD)
+    @app_commands.describe(
+        channel="Channel to toggle (defaults to the current channel)",
+        duration="Lock duration in minutes -- auto-unlocks after this time (only applies when locking)",
+        message="Public message to announce in the channel alongside the lock/unlock",
+    )
+    @has_role(config.REQUIRED_ROLE_ID)
+    @is_in_guild(config.GUILD_ID)
+    async def togglelock(
+        self,
+        interaction: discord.Interaction,
+        channel: Optional[_LockableChannel] = None,
+        duration: Optional[app_commands.Range[int, 1, 10080]] = None,
+        message: Optional[str] = None,
+    ):
+        await _togglelock_impl(interaction, channel, duration, message)
+
+    @app_commands.command(name="togglelockdown", description="Toggles the lock or unlock state on all text, voice, stage, and forum channels.")
+    @app_commands.guilds(GUILD)
+    @app_commands.describe(
+        duration="Lockdown duration in minutes -- auto-lifts after this time (only applies when locking down)",
+        message="Public message to announce in this channel alongside the lockdown/lift",
+    )
+    @has_role(config.REQUIRED_ROLE_ID)
+    @is_in_guild(config.GUILD_ID)
+    async def togglelockdown(
+        self,
+        interaction: discord.Interaction,
+        duration: Optional[app_commands.Range[int, 1, 10080]] = None,
+        message: Optional[str] = None,
+    ):
+        await _togglelockdown_impl(interaction, duration, message)
 
 
 async def setup(bot: commands.Bot):
