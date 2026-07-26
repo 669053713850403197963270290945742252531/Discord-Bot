@@ -269,6 +269,33 @@ def trigger_cache_refresh_threadsafe() -> bool:
 
 
 # =========================================================================
+# Rate limit status (shared by /ratelimits)
+# =========================================================================
+
+RATE_LIMIT_URL = "https://api.github.com/rate_limit"
+
+
+async def fetch_rate_limit(session: Optional[aiohttp.ClientSession] = None) -> Dict[str, Any]:
+    """
+    Fetches the full GitHub Rate Limit API response for the configured PAT
+    (config.GITHUB_TOKEN) -- every resource category this token has a quota
+    for (core, search, graphql, etc), each with its own limit/used/
+    remaining/reset. Hitting this endpoint is explicitly free per GitHub's
+    docs (it doesn't count against any of the limits it reports), so it's
+    always safe to call on demand from a live command.
+    """
+    sess, should_close = await _get_session(session)
+    try:
+        async with sess.get(RATE_LIMIT_URL, headers=config.HEADERS) as resp:
+            if resp.status != 200:
+                raise GitHubAPIError(f"Failed to fetch rate limit status (HTTP {resp.status})", resp.status)
+            return await resp.json()
+    finally:
+        if should_close:
+            await sess.close()
+
+
+# =========================================================================
 # Commit-history helpers (shared by /commithistory and /fetchcommit)
 # =========================================================================
 

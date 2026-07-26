@@ -41,6 +41,7 @@ from .github import (
     register_refresh_task, next_cache_refresh,
     register_bot_loop, trigger_cache_refresh_threadsafe,
     list_commits, get_commit,
+    fetch_rate_limit,
     fetch_permitted_keys_with_sha, commit_permitted_keys,
     remove_permitted_key, remove_permitted_keys, remove_first_n_permitted_keys,
     fetch_stored_script, fetch_stored_script_with_sha, commit_stored_script,

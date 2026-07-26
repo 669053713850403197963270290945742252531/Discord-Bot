@@ -6,7 +6,7 @@ password/passphrase and classic-cipher tools, string entropy analysis, and a
 persistent control panel. Originally a single ~4,100-line `main.py` +
 ~1,600-line `bot_api.py`, refactored into this package -- and extended since
 with newer commands (classic ciphers, `/entropy`, bulk `/genpass`, and more).
-70 commands total today (55 slash commands + 15 user context menus).
+71 commands total today (56 slash commands + 15 user context menus).
 
 ## Layout
 
@@ -34,7 +34,7 @@ Discord-Bot/
 │   │   └── discord_helpers.py   # embeds, interaction responders, permission checks, shared Components V2 layouts
 │   └── commands/                # one cog per file -- each is a discord.py extension
 │       ├── __init__.py          # empty -- just makes this a package
-│       ├── info.py              # /botstatus, /myinfo
+│       ├── info.py              # /botstatus, /myinfo, /ratelimits
 │       ├── utility.py           # /hash, /transform, /encode, /decode, /diff, /entropy
 │       ├── ciphers.py           # /cipher, /decipher -- classic cipher encode/decode
 │       ├── genpass.py           # /genpass -- password/passphrase generator, single or bulk (up to 10)

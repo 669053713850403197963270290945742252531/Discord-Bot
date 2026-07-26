@@ -75,16 +75,16 @@ EXTENSIONS = (
 
 
 EXTENSION_MAX_COMMANDS = {
-    "commands.info": 2,
+    "commands.info": 3,
     "commands.utility": 6,
     "commands.genpass": 1,
     "commands.ciphers": 2,
-    "commands.moderation": 9,
+    "commands.moderation": 12,
     "commands.whitelist": 12,
     "commands.keys_hwid": 9,
     "commands.database": 7,
     "commands.panel": 2,
-    "commands.access": 4,
+    "commands.access": 2,
     "commands.reaction_roles": 1,
     "commands.context_menus": 15,
 }
