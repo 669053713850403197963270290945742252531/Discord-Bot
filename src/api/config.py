@@ -41,9 +41,15 @@ REACTION_ROLE_CHANNEL_ID = _require_int("REACTION_ROLE_CHANNEL_ID")
 PANEL_CHANNEL_ID = _require_int("PANEL_CHANNEL_ID")
 # Role granted by the control panel's "Get Role" button to whitelisted users.
 BUYER_ROLE_ID = _require_int("BUYER_ROLE_ID")
-# Staff-only channel that receives "Key Redeemed" and "Potential Breach"
-# alerts from the control panel's Redeem Key / Reset HWID flows.
-REDEEM_ALERTS_CHANNEL_ID = _require_int("REDEEM_ALERTS_CHANNEL_ID")
+# Staff-only channel that receives an alert for every meaningful whitelist/
+# key/HWID/access change across the bot -- whitelisting, unwhitelisting,
+# bulk operations, edits, HWID resets, key generation/clearing, temp
+# whitelists, database rollbacks/uploads, and Bot Access role changes -- on
+# top of the control panel's self-service "Key Redeemed" and "Potential
+# Breach" alerts. One shared channel so staff can watch everything that
+# happens in one place. Still read from REDEEM_ALERTS_CHANNEL_ID in the .env
+# file so existing deployments don't need to change anything.
+ALERTS_CHANNEL_ID = _require_int("REDEEM_ALERTS_CHANNEL_ID")
 
 # Timezone JoinDate values are displayed/stored in (handles EST/EDT automatically)
 LOCAL_TZ = ZoneInfo("America/New_York")

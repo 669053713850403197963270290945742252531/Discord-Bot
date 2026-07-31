@@ -3,17 +3,19 @@ import csv
 import io
 import json
 from datetime import datetime, timezone
+from typing import List
 
 import discord
 from discord import app_commands
 from discord.ext import commands
-from discord.ui import LayoutView, Container, TextDisplay, ActionRow, Button
+from discord.ui import LayoutView, Container, TextDisplay, ActionRow, Button, File as UIFile
 
 from api import config
 from api.discord_helpers import (
     has_role, is_in_guild, send_error, file_success_layout, status_layout,
-    build_unified_diff, send_diff_result,
+    build_unified_diff,
 )
+from api.alerts import send_alert, alert_embed, ALERT_COLOR_CAUTION
 from api.github import (
     GitHubAPIError, fetch_raw_text, fetch_api_text_and_sha, fetch_api_file,
     commit_content, fetch_users_with_sha, list_commits, get_commit,
@@ -22,6 +24,27 @@ from api.users import find_removed_discord_ids, revoke_buyer_role
 from api.time_utils import format_discord_timestamp
 
 GUILD = discord.Object(id=config.GUILD_ID)
+
+# Maps Users.json's PascalCase keys to the snake_case column names
+# /bulkwhitelist's CSV parser looks for (identifier, hwid, discord_id, rank,
+# notes -- see BULK_WHITELIST_REQUIRED_COLUMNS in whitelist.py). Used by
+# /export's CSV branch so the exported file can be edited and fed straight
+# back into /bulkwhitelist. Every key here matches its required column
+# case-insensitively except DiscordId, which /bulkwhitelist wouldn't
+# recognize at all without this remap (it lowercases to "discordid", not
+# "discord_id"). The remaining keys aren't columns /bulkwhitelist reads, but
+# are still normalized to snake_case for consistency in the exported file.
+CSV_EXPORT_COLUMN_MAP = {
+    "Identifier": "identifier",
+    "HWID": "hwid",
+    "DiscordId": "discord_id",
+    "Rank": "rank",
+    "JoinDate": "join_date",
+    "Key": "key",
+    "Notes": "notes",
+    "LastHwidReset": "last_hwid_reset",
+    "totalHwidResets": "total_hwid_resets",
+}
 
 
 class DbSearchView(LayoutView):
@@ -86,6 +109,60 @@ class DbSearchView(LayoutView):
         await interaction.response.edit_message(view=self)
 
 
+class RollbackResultView(LayoutView):
+    """
+    Components V2 layout for a successful /rollback. The diff is the
+    biggest (and often least-needed-at-a-glance) part of the response --
+    and can contain sensitive fields like HWIDs/keys -- so it starts
+    hidden behind a "Show Diff" button instead of being dumped straight
+    into the response the way /diff's is. Clicking it edits this same
+    message in place to reveal the diff, rather than posting it as a
+    separate followup message.
+
+    Only ever constructed when `diff_lines` is non-empty -- a no-op
+    rollback (nothing actually changed) skips this entirely and just
+    sends a plain status_layout(), so there's no "nothing to show" case
+    to handle here.
+    """
+
+    def __init__(self, description: str, diff_lines: List[str], filename: str, *, inline_char_limit: int = 1800):
+        super().__init__(timeout=300)
+        self.diff_lines = diff_lines
+        self.filename = filename
+        self.inline_char_limit = inline_char_limit
+
+        self.show_diff_button = Button(label="Show Diff", emoji="🔍", style=discord.ButtonStyle.secondary)
+        self.show_diff_button.callback = self.on_show_diff
+
+        self.container = Container(
+            TextDisplay("### ✅ Success"),
+            TextDisplay(description),
+            accent_color=discord.Color.green(),
+        )
+        self.container.add_item(ActionRow(self.show_diff_button))
+        self.add_item(self.container)
+
+    async def on_show_diff(self, interaction: discord.Interaction):
+        diff_text = "\n".join(self.diff_lines)
+
+        self.show_diff_button.disabled = True
+
+        # Same inline-vs-attachment split /diff and the old /rollback used
+        # (see send_diff_result) -- small diffs get added straight into
+        # this message as a fenced codeblock, oversized ones get attached
+        # as a .diff file instead so the edit doesn't blow past Discord's
+        # per-component character limit.
+        if len(diff_text) <= self.inline_char_limit:
+            self.show_diff_button.label = "Diff Shown"
+            self.container.add_item(TextDisplay(f"```diff\n{diff_text}\n```"))
+            await interaction.response.edit_message(view=self)
+        else:
+            self.show_diff_button.label = "Diff Attached Below"
+            self.container.add_item(UIFile(f"attachment://{self.filename}"))
+            diff_file = discord.File(io.BytesIO(diff_text.encode()), filename=self.filename)
+            await interaction.response.edit_message(view=self, attachments=[diff_file])
+
+
 class Database(commands.Cog):
     def __init__(self, bot: commands.Bot):
         self.bot = bot
@@ -124,8 +201,17 @@ class Database(commands.Cog):
         for discord_id in removed_ids:
             await revoke_buyer_role(interaction.guild, discord_id)
 
+        await send_alert(interaction.client, alert_embed(
+            "⏮️ Database Rolled Back",
+            f"{interaction.user.mention} rolled back Users.json to commit `{sha[:7]}` via `/rollback`.",
+            color=ALERT_COLOR_CAUTION,
+            fields=[("Users Implicitly Removed", str(len(removed_ids)), True)] if removed_ids else None,
+        ))
+
         # Diff what's being replaced against what was just restored, so
-        # staff can see exactly what the rollback changed.
+        # staff can see exactly what the rollback changed -- kept out of
+        # the initial response and revealed on demand via RollbackResultView
+        # (see class docstring) rather than shown inline right away.
         diff_lines = build_unified_diff(
             current_content,
             restored_content,
@@ -133,13 +219,21 @@ class Database(commands.Cog):
             tofile=f"Users.json (rolled back to {sha[:7]})",
         )
 
-        await send_diff_result(
-            interaction,
-            diff_lines,
-            description=f"Successfully rolled back the database to commit `{sha}`.",
-            no_changes_message="No changes -- content is identical to the current version.",
-            filename=f"rollback_{sha[:7]}.diff",
-        )
+        description = f"Successfully rolled back the database to commit `{sha}`."
+
+        if not diff_lines:
+            await interaction.followup.send(
+                view=status_layout(
+                    "✅ Success",
+                    f"{description}\n\nNo changes -- content is identical to the current version.",
+                    discord.Color.green(),
+                ),
+                ephemeral=True,
+            )
+            return
+
+        view = RollbackResultView(description, diff_lines, filename=f"rollback_{sha[:7]}.diff")
+        await interaction.followup.send(view=view, ephemeral=True)
 
     @app_commands.command(name="commithistory", description="View the recent commit history.")
     @app_commands.guilds(GUILD)
@@ -293,11 +387,19 @@ class Database(commands.Cog):
         else:  # csv
             output = io.StringIO()
             if users:
-                fieldnames = users[0].keys()
-                writer = csv.DictWriter(output, fieldnames=fieldnames)
+                # Column order/coverage is derived from every row (not just
+                # users[0]) so older entries missing a newer field (e.g. a
+                # pre-HWID-reset-tracking entry without LastHwidReset) don't
+                # break the header -- restval="" fills those in as blank.
+                fieldnames = list(dict.fromkeys(
+                    CSV_EXPORT_COLUMN_MAP.get(key, key)
+                    for user in users
+                    for key in user.keys()
+                ))
+                writer = csv.DictWriter(output, fieldnames=fieldnames, restval="")
                 writer.writeheader()
                 for user in users:
-                    writer.writerow(user)
+                    writer.writerow({CSV_EXPORT_COLUMN_MAP.get(k, k): v for k, v in user.items()})
             else:
                 output.write("No data available.")
 
@@ -334,8 +436,21 @@ class Database(commands.Cog):
 
         # A bulk upload can implicitly "unwhitelist" anyone missing from the
         # uploaded file -- diff the before/after lists to find them.
-        for discord_id in find_removed_discord_ids(current_users, users_data):
+        removed_ids = find_removed_discord_ids(current_users, users_data)
+        for discord_id in removed_ids:
             await revoke_buyer_role(interaction.guild, discord_id)
+
+        added_ids = find_removed_discord_ids(users_data, current_users) if isinstance(users_data, list) else []
+        await send_alert(interaction.client, alert_embed(
+            "📤 Database Uploaded",
+            f"{interaction.user.mention} replaced Users.json via `/upload` ({file.filename}).",
+            color=ALERT_COLOR_CAUTION,
+            fields=[
+                ("Total Entries", str(len(users_data)) if isinstance(users_data, list) else "N/A", True),
+                ("Added", str(len(added_ids)), True),
+                ("Removed", str(len(removed_ids)), True),
+            ],
+        ))
 
         await interaction.followup.send(
             view=status_layout("✅ Success", "Users.json uploaded successfully.", discord.Color.green()),

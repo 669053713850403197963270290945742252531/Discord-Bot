@@ -171,7 +171,7 @@ async def ctx_edit_user(interaction: discord.Interaction, target: discord.Member
 @has_role(config.REQUIRED_ROLE_ID)
 @is_in_guild(config.GUILD_ID)
 async def ctx_unwhitelist_user(interaction: discord.Interaction, target: discord.Member):
-    await _unwhitelist_impl(interaction, target)
+    await _unwhitelist_impl(interaction, str(target.id), target.mention)
 
 
 # // Fetch User Info //

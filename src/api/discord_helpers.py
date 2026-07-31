@@ -15,6 +15,8 @@ import discord
 from discord import app_commands
 from discord.ui import Container, File, LayoutView, TextDisplay
 
+from api.keys import is_valid_discord_id
+
 # =========================================================================
 # Embed helpers
 # =========================================================================
@@ -191,6 +193,42 @@ async def edit_or_send_error(
         await interaction.edit_original_response(content=None, embed=embed)
     except discord.NotFound:
         await send_error(interaction, description, title=title, fields=fields, footer=footer, thumbnail=thumbnail)
+
+
+async def resolve_user_option(interaction: discord.Interaction, raw_user: str) -> Optional[discord.User]:
+    """
+    Resolves a raw `user` slash-command option -- typed or picked from a
+    whitelist-autocomplete field (see whitelisted_user_autocomplete in
+    commands/whitelist.py) -- into an actual discord.User object.
+
+    Re-validates the format first, since autocomplete only *suggests*
+    values and Discord still lets someone submit arbitrary text. Then tries
+    the client's cache before falling back to a fetch_user() API call (for
+    users who share no mutual guild/cache entry with the bot). Sends a
+    standard error and returns None on any failure, so callers can just
+    `user = await resolve_user_option(...); if user is None: return`.
+    """
+    raw_user = raw_user.strip()
+    if not is_valid_discord_id(raw_user):
+        await send_error(
+            interaction,
+            f"`{raw_user}` doesn't look like a valid Discord ID -- start typing to pick a whitelisted user from the list.",
+        )
+        return None
+
+    discord_id = int(raw_user)
+    user = interaction.client.get_user(discord_id)
+    if user is not None:
+        return user
+
+    try:
+        return await interaction.client.fetch_user(discord_id)
+    except discord.NotFound:
+        await send_error(interaction, f"No Discord user exists with ID `{raw_user}`.")
+        return None
+    except discord.HTTPException as e:
+        await send_error(interaction, f"Couldn't look up that Discord user: {e}")
+        return None
 
 
 async def notify_user(user, action: str, moderator, reason: str, guild_name: str):

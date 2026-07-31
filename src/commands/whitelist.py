@@ -1,8 +1,10 @@
+import csv
+import io
 import json
 import re
 from collections import defaultdict
 from datetime import datetime, timezone
-from typing import Any, Dict, Optional
+from typing import Any, Dict, List, Optional, Tuple
 
 import discord
 from discord import app_commands
@@ -14,14 +16,18 @@ from discord.ui import (
 
 from api import config
 from api.discord_helpers import (
-    has_role, is_in_guild, send_success, send_error, status_layout,
+    has_role, is_in_guild, send_success, send_error, status_layout, resolve_user_option,
 )
-from api.github import GitHubAPIError, fetch_users_with_sha, fetch_api_text_and_sha, commit_content, commit_users
+from api.alerts import (
+    send_alert, alert_embed,
+    ALERT_COLOR_ADD, ALERT_COLOR_REMOVE, ALERT_COLOR_EDIT, ALERT_COLOR_CAUTION,
+)
+from api.github import GitHubAPIError, fetch_users_with_sha, fetch_api_text_and_sha, commit_content, commit_users, get_cached_users
 from api.users import (
     find_user_by_discord_id, find_user_by_hwid, remove_user_by_discord_id,
     build_user_entry, revoke_buyer_role, find_removed_discord_ids,
 )
-from api.keys import generate_unique_key, is_valid_hwid, is_valid_discord_id
+from api.keys import generate_unique_key, generate_unique_keys, is_valid_hwid, is_valid_discord_id
 from api.time_utils import format_join_date, format_discord_timestamp, is_notes_locked
 
 GUILD = discord.Object(id=config.GUILD_ID)
@@ -29,6 +35,23 @@ GUILD = discord.Object(id=config.GUILD_ID)
 # Discord's String Select requires a fixed, predefined set of choices (max 25)
 # -- edit this list to match whatever rank tiers are actually in use.
 WHITELIST_RANKS = ["User", "Premium", "VIP", "Staff", "Admin", "Owner"]
+
+# Case-insensitive lookup so a /bulkwhitelist CSV's `rank` column can use any
+# casing (e.g. "vip") and still resolve to the canonical value stored in
+# Users.json.
+_RANK_LOOKUP = {r.lower(): r for r in WHITELIST_RANKS}
+
+# Caps /bulkwhitelist's CSV row count. The whole batch is committed in a
+# single GitHub commit (not one per row -- see _bulkwhitelist_impl()), so an
+# unbounded file would mean an arbitrarily large diff landing in one commit;
+# capped at a size that's still easy to review and comfortably clears
+# Discord's 3-second interaction-ack window.
+MAX_BULK_WHITELIST_ROWS = 50
+
+# Columns /bulkwhitelist's CSV requires in its header (case-insensitive, any
+# order). `rank` and `notes` are deliberately left out -- they're optional
+# columns; see _parse_bulk_whitelist_row().
+BULK_WHITELIST_REQUIRED_COLUMNS = {"identifier", "hwid", "discord_id"}
 
 # Kept as a constant so the pre-flight check in editwhitelist() can never
 # silently drift out of sync with the modal's actual max_length.
@@ -139,6 +162,16 @@ class WhitelistModal(Modal, title="Whitelist a User"):
         except GitHubAPIError as e:
             return await send_error(interaction, str(e))
 
+        alert_fields = [("Rank", rank, True), ("HWID", f"||`{hwid}`||", True)]
+        if notes:
+            alert_fields.append(("Notes", notes[:200] + ("..." if len(notes) > 200 else ""), False))
+        await send_alert(interaction.client, alert_embed(
+            "✅ User Whitelisted",
+            f"{interaction.user.mention} whitelisted {mention} as **{identifier}**.",
+            color=ALERT_COLOR_ADD,
+            fields=alert_fields,
+        ))
+
         await send_success(
             interaction,
             f"**{identifier}** ({mention}) has been whitelisted.",
@@ -147,21 +180,291 @@ class WhitelistModal(Modal, title="Whitelist a User"):
 
 
 # =========================================================================
-# /unwhitelist
+# /bulkwhitelist
 # =========================================================================
 
-async def _unwhitelist_impl(interaction: discord.Interaction, user: discord.User):
+def _parse_bulk_whitelist_row(
+    row: Dict[str, Any],
+    col_map: Dict[str, str],
+    default_rank: Optional[str],
+) -> Tuple[Optional[Dict[str, Any]], Optional[str]]:
+    """
+    Validates and normalizes a single CSV row for /bulkwhitelist, mirroring
+    WhitelistModal.on_submit()'s per-field checks. Returns (parsed, None) on
+    success -- `parsed` holds identifier/hwid/discord_id/rank/notes, ready
+    to hand to build_user_entry() -- or (None, reason) on failure, with
+    `reason` being a short line suitable for the errors file.
+
+    Only validates the row in isolation (format, required fields, rank
+    membership). Cross-row and cross-database duplicate checks need
+    visibility into the rest of the batch and the live Users.json, so those
+    live in the caller instead.
+    """
+    def _cell(col_name: str) -> str:
+        source_col = col_map.get(col_name)
+        if source_col is None:
+            return ""
+        return (row.get(source_col) or "").strip()
+
+    identifier = _cell("identifier")
+    hwid = _cell("hwid")
+    raw_discord = _cell("discord_id")
+    raw_rank = _cell("rank")
+    notes = _cell("notes")
+
+    if not identifier:
+        return None, "Missing identifier"
+    if len(identifier) > 100:
+        return None, "Identifier exceeds 100 characters"
+
+    mention_match = re.fullmatch(r"<@!?(\d{17,20})>", raw_discord)
+    discord_id = mention_match.group(1) if mention_match else raw_discord
+    if not is_valid_discord_id(discord_id):
+        return None, f"Invalid Discord ID/mention (`{raw_discord or 'blank'}`)"
+
+    if not is_valid_hwid(hwid):
+        return None, "Invalid HWID (must be 64 hex characters)"
+
+    if raw_rank:
+        resolved_rank = _RANK_LOOKUP.get(raw_rank.lower())
+        if resolved_rank is None:
+            return None, f"Invalid rank `{raw_rank}` -- must be one of: {', '.join(WHITELIST_RANKS)}"
+    else:
+        resolved_rank = default_rank
+        if not resolved_rank:
+            return None, "Missing rank and no default_rank was provided"
+
+    if len(notes) > 500:
+        return None, "Notes exceeds 500 characters"
+
+    return {
+        "identifier": identifier,
+        "hwid": hwid,
+        "discord_id": discord_id,
+        "rank": resolved_rank,
+        "notes": notes or None,
+    }, None
+
+
+async def _bulkwhitelist_impl(interaction: discord.Interaction, file: discord.Attachment, default_rank: Optional[str]):
     await interaction.response.defer(ephemeral=True)
-    discord_id = str(user.id)
+
+    if not file.filename.lower().endswith(".csv"):
+        return await send_error(interaction, "Please upload a valid CSV file.")
+
+    try:
+        raw_bytes = await file.read()
+    except discord.HTTPException as e:
+        return await send_error(interaction, f"Failed to download the uploaded file: {e}")
+
+    try:
+        text = raw_bytes.decode("utf-8-sig")  # -sig so an Excel-exported BOM doesn't end up glued to the first header name
+    except UnicodeDecodeError:
+        return await send_error(interaction, "Couldn't decode the file -- please upload it as UTF-8 encoded CSV.")
+
+    reader = csv.DictReader(io.StringIO(text))
+    if not reader.fieldnames:
+        return await send_error(interaction, "The CSV file appears to be empty or missing a header row.")
+
+    col_map = {name.strip().lower(): name for name in reader.fieldnames if name}
+    missing_cols = BULK_WHITELIST_REQUIRED_COLUMNS - col_map.keys()
+    if missing_cols:
+        return await send_error(
+            interaction,
+            f"Missing required column(s): `{', '.join(sorted(missing_cols))}`. The header must include at "
+            "least `identifier,hwid,discord_id` -- `rank` and `notes` are optional columns.",
+        )
+
+    # Blank trailing lines (common in spreadsheet exports) shouldn't count
+    # as data rows or shift row numbers -- filter them out up front, but
+    # keep numbering (i, starting at 2 for the first row after the header)
+    # tied to the raw file so error messages point at the right line.
+    raw_rows = list(reader)
+    data_rows = [
+        (i, row) for i, row in enumerate(raw_rows, start=2)
+        if any((value or "").strip() for value in row.values())
+    ]
+
+    if not data_rows:
+        return await send_error(interaction, "The CSV file has no data rows.")
+    if len(data_rows) > MAX_BULK_WHITELIST_ROWS:
+        return await send_error(
+            interaction,
+            f"Too many rows ({len(data_rows)}) -- `/bulkwhitelist` is capped at "
+            f"{MAX_BULK_WHITELIST_ROWS} rows per file.",
+        )
 
     try:
         users, sha = await fetch_users_with_sha()
     except GitHubAPIError as e:
         return await send_error(interaction, str(e))
 
+    errors: List[str] = []
+    valid_rows: List[Dict[str, Any]] = []
+    seen_discord_ids: Dict[str, int] = {}
+    seen_hwids: Dict[str, int] = {}
+
+    for i, row in data_rows:
+        parsed, reason = _parse_bulk_whitelist_row(row, col_map, default_rank)
+        if reason:
+            errors.append(f"Row {i}: {reason}")
+            continue
+
+        discord_id = parsed["discord_id"]
+        hwid_lower = parsed["hwid"].lower()
+
+        existing = find_user_by_discord_id(users, discord_id)
+        if existing:
+            errors.append(f"Row {i}: Discord ID {discord_id} is already whitelisted as {existing.get('Identifier', 'Unknown')}")
+            continue
+        existing_hwid = find_user_by_hwid(users, parsed["hwid"])
+        if existing_hwid:
+            errors.append(f"Row {i}: HWID is already whitelisted under {existing_hwid.get('Identifier', 'Unknown')}")
+            continue
+        # Duplicates checked against the rest of *this* file, not just the
+        # live database -- two rows in the same upload can collide with
+        # each other even though neither is in Users.json yet.
+        if discord_id in seen_discord_ids:
+            errors.append(f"Row {i}: Discord ID {discord_id} duplicates row {seen_discord_ids[discord_id]}")
+            continue
+        if hwid_lower in seen_hwids:
+            errors.append(f"Row {i}: HWID duplicates row {seen_hwids[hwid_lower]}")
+            continue
+
+        seen_discord_ids[discord_id] = i
+        seen_hwids[hwid_lower] = i
+        valid_rows.append(parsed)
+
+    error_file = None
+    if errors:
+        error_text = "\n".join(errors) + "\n"
+        error_file = discord.File(io.BytesIO(error_text.encode()), filename="bulkwhitelist_errors.txt")
+
+    if not valid_rows:
+        return await send_error(
+            interaction,
+            "No rows were whitelisted -- every row failed validation. See the attached file for details.",
+            fields=[("Rows Failed", str(len(errors)), True)],
+            **({"file": error_file} if error_file else {}),
+        )
+
+    # One generate_unique_keys() call for the whole batch -- guaranteed
+    # unique both against every already-assigned Key and against every
+    # other key generated in this same call, so no two rows can collide
+    # with each other the way sequential generate_unique_key() calls might
+    # if this were done one row at a time.
+    existing_keys = {u.get("Key") for u in users if u.get("Key")}
+    new_keys = generate_unique_keys(len(valid_rows), existing_keys)
+
+    for parsed, key in zip(valid_rows, new_keys):
+        users.append(build_user_entry(
+            parsed["hwid"], parsed["identifier"], parsed["rank"], parsed["discord_id"], key, parsed["notes"],
+        ))
+
+    # A single commit for the entire batch, not one per row -- keeps this
+    # to one GitHub API write regardless of row count, so a full 50-row
+    # file can't hammer the API or trip a rate limit the way 50 sequential
+    # commits could.
+    try:
+        await commit_users(users, sha, f"Bulk whitelist: {len(valid_rows)} user(s) by {interaction.user}")
+    except GitHubAPIError as e:
+        return await send_error(interaction, str(e))
+
+    # Cap the listed names so a full 50-row batch can't blow out the
+    # alert embed -- the GitHub commit is still the authoritative full
+    # record of exactly who was added.
+    preview_rows = valid_rows[:15]
+    preview = ", ".join(f"**{p['identifier']}** (<@{p['discord_id']}>)" for p in preview_rows)
+    if len(valid_rows) > len(preview_rows):
+        preview += f", and {len(valid_rows) - len(preview_rows)} more"
+    await send_alert(interaction.client, alert_embed(
+        "📥 Bulk Whitelist",
+        f"{interaction.user.mention} bulk-whitelisted **{len(valid_rows)}** user(s)"
+        + (f" ({len(errors)} row(s) skipped)" if errors else "") + ".",
+        color=ALERT_COLOR_ADD,
+        fields=[("Users", preview, False)],
+    ))
+
+    description = f"Whitelisted **{len(valid_rows)}** user{'s' if len(valid_rows) != 1 else ''}."
+    fields = [("Whitelisted", str(len(valid_rows)), True)]
+    if errors:
+        fields.append(("Skipped", str(len(errors)), True))
+        description += f" **{len(errors)}** row{'s were' if len(errors) != 1 else ' was'} skipped -- see the attached file for details."
+
+    await send_success(
+        interaction,
+        description,
+        fields=fields,
+        **({"file": error_file} if error_file else {}),
+    )
+
+
+# =========================================================================
+# /unwhitelist
+# =========================================================================
+
+async def whitelisted_user_autocomplete(interaction: discord.Interaction, current: str) -> List[app_commands.Choice[str]]:
+    """
+    Populates the `user` option on any command whose target must already be
+    a whitelisted user -- /unwhitelist, /edituser, /fetchuser,
+    /checkregistration, /clearnotes, /checktemp, /extend, /forceresethwid,
+    /resethwidcooldown -- straight from the in-memory Users.json cache
+    (get_cached_users() -- no network call, so it's fast enough for
+    Discord's autocomplete window). Since that cache is updated immediately
+    on every whitelist/unwhitelist commit (and by the periodic background
+    refresh -- see start.py), these suggestions live-update automatically
+    without this function doing anything extra.
+
+    Not used by /tempwhitelist, since that command's whole point is
+    granting access to someone who *isn't* already whitelisted.
+
+    Each suggestion is shown as "DiscordId (Identifier/Discord Name)" --
+    e.g. "999776749070078004 (Corrade/corradeknight)". Identifier comes
+    straight from the Users.json entry (whatever alias the user registered
+    under); Discord Name is their actual current Discord username, resolved
+    from the bot's own user cache -- shown together since staff might
+    recognize a match by either one, and they can genuinely differ.
+    """
+    users = get_cached_users() or []
+    query = current.lower().strip()
+
+    choices = []
+    for entry in users:
+        discord_id = entry.get("DiscordId")
+        if not discord_id:
+            continue
+        discord_id = str(discord_id)
+
+        identifier = entry.get("Identifier") or "Unknown"
+        discord_user = interaction.client.get_user(int(discord_id)) if discord_id.isdigit() else None
+        discord_name = discord_user.name if discord_user else "Unknown"
+        label = f"{discord_id} ({identifier}/{discord_name})"
+
+        if query and query not in label.lower():
+            continue
+
+        choices.append(app_commands.Choice(name=label[:100], value=discord_id))
+
+    return choices[:25]
+
+
+async def _unwhitelist_impl(interaction: discord.Interaction, discord_id: str, mention: Optional[str] = None):
+    await interaction.response.defer(ephemeral=True)
+    discord_id = str(discord_id)
+    mention = mention or f"<@{discord_id}>"
+
+    try:
+        users, sha = await fetch_users_with_sha()
+    except GitHubAPIError as e:
+        return await send_error(interaction, str(e))
+
+    # Grabbed before removal purely for the alert -- remove_user_by_discord_id
+    # only reports whether something was removed, not what it was.
+    removed_entry = find_user_by_discord_id(users, discord_id)
+
     filtered, removed = remove_user_by_discord_id(users, discord_id)
     if not removed:
-        return await send_error(interaction, f"{user.mention} was not found in database.")
+        return await send_error(interaction, f"{mention} was not found in database.")
 
     try:
         await commit_users(filtered, sha, f"Unwhitelist user: {discord_id}")
@@ -169,7 +472,15 @@ async def _unwhitelist_impl(interaction: discord.Interaction, user: discord.User
         return await send_error(interaction, str(e))
 
     await revoke_buyer_role(interaction.guild, discord_id)
-    await send_success(interaction, f"{user.mention} has been removed from the whitelist.")
+
+    identifier = removed_entry.get("Identifier", "Unknown") if removed_entry else "Unknown"
+    await send_alert(interaction.client, alert_embed(
+        "❌ User Unwhitelisted",
+        f"{interaction.user.mention} removed {mention} (**{identifier}**) from the whitelist.",
+        color=ALERT_COLOR_REMOVE,
+    ))
+
+    await send_success(interaction, f"{mention} has been removed from the whitelist.")
 
 
 # =========================================================================
@@ -235,8 +546,25 @@ class EditWhitelistModal(Modal):
         except GitHubAPIError as e:
             return await send_error(interaction, str(e))
 
-        for discord_id in find_removed_discord_ids(current_users, new_users):
+        removed_ids = find_removed_discord_ids(current_users, new_users)
+        for discord_id in removed_ids:
             await revoke_buyer_role(interaction.guild, discord_id)
+
+        # find_removed_discord_ids() is symmetric -- swapping the before/
+        # after arguments gives everything present in the new JSON that
+        # wasn't in the old one, i.e. what got added.
+        added_ids = find_removed_discord_ids(new_users, current_users) if isinstance(new_users, list) else []
+        total = len(new_users) if isinstance(new_users, list) else "N/A"
+        await send_alert(interaction.client, alert_embed(
+            "📝 Whitelist JSON Edited",
+            f"{interaction.user.mention} edited the whitelist database directly via `/editwhitelist`.",
+            color=ALERT_COLOR_CAUTION,
+            fields=[
+                ("Total Entries", str(total), True),
+                ("Added", str(len(added_ids)), True),
+                ("Removed", str(len(removed_ids)), True),
+            ],
+        ))
 
         await send_success(interaction, "Whitelist updated successfully.")
 
@@ -356,6 +684,12 @@ class EditUserCommandModal(Modal):
                 "relies on. It'll unlock once the temporary whitelist expires or is removed.",
             )
 
+        # Snapshot before mutating, so the alert below can report exactly
+        # what changed rather than just the end state.
+        before_identifier = entry.get("Identifier")
+        before_rank = entry.get("Rank")
+        before_notes = entry.get("Notes") or None
+
         entry["Identifier"] = identifier
         entry["DiscordId"] = discord_id
         entry["Rank"] = rank
@@ -366,6 +700,24 @@ class EditUserCommandModal(Modal):
             await commit_users(users, sha, f"Edited whitelist user: {identifier} ({discord_id})")
         except GitHubAPIError as e:
             return await send_error(interaction, str(e))
+
+        changes = []
+        if before_identifier != identifier:
+            changes.append(f"**Identifier:** {before_identifier} → {identifier}")
+        if self.original_discord_id != discord_id:
+            changes.append(f"**Discord User:** <@{self.original_discord_id}> → {mention}")
+        if before_rank != rank:
+            changes.append(f"**Rank:** {before_rank} → {rank}")
+        if self.original_hwid != hwid:
+            changes.append(f"**HWID:** ||`{self.original_hwid}`|| → ||`{hwid}`||")
+        if before_notes != notes:
+            changes.append("**Notes:** updated")
+        await send_alert(interaction.client, alert_embed(
+            "✏️ User Edited",
+            f"{interaction.user.mention} edited {mention}'s whitelist entry (**{identifier}**) via `/edituser`.",
+            color=ALERT_COLOR_EDIT,
+            fields=[("Changes", "\n".join(changes) if changes else "No values changed", False)],
+        ))
 
         await send_success(
             interaction,
@@ -487,6 +839,12 @@ class EditUserModal(Modal):
                 "or is removed.",
             )
 
+        before_identifier = entry.get("Identifier")
+        before_rank = entry.get("Rank")
+        before_hwid = entry.get("HWID") or ""
+        before_key = entry.get("Key") or ""
+        before_notes = entry.get("Notes") or None
+
         self.user_data["Identifier"] = self.identifier.value
         self.user_data["Rank"] = self.rank.value
         self.user_data["HWID"] = self.hwid.value or "N/A"
@@ -501,6 +859,24 @@ class EditUserModal(Modal):
             await commit_users(existing, sha, f"Edited whitelist user: {self.user_data.get('Identifier', 'N/A')} ({discord_id})")
         except GitHubAPIError as e:
             return await send_error(interaction, str(e))
+
+        changes = []
+        if before_identifier != self.user_data["Identifier"]:
+            changes.append(f"**Identifier:** {before_identifier} → {self.user_data['Identifier']}")
+        if before_rank != self.user_data["Rank"]:
+            changes.append(f"**Rank:** {before_rank} → {self.user_data['Rank']}")
+        if before_hwid != (self.hwid.value or ""):
+            changes.append("**HWID:** changed")
+        if before_key != (self.key.value or ""):
+            changes.append("**Key:** changed")
+        if before_notes != new_notes:
+            changes.append("**Notes:** updated")
+        await send_alert(interaction.client, alert_embed(
+            "✏️ User Edited",
+            f"{interaction.user.mention} edited **{self.user_data.get('Identifier', 'N/A')}**'s (<@{discord_id}>) whitelist entry via `/viewwhitelist`.",
+            color=ALERT_COLOR_EDIT,
+            fields=[("Changes", "\n".join(changes) if changes else "No values changed", False)],
+        ))
 
         # Same page they were editing on -- just refresh the entry's own data.
         self.whitelist_view.users = existing
@@ -555,6 +931,12 @@ class DeleteUserConfirmView(LayoutView):
             return await send_error(interaction, str(e))
 
         await revoke_buyer_role(interaction.guild, self.discord_id)
+
+        await send_alert(interaction.client, alert_embed(
+            "🗑️ User Deleted",
+            f"{interaction.user.mention} deleted **{self.identifier}** (<@{self.discord_id}>) from the whitelist via `/viewwhitelist`.",
+            color=ALERT_COLOR_REMOVE,
+        ))
 
         view.users = existing
         if view.current_index >= len(view.users):
@@ -755,12 +1137,39 @@ class Whitelist(commands.Cog):
     async def whitelist(self, interaction: discord.Interaction):
         await interaction.response.send_modal(WhitelistModal())
 
-    @app_commands.command(name="unwhitelist", description="Removes a user from the database.")
+    @app_commands.command(name="bulkwhitelist", description="Bulk-whitelists users from a CSV file (identifier,hwid,discord_id,rank,notes).")
     @app_commands.guilds(GUILD)
-    @app_commands.describe(user="Discord user to remove from the database.")
+    @app_commands.describe(
+        file=f"CSV, header identifier,hwid,discord_id,rank,notes ({MAX_BULK_WHITELIST_ROWS} rows max). rank/notes are optional per row.",
+        default_rank="Rank to use for rows that don't specify their own",
+    )
+    @app_commands.choices(default_rank=[app_commands.Choice(name=r, value=r) for r in WHITELIST_RANKS])
     @has_role(config.REQUIRED_ROLE_ID)
     @is_in_guild(config.GUILD_ID)
-    async def unwhitelist(self, interaction: discord.Interaction, user: discord.User):
+    async def bulkwhitelist(
+        self,
+        interaction: discord.Interaction,
+        file: discord.Attachment,
+        default_rank: Optional[app_commands.Choice[str]] = None,
+    ):
+        await _bulkwhitelist_impl(interaction, file, default_rank.value if default_rank else None)
+
+    @app_commands.command(name="unwhitelist", description="Removes a user from the database.")
+    @app_commands.guilds(GUILD)
+    @app_commands.describe(user="Whitelisted user to remove -- start typing an ID or name to search.")
+    @app_commands.autocomplete(user=whitelisted_user_autocomplete)
+    @has_role(config.REQUIRED_ROLE_ID)
+    @is_in_guild(config.GUILD_ID)
+    async def unwhitelist(self, interaction: discord.Interaction, user: str):
+        user = user.strip()
+        if not is_valid_discord_id(user):
+            # Autocomplete only *suggests* valid values -- Discord still lets
+            # a user submit whatever raw text they typed, so this
+            # re-validates rather than trusting the input.
+            return await send_error(
+                interaction,
+                f"`{user}` doesn't look like a valid Discord ID -- start typing to pick a whitelisted user from the list.",
+            )
         await _unwhitelist_impl(interaction, user)
 
     @app_commands.command(name="editwhitelist", description="Edits the database JSON directly.")
@@ -790,19 +1199,27 @@ class Whitelist(commands.Cog):
 
     @app_commands.command(name="edituser", description="Edits a whitelisted user's info.")
     @app_commands.guilds(GUILD)
-    @app_commands.describe(user="User to edit")
+    @app_commands.describe(user="User to edit -- start typing an ID or name to search.")
+    @app_commands.autocomplete(user=whitelisted_user_autocomplete)
     @has_role(config.REQUIRED_ROLE_ID)
     @is_in_guild(config.GUILD_ID)
-    async def edituser(self, interaction: discord.Interaction, user: discord.User):
-        await _edituser_impl(interaction, user)
+    async def edituser(self, interaction: discord.Interaction, user: str):
+        resolved = await resolve_user_option(interaction, user)
+        if resolved is None:
+            return
+        await _edituser_impl(interaction, resolved)
 
     @app_commands.command(name="fetchuser", description="Fetches all stored info about a user.")
     @app_commands.guilds(GUILD)
-    @app_commands.describe(user="The user to look up")
+    @app_commands.describe(user="The user to look up -- start typing an ID or name to search.")
+    @app_commands.autocomplete(user=whitelisted_user_autocomplete)
     @has_role(config.REQUIRED_ROLE_ID)
     @is_in_guild(config.GUILD_ID)
-    async def fetchuser(self, interaction: discord.Interaction, user: discord.User):
-        await _fetchuser_impl(interaction, user)
+    async def fetchuser(self, interaction: discord.Interaction, user: str):
+        resolved = await resolve_user_option(interaction, user)
+        if resolved is None:
+            return
+        await _fetchuser_impl(interaction, resolved)
 
     @app_commands.command(name="fetchdupes", description="Find duplicate values in the whitelist.")
     @app_commands.guilds(GUILD)
@@ -957,10 +1374,15 @@ class Whitelist(commands.Cog):
 
     @app_commands.command(name="checkregistration", description="Checks if a user is registered.")
     @app_commands.guilds(GUILD)
-    @app_commands.describe(user="The user to check registration for")
+    @app_commands.describe(user="The user to check registration for -- start typing an ID or name to search.")
+    @app_commands.autocomplete(user=whitelisted_user_autocomplete)
     @has_role(config.REQUIRED_ROLE_ID)
     @is_in_guild(config.GUILD_ID)
-    async def checkregistration(self, interaction: discord.Interaction, user: discord.User):
+    async def checkregistration(self, interaction: discord.Interaction, user: str):
+        resolved = await resolve_user_option(interaction, user)
+        if resolved is None:
+            return
+        user = resolved
         await interaction.response.defer(ephemeral=True)
         discord_id_str = str(user.id)
 
@@ -1057,11 +1479,15 @@ class Whitelist(commands.Cog):
 
     @app_commands.command(name="clearnotes", description="Clears the notes field for a user in the GitHub whitelist JSON.")
     @app_commands.guilds(GUILD)
-    @app_commands.describe(user="The user whose notes to clear")
+    @app_commands.describe(user="The user whose notes to clear -- start typing an ID or name to search.")
+    @app_commands.autocomplete(user=whitelisted_user_autocomplete)
     @has_role(config.REQUIRED_ROLE_ID)
     @is_in_guild(config.GUILD_ID)
-    async def clearnotes(self, interaction: discord.Interaction, user: discord.User):
-        await _clearnotes_impl(interaction, user)
+    async def clearnotes(self, interaction: discord.Interaction, user: str):
+        resolved = await resolve_user_option(interaction, user)
+        if resolved is None:
+            return
+        await _clearnotes_impl(interaction, resolved)
 
 
 async def _clearnotes_impl(interaction: discord.Interaction, user: discord.User):
@@ -1091,6 +1517,12 @@ async def _clearnotes_impl(interaction: discord.Interaction, user: discord.User)
         await commit_users(users, sha, f"Cleared notes for user: {user} ({discord_id_str})")
     except GitHubAPIError as e:
         return await send_error(interaction, str(e))
+
+    await send_alert(interaction.client, alert_embed(
+        "🧹 Notes Cleared",
+        f"{interaction.user.mention} cleared {user.mention}'s notes (**{entry.get('Identifier', 'Unknown')}**) via `/clearnotes`.",
+        color=ALERT_COLOR_EDIT,
+    ))
 
     await send_success(interaction, f"Notes cleared for {user.mention}.")
 

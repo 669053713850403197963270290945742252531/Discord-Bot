@@ -1,0 +1,70 @@
+{
+  "schema_version": 1,
+  "last_updated": "2026-07-31T18:42:07Z",
+
+  "temp_bans": [
+    {
+      "id": "tb_9f2a1c",
+      "discord_id": "895500903799463976",
+      "guild_id": "1102938475610293847",
+      "reason": "Spamming invite links",
+      "banned_at": "2026-07-31T18:00:00Z",
+      "unban_at": "2026-07-31T20:00:00Z",
+      "banned_by_id": "312445566778899001",
+      "banned_by_tag": "Accounts"
+    }
+  ],
+
+  "lockdown": {
+    "active": true,
+    "started_at": "2026-07-31T17:15:00Z",
+    "unlock_at": "2026-07-31T18:15:00Z",
+    "started_by_id": "312445566778899001",
+    "started_by_tag": "Accounts",
+    "announce_channel_id": "1102938475610293900",
+    "channel_snapshots": {
+      "1102938475610294011": { "send_messages": null, "add_reactions": false },
+      "1102938475610294022": { "send_messages": null, "connect": null }
+    }
+  },
+
+  "channel_locks": [
+    {
+      "id": "cl_7b3e90",
+      "channel_id": "1102938475610294088",
+      "locked_at": "2026-07-31T18:10:00Z",
+      "unlock_at": "2026-07-31T18:40:00Z",
+      "locked_by_id": "312445566778899001",
+      "locked_by_tag": "Accounts"
+    }
+  ],
+
+  "temp_bot_access": [
+    {
+      "id": "ta_1d44f2",
+      "discord_id": "889001122334455667",
+      "granted_at": "2026-07-31T18:05:00Z",
+      "expires_at": "2026-07-31T19:05:00Z",
+      "granted_by_id": "312445566778899001",
+      "granted_by_tag": "Accounts"
+    }
+  ],
+
+  "pending_breach_alerts": [
+    {
+      "id": "ba_c02d17",
+      "message_id": "1398765432109876543",
+      "channel_id": "1102938475610293999",
+      "created_at": "2026-07-31T17:50:00Z",
+      "owner_discord_id": "700111222333444555",
+      "owner_identifier": "SomeUser",
+      "hwid": "cd0aa9856147b6c5b4ff2b7dfee5da20aa38253099ef1b4a64aced233c9afe29",
+      "attempting_discord_id": "800222333444555666"
+    }
+  ],
+
+  "reaction_role_panel": {
+    "channel_id": "1102938475610293955",
+    "message_id": "1398765432100000001"
+  }
+}
