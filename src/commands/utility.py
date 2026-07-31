@@ -1,4 +1,5 @@
 import difflib
+import random
 import re
 from typing import List
 
@@ -17,6 +18,7 @@ from api.encoding import (
     ENCODING_ALGORITHMS, ENCODING_CHOICES, IDENTIFY_CHOICE_VALUE,
     encode_text, decode_text, identify_encoding,
 )
+from api.encoding_help import ENCODING_HELP, get_demo_text
 from api.entropy import analyze_entropy
 
 GUILD = discord.Object(id=config.GUILD_ID)
@@ -143,17 +145,28 @@ class Utility(commands.Cog):
         )
         await safe_respond(interaction, embed=embed, ephemeral=True)
 
-    @app_commands.command(name="encode", description="Encodes text using a chosen algorithm (Base64, URL Encode, ROT13, and more).")
-    @app_commands.guilds(GUILD)
+    # /encode, /decode, and /encodehelp are now subcommands of a single
+    # /encode group: /encode encode, /encode decode, /encode help. The
+    # guild restriction moves to the group itself -- per discord.py, a
+    # group's subcommands can't carry their own @app_commands.guilds(...)
+    # default, so decorating the group here makes every child inherit it.
+    encode_group = app_commands.guilds(GUILD)(
+        app_commands.Group(
+            name="encode",
+            description="Text encoding tools -- encode, decode (or identify), and learn how an algorithm works.",
+        )
+    )
+
+    @encode_group.command(name="encode", description="Encodes text using a chosen algorithm (Base64, URL Encode, ROT13, and more).")
     @app_commands.describe(text="The text to encode", algorithm="Algorithm to encode with")
     @app_commands.choices(algorithm=[app_commands.Choice(name=name, value=value) for name, value in ENCODING_CHOICES])
     @has_role(config.REQUIRED_ROLE_ID)
     @is_in_guild(config.GUILD_ID)
-    async def encode_cmd(self, interaction: discord.Interaction, text: str, algorithm: app_commands.Choice[str]):
+    async def encode_encode(self, interaction: discord.Interaction, text: str, algorithm: app_commands.Choice[str]):
         if algorithm.value == IDENTIFY_CHOICE_VALUE:
             return await send_error(
                 interaction,
-                "`Identify` only applies to `/decode` -- it guesses how existing encoded text was "
+                "`Identify` only applies to `/encode decode` -- it guesses how existing encoded text was "
                 "produced. Pick a specific algorithm here to encode into.",
             )
 
@@ -173,13 +186,12 @@ class Utility(commands.Cog):
         )
         await safe_respond(interaction, embed=embed, ephemeral=True)
 
-    @app_commands.command(name="decode", description="Decodes text using a chosen algorithm, or estimates which one was used.")
-    @app_commands.guilds(GUILD)
+    @encode_group.command(name="decode", description="Decodes text using a chosen algorithm, or estimates which one was used.")
     @app_commands.describe(text="The text to decode", algorithm="Algorithm to decode with, or Identify to estimate which one was used")
     @app_commands.choices(algorithm=[app_commands.Choice(name=name, value=value) for name, value in ENCODING_CHOICES])
     @has_role(config.REQUIRED_ROLE_ID)
     @is_in_guild(config.GUILD_ID)
-    async def decode_cmd(self, interaction: discord.Interaction, text: str, algorithm: app_commands.Choice[str]):
+    async def encode_decode(self, interaction: discord.Interaction, text: str, algorithm: app_commands.Choice[str]):
         if algorithm.value == IDENTIFY_CHOICE_VALUE:
             return await self._identify_and_respond(interaction, text)
 
@@ -197,6 +209,50 @@ class Utility(commands.Cog):
                 ("After", f"```{_safe_codeblock(result)}```", False),
             ],
         )
+        await safe_respond(interaction, embed=embed, ephemeral=True)
+
+    @encode_group.command(
+        name="help",
+        description="Explains how an encoding works, with an example and whether it's actually secure.",
+    )
+    @app_commands.describe(algorithm="Which encode/decode algorithm to learn about")
+    @app_commands.choices(algorithm=[app_commands.Choice(name=name, value=value) for name, value in ENCODING_CHOICES])
+    @has_role(config.REQUIRED_ROLE_ID)
+    @is_in_guild(config.GUILD_ID)
+    async def encode_help(self, interaction: discord.Interaction, algorithm: app_commands.Choice[str]):
+        if algorithm.value == IDENTIFY_CHOICE_VALUE:
+            return await send_error(
+                interaction,
+                "`Identify` isn't an algorithm itself -- it's an `/encode decode` mode that guesses how "
+                "existing text was encoded by looking at its shape. Pick a specific algorithm from the list "
+                "to learn about that one.",
+            )
+
+        help_entry = ENCODING_HELP[algorithm.value]
+        demo_text = get_demo_text(algorithm.value)
+
+        fields = [("How It Works", help_entry["how_it_works"], False)]
+
+        # Generate the worked example by running the real encode engine
+        # against a demo phrase, rather than hard-coding the result here --
+        # this way the example can never drift out of sync with what
+        # /encode encode and /encode decode actually produce.
+        try:
+            example_result = encode_text(algorithm.value, demo_text)
+        except ValueError:
+            example_result = None
+
+        if example_result:
+            fields.append((
+                "Example",
+                f"Before: ```{_safe_codeblock(demo_text)}```After: ```{_safe_codeblock(example_result)}```",
+                False,
+            ))
+
+        fields.append(("Is It Secure?", help_entry["security"], False))
+        fields.append(("Industry Standard?", help_entry["standard"], False))
+
+        embed = build_embed(title=f"📖 {algorithm.name} Explained", color=discord.Color.blue(), fields=fields)
         await safe_respond(interaction, embed=embed, ephemeral=True)
 
     async def _identify_and_respond(self, interaction: discord.Interaction, text: str):
@@ -315,6 +371,22 @@ class Utility(commands.Cog):
                 ("Estimated Time To Crack", f"```{crack_lines}```", False),
             ],
             footer="Heuristic estimate only -- doesn't check real breach databases or dictionary words.",
+        )
+        await safe_respond(interaction, embed=embed, ephemeral=True)
+
+    @app_commands.command(name="coinflip", description="Flips a coin -- a traditional 50/50 Heads or Tails.")
+    @app_commands.guilds(GUILD)
+    @has_role(config.REQUIRED_ROLE_ID)
+    @is_in_guild(config.GUILD_ID)
+    async def coinflip_cmd(self, interaction: discord.Interaction):
+        # random.choice() over a straight 2-item sequence -- a plain,
+        # unweighted 50/50 pick, same as a traditional physical coin flip
+        # (no loaded odds, no third "landed on its edge" outcome).
+        result = random.choice(("Heads", "Tails"))
+        embed = build_embed(
+            title="🪙 Coin Flip",
+            color=discord.Color.gold(),
+            fields=[("Result", f"**{result}**", False)],
         )
         await safe_respond(interaction, embed=embed, ephemeral=True)
 

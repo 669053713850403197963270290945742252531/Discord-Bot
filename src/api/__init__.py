@@ -12,9 +12,11 @@ stays a manageable size:
     time_utils.py       date formatting/parsing + temp-whitelist expiration
     hashing.py         /hash algorithm utilities
     transforms.py       /transform's stylized-Unicode text styles
-    encoding.py         /encode and /decode's algorithms + Identify heuristic
-    ciphers.py          /cipher and /decipher's classical cipher algorithms
+    encoding.py         /encode encode and /encode decode's algorithms + Identify heuristic
+    ciphers.py          /cipher encrypt and /cipher decrypt's classical cipher algorithms + Identify heuristic
+    encryption.py       /encrypt and /decrypt's modern authenticated-encryption algorithms
     discord_helpers.py embeds, interaction responders, permission checks
+    alerts.py           staff Alerts channel logging (send_alert/alert_embed)
 
 Everything below is re-exported here too, so cogs can do either
 `from api import github` or `from api.github import fetch_users_with_sha`.
@@ -24,7 +26,7 @@ from . import config
 from .config import (
     DISCORD_TOKEN, GITHUB_TOKEN,
     GUILD_ID, REQUIRED_ROLE_ID, REGISTRATION_CHANNEL_ID, REACTION_ROLE_CHANNEL_ID,
-    PANEL_CHANNEL_ID, BUYER_ROLE_ID, REDEEM_ALERTS_CHANNEL_ID,
+    PANEL_CHANNEL_ID, BUYER_ROLE_ID, ALERTS_CHANNEL_ID,
     LOCAL_TZ, RESET_HWID_COOLDOWN,
     OWNER, REPO, FILE_PATH, BRANCH, RAW_URL, API_URL,
     STORAGE_REPO, STORAGE_BRANCH,
@@ -71,7 +73,12 @@ from .transforms import TRANSFORM_FORMAT_CHOICES, transform_text
 
 from .encoding import ENCODING_ALGORITHMS, ENCODING_CHOICES, IDENTIFY_CHOICE_VALUE, encode_text, decode_text, identify_encoding
 
-from .ciphers import CIPHER_ALGORITHMS, CIPHER_CHOICES, cipher_text, decipher_text
+from .ciphers import (
+    CIPHER_ALGORITHMS, CIPHER_CHOICES, cipher_text, decipher_text,
+    identify_cipher, IDENTIFY_CHOICE_VALUE as CIPHER_IDENTIFY_CHOICE_VALUE,
+)
+
+from .encryption import ENCRYPTION_ALGORITHMS, ENCRYPTION_CHOICES, encrypt_text, decrypt_text
 
 from .discord_helpers import (
     build_embed, success_embed, error_embed,
@@ -82,3 +89,8 @@ from .discord_helpers import (
 )
 
 from .webhook_sync import sync_webhook_url
+
+from .alerts import (
+    send_alert, alert_embed,
+    ALERT_COLOR_ADD, ALERT_COLOR_REMOVE, ALERT_COLOR_EDIT, ALERT_COLOR_TEMP, ALERT_COLOR_CAUTION,
+)

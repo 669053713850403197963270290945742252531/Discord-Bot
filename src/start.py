@@ -1,7 +1,7 @@
 """
 Entry point. Everything else in this package is a library (api/) or an
 extension (commands/); this is the only file that actually constructs the
-Client, wires the 11 extensions into it, and calls bot.run().
+Client, wires the 13 extensions into it, and calls bot.run().
 
 Run from the repo root with `python src/start.py` (after `pip install -r
 requirements.txt` and filling in `.env`).
@@ -63,6 +63,7 @@ EXTENSIONS = (
     "commands.utility",
     "commands.genpass",
     "commands.ciphers",
+    "commands.encryption",
     "commands.moderation",
     "commands.whitelist",
     "commands.keys_hwid",
@@ -72,23 +73,6 @@ EXTENSIONS = (
     "commands.reaction_roles",
     "commands.context_menus",
 )
-
-
-EXTENSION_MAX_COMMANDS = {
-    "commands.info": 3,
-    "commands.utility": 6,
-    "commands.genpass": 1,
-    "commands.ciphers": 2,
-    "commands.moderation": 12,
-    "commands.whitelist": 12,
-    "commands.keys_hwid": 9,
-    "commands.database": 7,
-    "commands.panel": 2,
-    "commands.access": 2,
-    "commands.reaction_roles": 1,
-    "commands.context_menus": 15,
-}
-TOTAL_DEFINED_COMMANDS = sum(EXTENSION_MAX_COMMANDS.values())  # 70
 
 
 class Client(commands.Bot):
@@ -112,6 +96,12 @@ class Client(commands.Bot):
         guild_obj = discord.Object(id=config.GUILD_ID)
         total_extensions = len(EXTENSIONS)
         loaded_extensions = 0
+        # Sum of the per-extension before/after deltas below -- this is the
+        # dynamically-observed "expected" total, rather than a hardcoded
+        # constant that would need to be hand-updated (and could silently
+        # drift out of sync) every time a command is added/removed from any
+        # extension.
+        commands_added = 0
 
         for extension in EXTENSIONS:
             before = len(self.tree.get_commands(guild=guild_obj))
@@ -125,14 +115,26 @@ class Client(commands.Bot):
             loaded_extensions += 1
             after = len(self.tree.get_commands(guild=guild_obj))
             added = after - before
-            max_for_ext = EXTENSION_MAX_COMMANDS.get(extension, added)
-            print(f"Loaded extension:  {extension} ({added}/{max_for_ext} commands loaded)")
+            commands_added += added
+            print(f"Loaded extension:  {extension} ({added} commands loaded)")
 
         registered_commands = len(self.tree.get_commands(guild=guild_obj))
         print(
             f"All {loaded_extensions}/{total_extensions} extensions loaded, "
-            f"{registered_commands}/{TOTAL_DEFINED_COMMANDS} commands registered."
+            f"{registered_commands}/{commands_added} commands registered."
         )
+        if registered_commands != commands_added:
+            # Only possible if some extension's commands got clobbered by a
+            # same-named command from a later extension (before/after would
+            # show 0 added for the second one, but the first one's slot in
+            # the tree was silently overwritten rather than net-new). Worth
+            # flagging since it means two extensions collided on a command
+            # name.
+            print(
+                "Warning: registered command count doesn't match the sum of "
+                "per-extension additions -- check for duplicate command names "
+                "across extensions."
+            )
 
     async def on_ready(self):
         print(f"Logged in as {self.user} ({self.user.id})")

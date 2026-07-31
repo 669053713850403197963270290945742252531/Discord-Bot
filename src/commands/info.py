@@ -8,7 +8,7 @@ from discord import app_commands
 from discord.ext import commands
 
 from api import config
-from api.discord_helpers import has_role, is_in_guild, send_error, build_embed
+from api.discord_helpers import has_role, is_in_guild, send_error, build_embed, safe_respond
 from api.github import (
     GitHubAPIError, fetch_users_with_sha, fetch_rate_limit,
     get_cached_users, cached_users_updated_at,
@@ -138,6 +138,22 @@ def _rate_limit_field(name: str, resource: Dict[str, Any]) -> Tuple[str, str, bo
     field_name = f"{status_emoji} {icon} {label}"
     field_value = f"**{remaining:,}** / {limit:,} left ({used:,} used)\nResets <t:{reset_ts}:R>"
     return field_name, field_value, True
+
+
+def _asset_links(asset: discord.Asset) -> str:
+    """
+    Builds a row of markdown links to `asset` (an avatar/banner) at full
+    4096px size in every format Discord's CDN will actually serve it in --
+    static images get PNG/JPEG/WEBP, animated ones additionally get GIF so
+    the animation isn't lost. `asset.url` alone only gives one (Discord's
+    own auto-picked) format, which isn't enough when the point of the
+    command is letting someone grab the exact file type they want.
+    """
+    full_size = asset.with_size(4096)
+    formats = ["png", "jpg", "webp"]
+    if asset.is_animated():
+        formats.append("gif")
+    return " • ".join(f"[{fmt.upper()}]({full_size.with_format(fmt).url})" for fmt in formats)
 
 
 class Info(commands.Cog):
@@ -292,6 +308,61 @@ class Info(commands.Cog):
         embed.add_field(name="Total HWID Resets", value=str(user_data.get("totalHwidResets", 0)), inline=True)
 
         await interaction.followup.send(embed=embed, ephemeral=True)
+
+    @app_commands.command(name="avatar", description="Fetches a user's full-size avatar, server avatar, and banner.")
+    @app_commands.guilds(GUILD)
+    @app_commands.describe(user="The user to look up -- defaults to yourself")
+    @is_in_guild(config.GUILD_ID)
+    async def avatar(self, interaction: discord.Interaction, user: Optional[discord.Member] = None):
+        member = user or interaction.user
+        await interaction.response.defer(ephemeral=True)
+
+        # Member/cached-User objects never carry banner or accent_color --
+        # those aren't sent over the gateway, only returned by a live fetch
+        # -- so this is the one part of the command that has to hit
+        # Discord's API instead of reading straight off the cache.
+        try:
+            full_user = await interaction.client.fetch_user(member.id)
+        except discord.HTTPException as e:
+            return await send_error(interaction, f"Couldn't fetch {member.mention}'s profile: {e}")
+
+        accent_color = full_user.accent_color
+        embed_color = member.color if member.color.value else (accent_color or discord.Color.blurple())
+
+        avatar_embed = build_embed(title=f"🖼️ {member.display_name}'s Avatar", color=embed_color)
+
+        global_avatar = full_user.avatar
+        if global_avatar:
+            avatar_embed.set_image(url=global_avatar.with_size(4096).url)
+            avatar_embed.add_field(name="Global Avatar", value=_asset_links(global_avatar), inline=False)
+        else:
+            avatar_embed.description = "This user has no custom avatar set -- showing Discord's default."
+            avatar_embed.set_image(url=full_user.default_avatar.url)
+
+        # guild_avatar is only ever set on a Member (a per-server override),
+        # never on the plain User fetch_user() returns -- so this has to
+        # come from `member`, not `full_user`.
+        guild_avatar = member.guild_avatar
+        if guild_avatar:
+            avatar_embed.set_thumbnail(url=guild_avatar.with_size(4096).url)
+            avatar_embed.add_field(name="Server Avatar", value=_asset_links(guild_avatar), inline=False)
+
+        embeds = [avatar_embed]
+
+        if full_user.banner:
+            banner_embed = build_embed(
+                title=f"🎏 {member.display_name}'s Banner",
+                color=accent_color or embed_color,
+            )
+            banner_embed.set_image(url=full_user.banner.with_size(4096).url)
+            banner_embed.add_field(name="Banner", value=_asset_links(full_user.banner), inline=False)
+            embeds.append(banner_embed)
+        elif accent_color:
+            avatar_embed.add_field(name="Banner", value=f"No banner image -- accent color `#{accent_color.value:06X}`", inline=False)
+        else:
+            avatar_embed.add_field(name="Banner", value="No banner or accent color set.", inline=False)
+
+        await safe_respond(interaction, embeds=embeds, ephemeral=True)
 
     @app_commands.command(name="ratelimits", description="Shows this bot's GitHub PAT rate-limit usage across every API category.")
     @app_commands.guilds(GUILD)

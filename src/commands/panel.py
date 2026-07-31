@@ -1,6 +1,5 @@
 import io
 from datetime import datetime, timezone
-from typing import Optional
 
 import discord
 from discord import app_commands
@@ -9,6 +8,7 @@ from discord.ui import Modal, TextInput, Label, LayoutView, Container, TextDispl
 
 from api import config
 from api.discord_helpers import has_role, is_in_guild, send_success, send_error, build_embed, notify_user
+from api.alerts import send_alert
 from api.github import (
     GitHubAPIError, fetch_users_with_sha, commit_users,
     fetch_permitted_keys_with_sha, commit_permitted_keys, remove_permitted_key,
@@ -32,27 +32,6 @@ PANEL_GET_SCRIPT_ID = "panel_get_script"
 PANEL_GET_ROLE_ID = "panel_get_role"
 PANEL_RESET_HWID_ID = "panel_reset_hwid"
 PANEL_GET_INFO_ID = "panel_get_info"
-
-
-async def send_redeem_alert(bot: commands.Bot, embed: discord.Embed, view: Optional[View] = None):
-    """Best-effort delivery to the Redeem Alerts channel for the control
-    panel's Redeem Key flow (successful redemptions + HWID-breach attempts).
-    A missing channel or delivery failure here is logged and swallowed
-    rather than surfaced to the redeeming user -- their redemption already
-    succeeded or failed on its own, independent of whether staff got
-    notified about it."""
-    channel = bot.get_channel(config.REDEEM_ALERTS_CHANNEL_ID)
-    if not channel:
-        print(f"Redeem Alerts channel not found (REDEEM_ALERTS_CHANNEL_ID={config.REDEEM_ALERTS_CHANNEL_ID}).")
-        return
-
-    try:
-        if view is not None:
-            await channel.send(embed=embed, view=view)
-        else:
-            await channel.send(embed=embed)
-    except Exception as e:
-        print(f"Failed to send alert to Redeem Alerts channel: {e}")
 
 
 class HWIDBreachAlertView(View):
@@ -219,7 +198,7 @@ class RedeemKeyModal(Modal, title="Redeem Key"):
                 ],
                 timestamp=datetime.now(timezone.utc),
             )
-            await send_redeem_alert(interaction.client, breach_embed, HWIDBreachAlertView(owner_discord_id, owner_identifier, hwid, discord_id_str))
+            await send_alert(interaction.client, breach_embed, HWIDBreachAlertView(owner_discord_id, owner_identifier, hwid, discord_id_str))
 
             return await send_error(interaction, f"This HWID is already whitelisted under **{owner_identifier}**.")
 
@@ -249,7 +228,7 @@ class RedeemKeyModal(Modal, title="Redeem Key"):
             ],
             timestamp=datetime.now(timezone.utc),
         )
-        await send_redeem_alert(interaction.client, redeemed_embed)
+        await send_alert(interaction.client, redeemed_embed)
 
         success_fields = [
             ("Identifier", identifier, True),
@@ -341,7 +320,7 @@ class ResetHWIDModal(Modal, title="Reset HWID"):
                 ],
                 timestamp=datetime.now(timezone.utc),
             )
-            await send_redeem_alert(interaction.client, breach_embed, HWIDBreachAlertView(owner_discord_id, owner_identifier, hwid, discord_id_str))
+            await send_alert(interaction.client, breach_embed, HWIDBreachAlertView(owner_discord_id, owner_identifier, hwid, discord_id_str))
 
             return await send_error(interaction, f"This HWID is already whitelisted under **{owner_identifier}**.")
 
@@ -365,7 +344,7 @@ class ResetHWIDModal(Modal, title="Reset HWID"):
             ],
             timestamp=datetime.now(timezone.utc),
         )
-        await send_redeem_alert(interaction.client, reset_embed)
+        await send_alert(interaction.client, reset_embed)
 
         await send_success(
             interaction,

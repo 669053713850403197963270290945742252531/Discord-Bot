@@ -9,7 +9,14 @@ from discord import app_commands
 from discord.ext import commands
 
 from api import config
-from api.discord_helpers import has_role, is_in_guild, send_success, send_error, file_success_layout
+from api.discord_helpers import (
+    has_role, is_in_guild, send_success, send_error, file_success_layout, resolve_user_option,
+)
+from commands.whitelist import whitelisted_user_autocomplete
+from api.alerts import (
+    send_alert, alert_embed,
+    ALERT_COLOR_ADD, ALERT_COLOR_REMOVE, ALERT_COLOR_EDIT, ALERT_COLOR_TEMP, ALERT_COLOR_CAUTION,
+)
 from api.github import (
     GitHubAPIError, fetch_users_with_sha, commit_users,
     fetch_permitted_keys_with_sha, commit_permitted_keys,
@@ -47,7 +54,7 @@ _temp_whitelist_tasks: dict = {}
 # implementations (standalone so context_menus.py can call them directly)
 # =========================================================================
 
-def _schedule_temp_whitelist_expiry(guild: Optional[discord.Guild], user: discord.User, discord_id: str, expiration_time: datetime):
+def _schedule_temp_whitelist_expiry(bot: commands.Bot, guild: Optional[discord.Guild], user: discord.User, discord_id: str, expiration_time: datetime):
     """
     (Re)schedules the background task that DMs a "5 minutes left" warning
     and then removes `discord_id` from the whitelist at `expiration_time`.
@@ -89,6 +96,7 @@ def _schedule_temp_whitelist_expiry(guild: Optional[discord.Guild], user: discor
 
             try:
                 current_whitelist, current_sha = await fetch_users_with_sha()
+                removed_entry = find_user_by_discord_id(current_whitelist, discord_id)
                 current_whitelist, _ = remove_user_by_discord_id(current_whitelist, discord_id)
                 await commit_users(current_whitelist, current_sha, f"Temp whitelist expired: {user.name} ({discord_id})")
             except GitHubAPIError:
@@ -97,6 +105,13 @@ def _schedule_temp_whitelist_expiry(guild: Optional[discord.Guild], user: discor
             await revoke_buyer_role(guild, discord_id)
             _active_temp_whitelists.pop(discord_id, None)
             _temp_whitelist_tasks.pop(discord_id, None)
+
+            identifier = removed_entry.get("Identifier", user.name) if removed_entry else user.name
+            await send_alert(bot, alert_embed(
+                "⌛ Temp Whitelist Expired",
+                f"{user.mention} (**{identifier}**)'s temporary whitelist expired and was auto-removed.",
+                color=ALERT_COLOR_REMOVE,
+            ))
 
             try:
                 removed_embed = discord.Embed(
@@ -151,6 +166,14 @@ async def _tempwhitelist_impl(interaction: discord.Interaction, user: discord.Us
     except GitHubAPIError as e:
         return await send_error(interaction, str(e))
 
+    minute_label_alert = "minute" if minutes == 1 else "minutes"
+    await send_alert(interaction.client, alert_embed(
+        "⏳ Temp Whitelist Granted",
+        f"{interaction.user.mention} temporarily whitelisted {user.mention} for {minutes} {minute_label_alert}.",
+        color=ALERT_COLOR_TEMP,
+        fields=[("HWID", f"||`{hwid}`||", False), ("Expires", f"<t:{int(expiration_time.timestamp())}:F>", False)],
+    ))
+
     await send_success(
         interaction,
         f"Temporarily whitelisted {user.mention} for {minutes} minutes.",
@@ -177,7 +200,7 @@ async def _tempwhitelist_impl(interaction: discord.Interaction, user: discord.Us
     except Exception as e:
         print(f"Could not DM temp whitelist grant to {user}: {e}")
 
-    _schedule_temp_whitelist_expiry(interaction.guild, user, discord_id, expiration_time)
+    _schedule_temp_whitelist_expiry(interaction.client, interaction.guild, user, discord_id, expiration_time)
 
 
 async def _extend_impl(interaction: discord.Interaction, user: discord.User, minutes: int):
@@ -228,6 +251,13 @@ async def _extend_impl(interaction: discord.Interaction, user: discord.User, min
 
     minute_label = "minute" if minutes == 1 else "minutes"
 
+    await send_alert(interaction.client, alert_embed(
+        "⏲️ Temp Whitelist Extended",
+        f"{interaction.user.mention} extended {user.mention}'s (**{entry.get('Identifier', 'Unknown')}**) temporary whitelist by {minutes} {minute_label}.",
+        color=ALERT_COLOR_TEMP,
+        fields=[("New Expiry", f"<t:{int(new_expiration.timestamp())}:F>", False)],
+    ))
+
     await send_success(
         interaction,
         f"Extended {user.mention}'s temporary whitelist by {minutes} {minute_label}.",
@@ -258,7 +288,7 @@ async def _extend_impl(interaction: discord.Interaction, user: discord.User, min
     # and replaces it with one for the new one -- without this, the old
     # task would still remove the user right on schedule, undoing the
     # extension just written to Notes/GitHub above.
-    _schedule_temp_whitelist_expiry(interaction.guild, user, discord_id, new_expiration)
+    _schedule_temp_whitelist_expiry(interaction.client, interaction.guild, user, discord_id, new_expiration)
 
 
 async def _checktemp_impl(interaction: discord.Interaction, user: discord.User):
@@ -451,6 +481,13 @@ async def _forceresethwid_impl(interaction: discord.Interaction, user: discord.U
     except GitHubAPIError as e:
         return await send_error(interaction, str(e))
 
+    await send_alert(interaction.client, alert_embed(
+        "🛠️ HWID Force Reset",
+        f"{interaction.user.mention} force-reset {user.mention}'s (**{entry.get('Identifier', 'Unknown')}**) HWID via `/forceresethwid`.",
+        color=ALERT_COLOR_CAUTION,
+        fields=[("Old HWID", f"||`{old_hwid}`||", True), ("New HWID", f"||`{hwid}`||", True)],
+    ))
+
     # No DM to the target -- this just confirms the change to the moderator
     # who ran the command.
     await send_success(
@@ -490,6 +527,12 @@ async def _resethwidcooldown_impl(interaction: discord.Interaction, user: discor
         await commit_users(users, sha, f"Reset HWID cooldown for user: {entry.get('Identifier', discord_id_str)} ({discord_id_str})")
     except GitHubAPIError as e:
         return await send_error(interaction, str(e))
+
+    await send_alert(interaction.client, alert_embed(
+        "⏱️ HWID Cooldown Cleared",
+        f"{interaction.user.mention} cleared {user.mention}'s (**{entry.get('Identifier', 'Unknown')}**) HWID reset cooldown via `/resethwidcooldown`.",
+        color=ALERT_COLOR_EDIT,
+    ))
 
     await send_success(
         interaction,
@@ -548,6 +591,29 @@ class KeysHwid(commands.Cog):
                 )
             except GitHubAPIError as e:
                 return await send_error(interaction, str(e))
+
+        # Deliberately doesn't echo the actual key values here -- unlike the
+        # ephemeral response below, this posts to a shared staff channel,
+        # and there's no reason to widen a redeemable key's exposure beyond
+        # whoever ran the command. Amount/length/commit-status live in
+        # fields rather than the description line, matching this module's
+        # "one description line + a couple of essential fields" pattern.
+        await send_alert(interaction.client, alert_embed(
+            "🔐 Keys Generated",
+            f"{interaction.user.mention} generated key(s) via `/genkey`.",
+            color=ALERT_COLOR_ADD,
+            fields=[
+                ("Amount", str(len(new_keys)), True),
+                ("Length", f"{min_length}-{max_length}" if min_length != max_length else str(min_length), True),
+                (
+                    "Status",
+                    "✅ Committed to permittedKeys.txt -- redeemable now"
+                    if allow_redemption else
+                    "❌ Not committed -- not yet redeemable",
+                    False,
+                ),
+            ],
+        ))
 
         footer_text = (
             "Committed to permittedKeys.txt -- redeemable now via the control panel."
@@ -642,6 +708,13 @@ class KeysHwid(commands.Cog):
         except GitHubAPIError as e:
             return await send_error(interaction, str(e))
 
+        await send_alert(interaction.client, alert_embed(
+            "🧹 Keys Cleared",
+            f"{interaction.user.mention} cleared **{len(removed)}** key(s) from permittedKeys.txt via `/clearkeys`.",
+            color=ALERT_COLOR_REMOVE,
+            fields=[("Remaining", str(len(remaining)), True)],
+        ))
+
         fields = [
             ("Removed", str(len(removed)), True),
             ("Remaining", str(len(remaining)), True),
@@ -701,35 +774,51 @@ class KeysHwid(commands.Cog):
 
     @app_commands.command(name="checktemp", description="Checks a user's temporary whitelist status (via their Notes field) with a live countdown.")
     @app_commands.guilds(GUILD)
-    @app_commands.describe(user="Discord user to check")
+    @app_commands.describe(user="Discord user to check -- start typing an ID or name to search.")
+    @app_commands.autocomplete(user=whitelisted_user_autocomplete)
     @has_role(config.REQUIRED_ROLE_ID)
     @is_in_guild(config.GUILD_ID)
-    async def checktemp(self, interaction: discord.Interaction, user: discord.User):
-        await _checktemp_impl(interaction, user)
+    async def checktemp(self, interaction: discord.Interaction, user: str):
+        resolved = await resolve_user_option(interaction, user)
+        if resolved is None:
+            return
+        await _checktemp_impl(interaction, resolved)
 
     @app_commands.command(name="extend", description="Extends an existing temporary whitelist by x minutes, instead of re-running /tempwhitelist.")
     @app_commands.guilds(GUILD)
-    @app_commands.describe(user="Temporarily whitelisted user to extend", minutes="How many minutes to add to their current expiration")
+    @app_commands.describe(user="Temporarily whitelisted user to extend -- start typing an ID or name to search.", minutes="How many minutes to add to their current expiration")
+    @app_commands.autocomplete(user=whitelisted_user_autocomplete)
     @has_role(config.REQUIRED_ROLE_ID)
     @is_in_guild(config.GUILD_ID)
-    async def extend(self, interaction: discord.Interaction, user: discord.User, minutes: int):
-        await _extend_impl(interaction, user, minutes)
+    async def extend(self, interaction: discord.Interaction, user: str, minutes: int):
+        resolved = await resolve_user_option(interaction, user)
+        if resolved is None:
+            return
+        await _extend_impl(interaction, resolved, minutes)
 
     @app_commands.command(name="forceresethwid", description="Forcefully sets a whitelisted user's HWID, bypassing their reset cooldown.")
     @app_commands.guilds(GUILD)
-    @app_commands.describe(user="The whitelisted user whose HWID to force-reset.", hwid="The user's new HWID, pre-hashed in SHA-256 (64 hex characters).")
+    @app_commands.describe(user="The whitelisted user whose HWID to force-reset -- start typing an ID or name to search.", hwid="The user's new HWID, pre-hashed in SHA-256 (64 hex characters).")
+    @app_commands.autocomplete(user=whitelisted_user_autocomplete)
     @has_role(config.REQUIRED_ROLE_ID)
     @is_in_guild(config.GUILD_ID)
-    async def forceresethwid(self, interaction: discord.Interaction, user: discord.User, hwid: str):
-        await _forceresethwid_impl(interaction, user, hwid)
+    async def forceresethwid(self, interaction: discord.Interaction, user: str, hwid: str):
+        resolved = await resolve_user_option(interaction, user)
+        if resolved is None:
+            return
+        await _forceresethwid_impl(interaction, resolved, hwid)
 
     @app_commands.command(name="resethwidcooldown", description="Clears a user's HWID reset cooldown so they can reset their own HWID again immediately.")
     @app_commands.guilds(GUILD)
-    @app_commands.describe(user="The whitelisted user whose HWID reset cooldown to clear.")
+    @app_commands.describe(user="The whitelisted user whose HWID reset cooldown to clear -- start typing an ID or name to search.")
+    @app_commands.autocomplete(user=whitelisted_user_autocomplete)
     @has_role(config.REQUIRED_ROLE_ID)
     @is_in_guild(config.GUILD_ID)
-    async def resethwidcooldown(self, interaction: discord.Interaction, user: discord.User):
-        await _resethwidcooldown_impl(interaction, user)
+    async def resethwidcooldown(self, interaction: discord.Interaction, user: str):
+        resolved = await resolve_user_option(interaction, user)
+        if resolved is None:
+            return
+        await _resethwidcooldown_impl(interaction, resolved)
 
 
 async def setup(bot: commands.Bot):

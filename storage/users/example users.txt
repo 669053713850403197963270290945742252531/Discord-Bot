@@ -1,0 +1,46 @@
+Identifier: Corrade
+HWID: cff6443abb4db340a1771460b5ce2179ed40863087d844a506f346a0fa2cdb5b
+DiscordId: <@999776749070078004>
+Rank: Owner
+Notes: ts notes
+
+Identifier: CaptainEz
+HWID: cd0aa9856147b6c5b4ff2b7dfee5da20aa38253099ef1b4a64aced233c9afe29
+DiscordId: <@895500903799463976>
+Rank: User
+
+Identifier: Knit
+HWID: cbd3cfb9b9f51bbbfbf08759e243f5b3519cbf6ecc219ee95fe7c667e32c0a8d
+DiscordId: <@1058495565899505763>
+Rank: User
+Notes: test account
+
+Identifier: William
+HWID: 45d25abffe8c792d74d30346429b5bc244b815eeb378a9c38395f7a466cf6894
+DiscordId: <@339870406737395712>
+Rank: Head Honker
+Notes: Schedule I guy
+
+Identifier: FlameFrags
+HWID: 644b0cd43750d857207d03ba078dbb7b3929243cd1daf9ea44edde1e05bcdb7b
+DiscordId: 364436420414144512
+Rank: Special
+
+Identifier: Wemmbu
+HWID: 569c7f0b41ce9649602a0218cd02ed0b0a3d93130329451cc782b7dfda79ce71
+DiscordId: 1161658957513895946
+Rank: Special
+
+Identifier: Parrot
+HWID: a12f7f488a9e89dabe6c5640636fc3935e593ef720056f2d5cd37ff15b401cc8
+DiscordId: 400097639917420548
+Rank: Special
+
+Identifier: Spoke
+HWID: 876967b6b18b0b7019167863310937c582ac380cf4a4a8297117dbb00e79997d
+DiscordId: 349347610295009311
+Rank: Special
+
+Corrade: /rollback sha: a031ef81374fefd3fed2c5c8ee3453eaf24df170 
+All Users: /rollback sha: 4899b7be45a045f996f10f00fef0afbb0cc9e2a5
+Empty: /rollback sha: 0b43c8872231787219c87a7c40d901fc38cf2852

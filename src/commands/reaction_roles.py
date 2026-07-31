@@ -1,5 +1,6 @@
 import re
 from datetime import datetime
+from typing import Optional
 
 import discord
 from discord import app_commands
@@ -21,15 +22,81 @@ class ReactionRoles(commands.Cog):
         self.bot = bot
         self.reaction_roles_message_id = None
 
-    @app_commands.command(name="reactionrole", description="Creates a reaction role panel or applies a reaction role to an already existing panel.")
+    @app_commands.command(name="reactionrole", description="Creates/applies a reaction role on the panel, or removes an existing one.")
     @app_commands.guilds(GUILD)
-    @app_commands.describe(emoji="Emoji", role="Role to assign", note="What is the purpose of this role?")
+    @app_commands.describe(
+        emoji="Emoji",
+        action="Apply a new reaction role, or remove an existing one",
+        role="Role to assign (required for Apply -- optional for Remove if the emoji already identifies the entry)",
+        note="What is the purpose of this role? (Apply only)",
+    )
+    @app_commands.choices(action=[
+        app_commands.Choice(name="Apply", value="apply"),
+        app_commands.Choice(name="Remove", value="remove"),
+    ])
     @has_role(config.REQUIRED_ROLE_ID)
     @is_in_guild(config.GUILD_ID)
-    async def reactionrole(self, interaction: discord.Interaction, emoji: str, role: discord.Role, note: str = None):
+    async def reactionrole(
+        self,
+        interaction: discord.Interaction,
+        emoji: str,
+        action: app_commands.Choice[str],
+        role: Optional[discord.Role] = None,
+        note: Optional[str] = None,
+    ):
         await interaction.response.defer(ephemeral=True)
 
         channel = self.bot.get_channel(config.REACTION_ROLE_CHANNEL_ID)
+
+        if action.value == "remove":
+            if self.reaction_roles_message_id is None:
+                return await send_error(interaction, "There's no reaction role panel to remove from yet.")
+
+            try:
+                msg = await channel.fetch_message(self.reaction_roles_message_id)
+            except discord.NotFound:
+                self.reaction_roles_message_id = None
+                return await send_error(interaction, "The reaction role panel no longer exists.")
+
+            embed = msg.embeds[0] if msg.embeds else None
+            if not embed or not embed.description:
+                return await send_error(interaction, "There are no reaction roles configured to remove yet.")
+
+            lines = embed.description.split("\n")
+
+            # Match on whichever identifier was given -- the emoji, the role,
+            # or both. The first line to satisfy either wins.
+            target_index = None
+            for i, line in enumerate(lines):
+                if emoji and emoji in line:
+                    target_index = i
+                    break
+                if role and role.mention in line:
+                    target_index = i
+                    break
+
+            if target_index is None:
+                return await send_error(interaction, "Couldn't find a reaction role matching that emoji or role.")
+
+            removed_line = lines.pop(target_index)
+            removed_emoji = removed_line.split(" — ", 1)[0].strip()
+
+            embed.description = "\n".join(lines)
+            await msg.edit(embed=embed)
+
+            try:
+                await msg.clear_reaction(removed_emoji)
+            except discord.HTTPException:
+                # Bot may lack Manage Messages, or the reaction is already
+                # gone -- either way, the panel/embed removal above already
+                # took effect, so this is non-fatal.
+                pass
+
+            return await send_success(interaction, f"Removed reaction role: {removed_line}")
+
+        # action.value == "apply" -- usual reaction role application flow
+        if role is None:
+            return await send_error(interaction, "A role is required when applying a reaction role.")
 
         if self.reaction_roles_message_id is None:
             embed = discord.Embed(title="React to assign roles", description="", color=discord.Color.blurple())
