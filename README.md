@@ -3,14 +3,15 @@
 A Discord bot backed by a GitHub-hosted `Users` whitelist database, with
 key generation/redemption, HWID locking, moderation, reaction roles,
 password/passphrase and classic-cipher tools, modern authenticated
-encryption, string entropy analysis, and a persistent control panel.
-Originally a single ~4,100-line `main.py` + ~1,600-line `bot_api.py`,
-refactored into this package -- and extended since with newer commands
-(classic ciphers + Identify, `/entropy`, bulk `/genpass`, modern
-`/encrypt`/`/decrypt`, and more). 80 commands total today (65 slash
-commands + 15 user context menus) -- `start.py` logs the live count on
-every boot rather than this README (or any hardcoded constant in the code)
-needing to be hand-updated as commands are added or removed.
+encryption, string entropy analysis, a QR code generator, and a persistent
+control panel. Originally a single ~4,100-line `main.py` + ~1,600-line
+`bot_api.py`, refactored into this package -- and extended since with
+newer commands (classic ciphers + Identify, `/entropy`, bulk `/genpass`,
+modern `/encrypt`/`/decrypt`, `/qrcode`, and more). 83 commands total
+today (68 slash commands + 15 user context menus) -- `start.py` logs the
+live count on every boot rather than this README (or any hardcoded
+constant in the code) needing to be hand-updated as commands are added or
+removed.
 
 ## Layout
 
@@ -36,6 +37,7 @@ Discord-Bot/
 │   │   ├── data/                # bundled data for /genpass's Passphrase mode
 │   │   │   ├── README.md        # source/license note (CC BY 3.0, EFF) for the wordlist below
 │   │   │   └── eff_large_wordlist.txt  # EFF Long Wordlist (7,776 entries) for Diceware-style passphrases
+│   │   ├── qrcode_gen.py        # /qrcode generate's encoding + Pillow rendering (solid/rainbow, styles) & /qrcode decode's OpenCV scanning
 │   │   └── discord_helpers.py   # embeds, interaction responders, permission checks, shared Components V2 layouts
 │   └── commands/                # one cog per file -- each is a discord.py extension
 │       ├── __init__.py          # empty -- just makes this a package
@@ -46,11 +48,13 @@ Discord-Bot/
 │       ├── genpass.py           # /genpass -- password/passphrase generator, single or bulk (up to 10)
 │       ├── moderation.py        # /ban, /checkban, /unban, /kick, /mute, /unmute, /purge, /ghostping, /dm, /slowmode, /togglelock, /togglelockdown
 │       ├── whitelist.py         # /whitelist, /bulkwhitelist, /register, /editwhitelist, /edituser, /viewwhitelist, /fetchuser, /fetchdupes, /unwhitelist, /clearnotes, /clearregistrations, /checkregistration, /hwidhelp
-│       ├── keys_hwid.py         # /genkey, /getkeys, /clearkeys, /validatekey, /tempwhitelist, /checktemp, /extend, /forceresethwid, /resethwidcooldown
+│       ├── keys_hwid.py         # /key generate|validate|fetch|clear, /tempwhitelist, /checktemp, /extend, /forceresethwid, /resethwidcooldown
 │       ├── database.py          # /dbsearch, /export, /upload, /rollback, /commithistory, /fetchcommit, /verifydata
 │       ├── panel.py             # /createpanel, /updatescript + the persistent ControlPanelView
 │       ├── access.py            # /toggleaccess, /tempaccess, /togglealerts
 │       ├── reaction_roles.py    # /reactionrole
+│       ├── afk.py               # /afk (set/clear/mod clear/mod check subcommands) -- AFK status with ping/reply notifications
+│       ├── qrcode.py            # /qrcode (generate/decode/help subcommands) -- QR code generator + scanner
 │       └── context_menus.py     # the 15 right-click "user" context menu commands
 ├── storage/                      # permittedKeys.txt, storedscript.lua, test scripts for createpanel
 ├── .env.example
@@ -87,3 +91,42 @@ decrypt). AES and ChaCha20 are authenticated -- a wrong key or tampered
 ciphertext always fails cleanly rather than returning garbage. Blowfish and
 Triple DES are legacy 64-bit-block ciphers included for compatibility, not
 recommended for anything that needs to stay secret.
+
+## QR code generation
+
+`/qrcode generate` (`api/qrcode_gen.py`): remade from a standalone tkinter
+tool into a native command. Encodes text/a URL (up to 2,000 characters,
+auto-sized to the smallest QR version that fits) with a solid color or a
+diagonal rainbow gradient, an optional transparent background, a module
+`style` (square/rounded/dots -- the 3 corner finder patterns always stay
+solid squares regardless of style, since that's what a scanner locks onto
+first), and a selectable error-correction level (L/M/Q/H, auto-raised to Q
+for rainbow codes to help offset lower-contrast hues). `color` takes a hex
+code or CSS name with autocompleted presets; `/qrcode help` is a quick
+reference for all of it. Every render is validated up front (rejects a
+color too close to invisible against its background) and the result
+surfaces any scan-reliability caveats (rainbow, a light custom color, or a
+transparent background flattened to JPG) so whoever generates one knows to
+test-scan it.
+
+`/qrcode decode` (`api/qrcode_gen.py`): the reverse direction -- reads a
+QR code back out of an uploaded image via OpenCV. Tries a multi-code pass
+first (so more than one QR code in the same image all get read), falls
+back to a single-code pass for cases the multi-code detector alone misses
+(e.g. this bot's own `dots` style), and as a last resort retries both
+against an adaptive-threshold version of the image for low-contrast or
+unevenly-lit photos. A transparent background is composited onto white
+before scanning rather than naively dropped, since dropping it would
+otherwise turn every transparent pixel solid black -- indistinguishable
+from the code's own dark modules. The result lists every payload it
+managed to decode, and flags if any additional QR-shaped patterns were
+spotted but couldn't be read (damaged, obstructed, or too small).
+
+Alongside the raw decoded text, each result also gets a predicted-result
+field guessing what a phone's camera would actually *do* with that
+payload -- the same well-known QR "smart" content conventions camera apps
+special-case instead of showing raw text: a website link, a Wi-Fi network
+(SSID/security/password parsed out, password spoiler-tagged), a contact
+card (vCard/MECARD), a calendar event, a map location, an email/phone/SMS
+shortcut, an authenticator (2FA) setup link, or -- if nothing matches --
+plain text.

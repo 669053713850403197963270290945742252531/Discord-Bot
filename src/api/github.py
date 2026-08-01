@@ -381,7 +381,7 @@ def remove_permitted_keys(permitted_keys: List[str], keys_to_remove: List[str]) 
     """
     Returns (remaining_keys, actually_removed) after removing every exact
     match of anything in `keys_to_remove` from `permitted_keys`. Used by
-    /clearkeys' explicit-list mode; `actually_removed` only contains keys
+    /key clear's explicit-list mode; `actually_removed` only contains keys
     that were actually present, so the caller can report any requested key
     that wasn't found.
     """
@@ -394,7 +394,7 @@ def remove_permitted_keys(permitted_keys: List[str], keys_to_remove: List[str]) 
 def remove_first_n_permitted_keys(permitted_keys: List[str], n: int) -> Tuple[List[str], List[str]]:
     """
     Returns (remaining_keys, removed_keys) after removing the first `n`
-    entries from `permitted_keys` (file order). Used by /clearkeys' amount
+    entries from `permitted_keys` (file order). Used by /key clear's amount
     mode. `n` is clamped to len(permitted_keys) -- clearing more than exist
     just clears all of them.
     """

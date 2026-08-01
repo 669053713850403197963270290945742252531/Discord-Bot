@@ -31,7 +31,7 @@ from api.time_utils import (
 
 GUILD = discord.Object(id=config.GUILD_ID)
 
-# Caps /genkey's bulk `amount` option. Mainly guards against an oversized
+# Caps /key generate's bulk `amount` option. Mainly guards against an oversized
 # permittedKeys.txt commit and against blowing well past what the inline
 # embed / fallback file can reasonably display, not a security control.
 MAX_BULK_GENKEY_AMOUNT = 100
@@ -544,8 +544,21 @@ class KeysHwid(commands.Cog):
     def __init__(self, bot: commands.Bot):
         self.bot = bot
 
-    @app_commands.command(name="genkey", description="Generates one or more unique, random keys.")
-    @app_commands.guilds(GUILD)
+    # /genkey, /validatekey, /getkeys, and /clearkeys are now subcommands of
+    # a single /key group: /key generate, /key validate, /key fetch, /key
+    # clear. The guild restriction moves to the group itself -- per
+    # discord.py, a group's subcommands can't carry their own
+    # @app_commands.guilds(...) default, so decorating the group here makes
+    # every child inherit it. (Same pattern as /cipher in ciphers.py and
+    # /encode in utility.py.)
+    key_group = app_commands.guilds(GUILD)(
+        app_commands.Group(
+            name="key",
+            description="Generate, validate, fetch, and clear redemption keys.",
+        )
+    )
+
+    @key_group.command(name="generate", description="Generates one or more unique, random keys.")
     @app_commands.describe(
         amount="How many keys to generate",
         allow_redemption="Commit the generated keys to permittedKeys.txt so they're redeemable via the control panel",
@@ -553,7 +566,7 @@ class KeysHwid(commands.Cog):
     )
     @has_role(config.REQUIRED_ROLE_ID)
     @is_in_guild(config.GUILD_ID)
-    async def genkey(self, interaction: discord.Interaction, amount: int, allow_redemption: bool = False, length: Optional[str] = None):
+    async def key_generate(self, interaction: discord.Interaction, amount: int, allow_redemption: bool = False, length: Optional[str] = None):
         if amount > MAX_BULK_GENKEY_AMOUNT:
             return await send_error(interaction, f"`amount` can't exceed {MAX_BULK_GENKEY_AMOUNT} at once.")
 
@@ -600,7 +613,7 @@ class KeysHwid(commands.Cog):
         # "one description line + a couple of essential fields" pattern.
         await send_alert(interaction.client, alert_embed(
             "🔐 Keys Generated",
-            f"{interaction.user.mention} generated key(s) via `/genkey`.",
+            f"{interaction.user.mention} generated key(s) via `/key generate`.",
             color=ALERT_COLOR_ADD,
             fields=[
                 ("Amount", str(len(new_keys)), True),
@@ -637,11 +650,42 @@ class KeysHwid(commands.Cog):
             layout = file_success_layout(f"**{title}**\n{footer_text}", filename)
             await interaction.followup.send(view=layout, file=file, ephemeral=True)
 
-    @app_commands.command(name="getkeys", description="Displays every key currently available for redemption.")
-    @app_commands.guilds(GUILD)
+    @key_group.command(name="validate", description="Validates and returns the full information for a key including ownership.")
+    @app_commands.describe(key="Key to validate")
     @has_role(config.REQUIRED_ROLE_ID)
     @is_in_guild(config.GUILD_ID)
-    async def getkeys(self, interaction: discord.Interaction):
+    async def key_validate(self, interaction: discord.Interaction, key: str):
+        await interaction.response.defer(ephemeral=True)
+
+        try:
+            users, _sha = await fetch_users_with_sha()
+        except GitHubAPIError as e:
+            return await send_error(interaction, str(e))
+
+        entry = next((user for user in users if user.get("Key") == key), None)
+        if not entry:
+            return await send_error(interaction, "Invalid key. No match found.")
+
+        embed = discord.Embed(title="Valid Key", description=f"**The info for key:** ||`{key}`||", color=discord.Color.green())
+        embed.add_field(name="Identifier", value=entry.get("Identifier", "N/A"), inline=True)
+        embed.add_field(name="Rank", value=entry.get("Rank", "N/A"), inline=True)
+        embed.add_field(name="Join Date", value=format_discord_timestamp(entry.get("JoinDate", "Unknown")), inline=True)
+        embed.add_field(name="Discord ID", value=f"<@{entry.get('DiscordId')}>" if entry.get("DiscordId") else "N/A", inline=True)
+        embed.add_field(name="Last HWID Reset", value=format_discord_timestamp(entry.get("LastHwidReset")), inline=True)
+        embed.add_field(name="Total HWID Resets", value=str(entry.get("totalHwidResets", 0)), inline=True)
+        embed.add_field(name="Key", value=f"||`{entry.get('Key')}`||", inline=False)
+        embed.add_field(name="HWID", value=f"||`{entry.get('HWID')}`||", inline=False)
+
+        notes = entry.get("Notes")
+        if notes and notes != "false":
+            embed.add_field(name="Notes", value=notes, inline=False)
+
+        await interaction.followup.send(embed=embed, ephemeral=True)
+
+    @key_group.command(name="fetch", description="Displays every key currently available for redemption.")
+    @has_role(config.REQUIRED_ROLE_ID)
+    @is_in_guild(config.GUILD_ID)
+    async def key_fetch(self, interaction: discord.Interaction):
         await interaction.response.defer(ephemeral=True)
 
         try:
@@ -664,15 +708,14 @@ class KeysHwid(commands.Cog):
             layout = file_success_layout(f"**{title}**", filename)
             await interaction.followup.send(view=layout, file=file, ephemeral=True)
 
-    @app_commands.command(name="clearkeys", description="Removes keys from permittedKeys.txt -- provide a list of keys, or a number to clear, not both.")
-    @app_commands.guilds(GUILD)
+    @key_group.command(name="clear", description="Removes keys from permittedKeys.txt -- provide a list of keys, or a number to clear, not both.")
     @app_commands.describe(
         keys="Space/comma separated list of exact keys to remove",
         amount="Number of keys to remove (earliest entries first) -- use instead of `keys`, not with it",
     )
     @has_role(config.REQUIRED_ROLE_ID)
     @is_in_guild(config.GUILD_ID)
-    async def clearkeys(self, interaction: discord.Interaction, keys: Optional[str] = None, amount: Optional[int] = None):
+    async def key_clear(self, interaction: discord.Interaction, keys: Optional[str] = None, amount: Optional[int] = None):
         if keys is not None and amount is not None:
             return await send_error(interaction, "Provide either `keys` or `amount`, not both.")
         if keys is None and amount is None:
@@ -710,7 +753,7 @@ class KeysHwid(commands.Cog):
 
         await send_alert(interaction.client, alert_embed(
             "🧹 Keys Cleared",
-            f"{interaction.user.mention} cleared **{len(removed)}** key(s) from permittedKeys.txt via `/clearkeys`.",
+            f"{interaction.user.mention} cleared **{len(removed)}** key(s) from permittedKeys.txt via `/key clear`.",
             color=ALERT_COLOR_REMOVE,
             fields=[("Remaining", str(len(remaining)), True)],
         ))
@@ -731,38 +774,6 @@ class KeysHwid(commands.Cog):
             fields=fields,
         )
 
-    @app_commands.command(name="validatekey", description="Validates and returns the full information for a key including ownership.")
-    @app_commands.guilds(GUILD)
-    @app_commands.describe(key="Key to validate")
-    @has_role(config.REQUIRED_ROLE_ID)
-    @is_in_guild(config.GUILD_ID)
-    async def validatekey(self, interaction: discord.Interaction, key: str):
-        await interaction.response.defer(ephemeral=True)
-
-        try:
-            users, _sha = await fetch_users_with_sha()
-        except GitHubAPIError as e:
-            return await send_error(interaction, str(e))
-
-        entry = next((user for user in users if user.get("Key") == key), None)
-        if not entry:
-            return await send_error(interaction, "Invalid key. No match found.")
-
-        embed = discord.Embed(title="Valid Key", description=f"**The info for key:** ||`{key}`||", color=discord.Color.green())
-        embed.add_field(name="Identifier", value=entry.get("Identifier", "N/A"), inline=True)
-        embed.add_field(name="Rank", value=entry.get("Rank", "N/A"), inline=True)
-        embed.add_field(name="Join Date", value=format_discord_timestamp(entry.get("JoinDate", "Unknown")), inline=True)
-        embed.add_field(name="Discord ID", value=f"<@{entry.get('DiscordId')}>" if entry.get("DiscordId") else "N/A", inline=True)
-        embed.add_field(name="Last HWID Reset", value=format_discord_timestamp(entry.get("LastHwidReset")), inline=True)
-        embed.add_field(name="Total HWID Resets", value=str(entry.get("totalHwidResets", 0)), inline=True)
-        embed.add_field(name="Key", value=f"||`{entry.get('Key')}`||", inline=False)
-        embed.add_field(name="HWID", value=f"||`{entry.get('HWID')}`||", inline=False)
-
-        notes = entry.get("Notes")
-        if notes and notes != "false":
-            embed.add_field(name="Notes", value=notes, inline=False)
-
-        await interaction.followup.send(embed=embed, ephemeral=True)
 
     @app_commands.command(name="tempwhitelist", description="Temporarily whitelists a user for x minutes.")
     @app_commands.guilds(GUILD)

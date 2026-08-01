@@ -15,6 +15,7 @@ stays a manageable size:
     encoding.py         /encode encode and /encode decode's algorithms + Identify heuristic
     ciphers.py          /cipher encrypt and /cipher decrypt's classical cipher algorithms + Identify heuristic
     encryption.py       /encrypt and /decrypt's modern authenticated-encryption algorithms
+    qrcode_gen.py       /qrcode generate's encoding + Pillow rendering (solid/rainbow, styles)
     discord_helpers.py embeds, interaction responders, permission checks
     alerts.py           staff Alerts channel logging (send_alert/alert_embed)
 
@@ -79,6 +80,13 @@ from .ciphers import (
 )
 
 from .encryption import ENCRYPTION_ALGORITHMS, ENCRYPTION_CHOICES, encrypt_text, decrypt_text
+
+from .qrcode_gen import (
+    QROptions, QRResult, generate_qr, parse_color, swatch_emoji,
+    SCALE_MIN, SCALE_MAX, DEFAULT_SCALE, STYLES, DEFAULT_STYLE,
+    ERROR_CORRECTION_LEVELS, DEFAULT_ERROR_CORRECTION, RAINBOW_DEFAULT_ERROR_CORRECTION,
+    PRESET_COLORS, MAX_TEXT_LENGTH,
+)
 
 from .discord_helpers import (
     build_embed, success_embed, error_embed,

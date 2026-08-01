@@ -1,6 +1,6 @@
 import asyncio
 from datetime import datetime, timezone, timedelta
-from typing import Optional, Union
+from typing import List, Optional, Union
 
 import discord
 from discord import app_commands
@@ -8,9 +8,10 @@ from discord.ext import commands
 
 from api import config
 from api.discord_helpers import (
-    has_role, is_in_guild, can_moderate, notify_user,
+    has_role, is_in_guild, can_moderate, notify_user, build_embed,
     send_success, send_error, edit_or_send_error, error_embed, success_embed,
 )
+from api.alerts import send_alert, alert_embed, ALERT_COLOR_TEMP
 
 GUILD = discord.Object(id=config.GUILD_ID)
 
@@ -194,6 +195,116 @@ async def _unmute_impl(interaction: discord.Interaction, target: discord.Member,
         await notify_user(target, "unmuted", interaction.user, reason, interaction.guild.name)
     except discord.Forbidden:
         await send_error(interaction, "Missing permissions to remove roles.")
+
+
+# =========================================================================
+# /temprole -- generalizes access.py's /tempaccess (which only ever grants
+# the single, fixed Bot Access role) to any role at all.
+# =========================================================================
+
+# (member_id, role_id) pairs currently holding a role granted via
+# /temprole, so a second grant for the same member+role can be rejected
+# instead of stacking timers -- same convention as access.py's
+# _active_temp_access, just keyed on the role too since this isn't scoped
+# to one fixed role.
+_active_temp_roles: set = set()
+
+
+async def _remove_temp_role_after(interaction: discord.Interaction, target: discord.Member, role: discord.Role, minutes: int):
+    key = (target.id, role.id)
+    try:
+        await asyncio.sleep(minutes * 60)
+
+        # Fetch a fresh member since roles aren't always reflected on the
+        # cached object right away, and the member may have left and
+        # rejoined (or the role may have been removed manually) in the
+        # meantime.
+        guild = interaction.client.get_guild(target.guild.id)
+        fresh_member = guild.get_member(target.id) if guild else None
+        if fresh_member and role in fresh_member.roles:
+            try:
+                await fresh_member.remove_roles(role, reason="Temporary role expired")
+            except discord.Forbidden:
+                print(f"Missing permissions to remove expired temp role {role} from {fresh_member}")
+            else:
+                await send_alert(interaction.client, alert_embed(
+                    "⌛ Temp Role Expired",
+                    f"{target.mention}'s temporary {role.mention} role expired and was auto-removed.",
+                    color=discord.Color.red(),
+                ))
+                try:
+                    dm_embed = discord.Embed(
+                        title="Role Removed!",
+                        description=f"Your temporary role **{role.name}** in **{guild.name}** has expired and been removed.",
+                        color=discord.Color.red(),
+                        timestamp=datetime.now(timezone.utc),
+                    )
+                    await fresh_member.send(embed=dm_embed)
+                except discord.Forbidden:
+                    pass
+    except Exception as e:
+        print(f"Error removing temporary role {role} from {target}: {e}")
+    finally:
+        _active_temp_roles.discard(key)
+
+
+async def _temprole_impl(interaction: discord.Interaction, target: discord.Member, role: discord.Role, duration: int, reason: str = "No reason provided"):
+    await interaction.response.defer(ephemeral=True)
+
+    if duration <= 0:
+        return await send_error(interaction, "Duration must be a positive integer.")
+
+    if role in target.roles:
+        return await send_error(interaction, f"{target.mention} already has the {role.mention} role.")
+
+    key = (target.id, role.id)
+    if key in _active_temp_roles:
+        return await send_error(interaction, f"{target.mention} already has a temporary {role.mention} timer running.")
+
+    try:
+        await target.add_roles(role, reason=f"Temporary role ({duration}m) by {interaction.user} -- Reason: {reason}")
+    except discord.Forbidden:
+        return await send_error(interaction, f"Missing permissions to assign {role.mention} -- check that my top role sits above it.")
+    except discord.HTTPException as e:
+        return await send_error(interaction, f"Failed to assign role: {e}")
+
+    _active_temp_roles.add(key)
+
+    expiry = datetime.now(timezone.utc) + timedelta(minutes=duration)
+    timestamp = int(expiry.timestamp())
+    minute_label = "minute" if duration == 1 else "minutes"
+
+    await send_success(
+        interaction,
+        f"Gave {target.mention} the {role.mention} role for {duration} {minute_label}.",
+        fields=[
+            ("Reason", reason, False),
+            ("Expires", f"<t:{timestamp}:F>\n<t:{timestamp}:T> (<t:{timestamp}:R>)", False),
+        ],
+    )
+
+    await send_alert(interaction.client, alert_embed(
+        "⏳ Temp Role Granted",
+        f"{interaction.user.mention} granted {target.mention} the {role.mention} role for {duration} {minute_label} via `/temprole`.",
+        color=ALERT_COLOR_TEMP,
+        fields=[("Reason", reason, False)],
+    ))
+
+    try:
+        dm_embed = discord.Embed(
+            title="Role Added!",
+            description=f"You have been **granted** the role **{role.name}** in **{interaction.guild.name}** for {duration} {minute_label}.",
+            color=discord.Color.green(),
+            timestamp=datetime.now(timezone.utc),
+        )
+        dm_embed.add_field(name="Expires", value=f"<t:{timestamp}:F>", inline=False)
+        dm_embed.set_thumbnail(url=role.icon.url if role.icon else interaction.guild.icon.url if interaction.guild.icon else None)
+        dm_embed.set_footer(text="Temporary Role")
+        await target.send(embed=dm_embed)
+    except discord.Forbidden:
+        pass
+
+    interaction.client.loop.create_task(_remove_temp_role_after(interaction, target, role, duration))
 
 
 # =========================================================================
@@ -604,6 +715,158 @@ async def _togglelockdown_impl(
         _lockdown_duration_task = interaction.client.loop.create_task(_auto_unlockdown())
 
 
+# =========================================================================
+# /ghostping group -- /ghostping user (manually ping-then-delete someone)
+# and /ghostping toggle (flip passive ghost-ping-deletion detection on/off).
+#
+# Detection rides entirely on discord.py's own on_message_delete event,
+# which only fires for messages discord.py already had in its internal
+# message cache -- effectively "messages sent recently enough that the bot
+# was already running and saw them go by." That's exactly the population a
+# ghost ping cares about (a mention posted and deleted shortly after), so
+# there's no separate raw-event fallback for messages the bot never saw.
+#
+# Note that /purge's bulk deletions won't trigger this at all -- Discord
+# dispatches a single on_bulk_message_delete for those (which this module
+# intentionally doesn't hook), not one on_message_delete per message. Only
+# the rare fallback path for messages older than 14 days (deleted one at a
+# time) could still fire this listener during a purge.
+# =========================================================================
+
+GHOSTPING_MODE_NOTHING = "nothing"
+GHOSTPING_MODE_ANNOUNCED = "announced"
+
+# Runtime-only detection mode for /ghostping toggle. In-memory and
+# process-local -- deliberately not persisted anywhere (no file, no GitHub
+# commit), same tradeoff api.alerts._alerts_enabled makes for
+# /togglealerts -- so it resets to the default (Nothing) on every restart
+# instead of being a durable guild setting.
+_ghostping_mode = GHOSTPING_MODE_NOTHING
+
+
+async def _find_message_deleter(message: discord.Message) -> Optional[discord.abc.User]:
+    """
+    Best-effort identification of who deleted `message`, via the guild's
+    audit log.
+
+    Discord only writes a "Message Delete" audit log entry when someone
+    *other* than the message's own author deletes it (e.g. a moderator
+    using Manage Messages) -- an author deleting their own message leaves
+    no audit trail at all. So finding no matching entry here doesn't mean
+    the lookup failed; it's the expected, common case of a self-delete,
+    and callers should treat a None return that way.
+    """
+    guild = message.guild
+    if guild is None:
+        return None
+
+    me = guild.me
+    if me is None or not me.guild_permissions.view_audit_log:
+        return None
+
+    try:
+        async for entry in guild.audit_logs(limit=5, action=discord.AuditLogAction.message_delete):
+            # audit_logs() yields newest-first. Entries land a moment after
+            # the delete itself, so this doesn't wait around for one -- it
+            # just checks what's already there -- but a generous 10 second
+            # window guards against matching some earlier, unrelated
+            # deletion of the same author's messages in the same channel.
+            age = (datetime.now(timezone.utc) - entry.created_at).total_seconds()
+            if age > 10:
+                break
+            target_matches = entry.target and entry.target.id == message.author.id
+            channel = getattr(entry.extra, "channel", None)
+            channel_matches = channel and channel.id == message.channel.id
+            if target_matches and channel_matches:
+                return entry.user
+    except discord.Forbidden:
+        return None
+    except Exception as e:
+        print(f"Failed to check audit log for a deleted message: {e}")
+        return None
+
+    return None
+
+
+def _ghostping_announcement_embed(
+    *,
+    sender: discord.abc.User,
+    mentioned: List[str],
+    deleter: Optional[discord.abc.User],
+    content: Optional[str],
+) -> discord.Embed:
+    """Public callout embed for a detected ghost ping -- names who sent the
+    mention, what got mentioned, and who actually deleted it. Per the spec
+    this was built against, explicitly calls out whether that deleter is
+    the same person as the sender, since staff fixing another staffer's
+    announcement wording is a very different situation than someone
+    quietly deleting their own ping."""
+    same_person = deleter is None or deleter.id == sender.id
+    deleted_by_value = (
+        deleter.mention if deleter is not None
+        else f"{sender.mention} *(assumed -- no audit log entry found, so the sender likely deleted their own message)*"
+    )
+
+    fields = [
+        ("Ghost Pinged By", sender.mention, True),
+        ("Deleted By", deleted_by_value, True),
+        ("Same Person?", "✅ Yes" if same_person else "❌ No", False),
+        ("Mentioned", ", ".join(mentioned), False),
+    ]
+    if content:
+        trimmed = content if len(content) <= 500 else content[:497] + "..."
+        fields.append(("Original Message", trimmed, False))
+
+    return build_embed(
+        title="👻 Ghost Ping Detected",
+        color=discord.Color.orange(),
+        fields=fields,
+        timestamp=datetime.now(timezone.utc),
+    )
+
+
+async def _ghostping_user_impl(interaction: discord.Interaction, user: discord.User):
+    # channel.send() is used directly (rather than
+    # interaction.response.send_message() + interaction.original_response())
+    # since send() already hands back the created Message with its id
+    # populated -- no extra fetch needed just to get something to delete.
+    # Sending immediately followed by deleting keeps the mention live for
+    # exactly as long as these two HTTP round trips take.
+    try:
+        msg = await interaction.channel.send(
+            user.mention,
+            allowed_mentions=discord.AllowedMentions(users=True, everyone=False, roles=False),
+        )
+        await msg.delete()
+    except discord.Forbidden:
+        return await send_error(interaction, "Missing permissions to send or delete messages in this channel.")
+    except discord.HTTPException as e:
+        return await send_error(interaction, f"Failed to ghost ping: {e}")
+
+    await send_success(interaction, f"Ghost pinged {user.mention}.")
+
+
+async def _ghostping_toggle_impl(interaction: discord.Interaction):
+    """Flips between GHOSTPING_MODE_NOTHING and GHOSTPING_MODE_ANNOUNCED.
+    Process-local and resets to the Nothing default on every restart --
+    see _ghostping_mode above -- same convention as /togglealerts."""
+    global _ghostping_mode
+    _ghostping_mode = GHOSTPING_MODE_ANNOUNCED if _ghostping_mode == GHOSTPING_MODE_NOTHING else GHOSTPING_MODE_NOTHING
+
+    if _ghostping_mode == GHOSTPING_MODE_ANNOUNCED:
+        await send_success(
+            interaction,
+            "Ghost ping detection is now **Announced**. Deleting a message that mentions a user or role will "
+            "post a public callout in that channel naming the sender, what was mentioned, and whether the "
+            "sender also deleted it themselves.",
+        )
+    else:
+        await send_success(
+            interaction,
+            "Ghost ping detection is now **Nothing**. Deleted mentions will be ignored -- same as normal.",
+        )
+
+
 class Moderation(commands.Cog):
     def __init__(self, bot: commands.Bot):
         self.bot = bot
@@ -718,6 +981,26 @@ class Moderation(commands.Cog):
     async def unmute(self, interaction: discord.Interaction, target: discord.Member, reason: str = "No reason provided"):
         await _unmute_impl(interaction, target, reason)
 
+    @app_commands.command(name="temprole", description="Gives a member a role for a set amount of time, then auto-removes it.")
+    @app_commands.guilds(GUILD)
+    @app_commands.describe(
+        target="Member to give the role to",
+        role="Role to assign",
+        duration="How long to keep the role, in minutes",
+        reason="Reason for granting the role",
+    )
+    @has_role(config.REQUIRED_ROLE_ID)
+    @is_in_guild(config.GUILD_ID)
+    async def temprole(
+        self,
+        interaction: discord.Interaction,
+        target: discord.Member,
+        role: discord.Role,
+        duration: int,
+        reason: str = "No reason provided",
+    ):
+        await _temprole_impl(interaction, target, role, duration, reason)
+
     @app_commands.command(name="dm", description="Sends a direct message to a user.")
     @app_commands.guilds(GUILD)
     @app_commands.describe(target="User to direct message", message="Message to send")
@@ -740,30 +1023,65 @@ class Moderation(commands.Cog):
         except Exception as e:
             await send_error(interaction, f"Unexpected error: {e}")
 
-    @app_commands.command(name="ghostping", description="Sends a user's mention in this channel and deletes it immediately.")
-    @app_commands.guilds(GUILD)
+    # /ghostping user (manual ghost ping) and /ghostping toggle (passive
+    # detection mode) share a single guild-scoped group -- same pattern as
+    # afk.py's afk_group, so the guild restriction only needs to live once,
+    # here on the top-level group, for both subcommands to inherit it.
+    ghostping_group = app_commands.guilds(GUILD)(
+        app_commands.Group(
+            name="ghostping",
+            description="Ghost ping a user, or configure detection of deleted mentions.",
+        )
+    )
+
+    @ghostping_group.command(name="user", description="Sends a user's mention in this channel and deletes it immediately.")
     @app_commands.describe(user="User to ghost ping")
     @has_role(config.REQUIRED_ROLE_ID)
     @is_in_guild(config.GUILD_ID)
-    async def ghostping(self, interaction: discord.Interaction, user: discord.User):
-        # channel.send() is used directly (rather than
-        # interaction.response.send_message() + interaction.original_response())
-        # since send() already hands back the created Message with its id
-        # populated -- no extra fetch needed just to get something to delete.
-        # Sending immediately followed by deleting keeps the mention live for
-        # exactly as long as these two HTTP round trips take.
-        try:
-            msg = await interaction.channel.send(
-                user.mention,
-                allowed_mentions=discord.AllowedMentions(users=True, everyone=False, roles=False),
-            )
-            await msg.delete()
-        except discord.Forbidden:
-            return await send_error(interaction, "Missing permissions to send or delete messages in this channel.")
-        except discord.HTTPException as e:
-            return await send_error(interaction, f"Failed to ghost ping: {e}")
+    async def ghostping_user(self, interaction: discord.Interaction, user: discord.User):
+        await _ghostping_user_impl(interaction, user)
 
-        await send_success(interaction, f"Ghost pinged {user.mention}.")
+    @ghostping_group.command(name="toggle", description="Toggles whether a deleted mention gets publicly called out (Announced) or ignored (Nothing).")
+    @has_role(config.REQUIRED_ROLE_ID)
+    @is_in_guild(config.GUILD_ID)
+    async def ghostping_toggle(self, interaction: discord.Interaction):
+        await _ghostping_toggle_impl(interaction)
+
+    # =====================================================================
+    # Passive behavior: publicly calls out a deleted mention while
+    # /ghostping toggle is set to Announced. No-ops entirely while the mode
+    # is Nothing (the default), and only fires for messages discord.py had
+    # already cached -- see the module-level note above the /ghostping
+    # group for why that's the right population for this feature.
+    # =====================================================================
+
+    @commands.Cog.listener()
+    async def on_message_delete(self, message: discord.Message):
+        if _ghostping_mode != GHOSTPING_MODE_ANNOUNCED:
+            return
+        if message.author.bot or message.webhook_id is not None:
+            return
+        if not message.guild or message.guild.id != config.GUILD_ID:
+            return
+
+        mentioned = [user.mention for user in message.mentions] + [role.mention for role in message.role_mentions]
+        if not mentioned:
+            return
+
+        deleter = await _find_message_deleter(message)
+        embed = _ghostping_announcement_embed(
+            sender=message.author,
+            mentioned=mentioned,
+            deleter=deleter,
+            content=message.content,
+        )
+
+        try:
+            await message.channel.send(embed=embed)
+        except discord.Forbidden:
+            print(f"Missing permissions to post ghost ping callout in {getattr(message.channel, 'name', message.channel)}")
+        except Exception as e:
+            print(f"Failed to post ghost ping callout: {e}")
 
     @app_commands.command(name="slowmode", description="Sets slowmode for a channel (text, voice, stage, or forum).")
     @app_commands.guilds(GUILD)

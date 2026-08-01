@@ -22,81 +22,37 @@ class ReactionRoles(commands.Cog):
         self.bot = bot
         self.reaction_roles_message_id = None
 
-    @app_commands.command(name="reactionrole", description="Creates/applies a reaction role on the panel, or removes an existing one.")
-    @app_commands.guilds(GUILD)
-    @app_commands.describe(
-        emoji="Emoji",
-        action="Apply a new reaction role, or remove an existing one",
-        role="Role to assign (required for Apply -- optional for Remove if the emoji already identifies the entry)",
-        note="What is the purpose of this role? (Apply only)",
+    # /reactionrole add and /reactionrole remove live as subcommands under a
+    # single /reactionrole group (mirrors the /cipher group pattern in
+    # ciphers.py). The guild restriction moves to the group itself -- per
+    # discord.py, a group's subcommands can't carry their own
+    # @app_commands.guilds(...) default, so decorating the group here makes
+    # every child inherit it.
+    reactionrole_group = app_commands.guilds(GUILD)(
+        app_commands.Group(
+            name="reactionrole",
+            description="Manage reaction roles on the panel.",
+        )
     )
-    @app_commands.choices(action=[
-        app_commands.Choice(name="Apply", value="apply"),
-        app_commands.Choice(name="Remove", value="remove"),
-    ])
+
+    @reactionrole_group.command(name="add", description="Adds a new reaction role to the panel.")
+    @app_commands.describe(
+        emoji="Emoji members will react with",
+        role="Role to assign when a member reacts with this emoji",
+        note="What is the purpose of this role?",
+    )
     @has_role(config.REQUIRED_ROLE_ID)
     @is_in_guild(config.GUILD_ID)
-    async def reactionrole(
+    async def reactionrole_add(
         self,
         interaction: discord.Interaction,
         emoji: str,
-        action: app_commands.Choice[str],
-        role: Optional[discord.Role] = None,
+        role: discord.Role,
         note: Optional[str] = None,
     ):
         await interaction.response.defer(ephemeral=True)
 
         channel = self.bot.get_channel(config.REACTION_ROLE_CHANNEL_ID)
-
-        if action.value == "remove":
-            if self.reaction_roles_message_id is None:
-                return await send_error(interaction, "There's no reaction role panel to remove from yet.")
-
-            try:
-                msg = await channel.fetch_message(self.reaction_roles_message_id)
-            except discord.NotFound:
-                self.reaction_roles_message_id = None
-                return await send_error(interaction, "The reaction role panel no longer exists.")
-
-            embed = msg.embeds[0] if msg.embeds else None
-            if not embed or not embed.description:
-                return await send_error(interaction, "There are no reaction roles configured to remove yet.")
-
-            lines = embed.description.split("\n")
-
-            # Match on whichever identifier was given -- the emoji, the role,
-            # or both. The first line to satisfy either wins.
-            target_index = None
-            for i, line in enumerate(lines):
-                if emoji and emoji in line:
-                    target_index = i
-                    break
-                if role and role.mention in line:
-                    target_index = i
-                    break
-
-            if target_index is None:
-                return await send_error(interaction, "Couldn't find a reaction role matching that emoji or role.")
-
-            removed_line = lines.pop(target_index)
-            removed_emoji = removed_line.split(" — ", 1)[0].strip()
-
-            embed.description = "\n".join(lines)
-            await msg.edit(embed=embed)
-
-            try:
-                await msg.clear_reaction(removed_emoji)
-            except discord.HTTPException:
-                # Bot may lack Manage Messages, or the reaction is already
-                # gone -- either way, the panel/embed removal above already
-                # took effect, so this is non-fatal.
-                pass
-
-            return await send_success(interaction, f"Removed reaction role: {removed_line}")
-
-        # action.value == "apply" -- usual reaction role application flow
-        if role is None:
-            return await send_error(interaction, "A role is required when applying a reaction role.")
 
         if self.reaction_roles_message_id is None:
             embed = discord.Embed(title="React to assign roles", description="", color=discord.Color.blurple())
@@ -130,6 +86,71 @@ class ReactionRoles(commands.Cog):
         await msg.add_reaction(emoji)
 
         await send_success(interaction, f"Added reaction role: {emoji} for {role.mention}" + (f" — {note}" if note else ""))
+
+    @reactionrole_group.command(name="remove", description="Removes an existing reaction role from the panel.")
+    @app_commands.describe(
+        emoji="Emoji of the reaction role to remove",
+        role="Role of the reaction role to remove (optional if the emoji already identifies the entry)",
+    )
+    @has_role(config.REQUIRED_ROLE_ID)
+    @is_in_guild(config.GUILD_ID)
+    async def reactionrole_remove(
+        self,
+        interaction: discord.Interaction,
+        emoji: Optional[str] = None,
+        role: Optional[discord.Role] = None,
+    ):
+        await interaction.response.defer(ephemeral=True)
+
+        if emoji is None and role is None:
+            return await send_error(interaction, "Provide an emoji and/or a role to identify which reaction role to remove.")
+
+        channel = self.bot.get_channel(config.REACTION_ROLE_CHANNEL_ID)
+
+        if self.reaction_roles_message_id is None:
+            return await send_error(interaction, "There's no reaction role panel to remove from yet.")
+
+        try:
+            msg = await channel.fetch_message(self.reaction_roles_message_id)
+        except discord.NotFound:
+            self.reaction_roles_message_id = None
+            return await send_error(interaction, "The reaction role panel no longer exists.")
+
+        embed = msg.embeds[0] if msg.embeds else None
+        if not embed or not embed.description:
+            return await send_error(interaction, "There are no reaction roles configured to remove yet.")
+
+        lines = embed.description.split("\n")
+
+        # Match on whichever identifier was given -- the emoji, the role,
+        # or both. The first line to satisfy either wins.
+        target_index = None
+        for i, line in enumerate(lines):
+            if emoji and emoji in line:
+                target_index = i
+                break
+            if role and role.mention in line:
+                target_index = i
+                break
+
+        if target_index is None:
+            return await send_error(interaction, "Couldn't find a reaction role matching that emoji or role.")
+
+        removed_line = lines.pop(target_index)
+        removed_emoji = removed_line.split(" — ", 1)[0].strip()
+
+        embed.description = "\n".join(lines)
+        await msg.edit(embed=embed)
+
+        try:
+            await msg.clear_reaction(removed_emoji)
+        except discord.HTTPException:
+            # Bot may lack Manage Messages, or the reaction is already
+            # gone -- either way, the panel/embed removal above already
+            # took effect, so this is non-fatal.
+            pass
+
+        return await send_success(interaction, f"Removed reaction role: {removed_line}")
 
     @commands.Cog.listener()
     async def on_raw_reaction_add(self, payload: discord.RawReactionActionEvent):

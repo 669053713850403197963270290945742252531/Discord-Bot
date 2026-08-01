@@ -26,7 +26,7 @@ def generate_unique_keys(count: int, existing_keys: Set[str], min_length: int = 
     """
     Generates `count` keys, each guaranteed unique against `existing_keys`
     and against every other key generated in this same call. Used by
-    /genkey's bulk path -- `existing_keys` should be the union of every
+    /key generate's bulk path -- `existing_keys` should be the union of every
     whitelisted user's Key *and* every key currently sitting in
     permittedKeys.txt, so a freshly generated key can never collide with
     one that's already assigned or already pending redemption.
@@ -44,7 +44,7 @@ def generate_unique_keys(count: int, existing_keys: Set[str], min_length: int = 
 
 def parse_key_length_range(length_str: str) -> Tuple[int, int]:
     """
-    Parses a /genkey `length` option into a (min_length, max_length) pair
+    Parses a /key generate `length` option into a (min_length, max_length) pair
     for generate_key()/generate_unique_keys(). Accepts either a single
     number ("20", a fixed length) or a range ("5-10", inclusive on both
     ends) -- one option covers both instead of separate min/max options.
