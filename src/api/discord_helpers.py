@@ -321,7 +321,7 @@ def file_success_layout(description: str, filename: str) -> LayoutView:
     """Components V2 success confirmation with the attached file placed as an
     explicit component *after* the message text, so the confirmation always
     renders above the file rather than relying on Discord's default
-    attachment/embed ordering. Used by /export, /genkey, /getkeys, /rollback."""
+    attachment/embed ordering. Used by /export, /key generate, /key fetch, /rollback."""
     layout = LayoutView(timeout=None)
     layout.add_item(Container(
         TextDisplay("### ✅ Success"),

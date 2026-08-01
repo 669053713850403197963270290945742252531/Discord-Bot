@@ -47,9 +47,11 @@ from cryptography.hazmat.primitives import hashes, padding
 from cryptography.hazmat.primitives.asymmetric import ec, x25519
 from cryptography.hazmat.primitives.ciphers import Cipher, algorithms, modes
 try:
-    # Blowfish/TripleDES/CAST5/IDEA/RC2/ARC4 live here in newer `cryptography`
-    # releases and no longer emit a deprecation warning on import from this
-    # location.
+    # Blowfish/TripleDES/CAST5/IDEA/RC2/ARC4/Camellia live here in newer
+    # `cryptography` releases and no longer emit a deprecation warning on
+    # import from this location. Camellia was migrated later than the
+    # others, so it's looked up with getattr() below rather than assumed
+    # present -- see the comment at its usage site.
     from cryptography.hazmat.decrepit.ciphers import algorithms as decrepit_algorithms
 except ImportError:  # pragma: no cover -- older `cryptography` versions
     decrepit_algorithms = algorithms
@@ -201,7 +203,22 @@ def _make_cbc_pair(cipher_cls, key_len: int, block_bits: int, label: str) -> Tup
 
 _encrypt_blowfish, _decrypt_blowfish = _make_cbc_pair(decrepit_algorithms.Blowfish, 16, 64, "Blowfish")
 _encrypt_tripledes, _decrypt_tripledes = _make_cbc_pair(decrepit_algorithms.TripleDES, 24, 64, "Triple DES")
-_encrypt_camellia, _decrypt_camellia = _make_cbc_pair(algorithms.Camellia, 32, 128, "Camellia")
+# Camellia moved to the decrepit module in a later `cryptography` release
+# than Blowfish/TripleDES/etc did, so unlike those, it can't just be
+# assumed present on decrepit_algorithms -- getattr() falls back to the
+# (deprecated-in-newer-releases, but still present) primitives location
+# on any version where it hasn't moved yet.
+if hasattr(decrepit_algorithms, "Camellia"):
+    _camellia_cls = decrepit_algorithms.Camellia
+else:
+    # getattr(decrepit_algorithms, "Camellia", algorithms.Camellia) looks
+    # tempting here, but Python evaluates a default argument eagerly --
+    # that would touch algorithms.Camellia (and trip its deprecation
+    # warning) on every run, even on newer `cryptography` where it's
+    # never actually used. The explicit branch above only ever touches
+    # whichever location is actually going to be used.
+    _camellia_cls = algorithms.Camellia
+_encrypt_camellia, _decrypt_camellia = _make_cbc_pair(_camellia_cls, 32, 128, "Camellia")
 _encrypt_sm4, _decrypt_sm4 = _make_cbc_pair(algorithms.SM4, 16, 128, "SM4")
 _encrypt_seed, _decrypt_seed = _make_cbc_pair(algorithms.SEED, 16, 128, "SEED")
 _encrypt_cast5, _decrypt_cast5 = _make_cbc_pair(decrepit_algorithms.CAST5, 16, 64, "CAST5")

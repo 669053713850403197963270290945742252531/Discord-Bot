@@ -1,7 +1,7 @@
 """
 Entry point. Everything else in this package is a library (api/) or an
 extension (commands/); this is the only file that actually constructs the
-Client, wires the 13 extensions into it, and calls bot.run().
+Client, wires the 14 extensions into it, and calls bot.run().
 
 Run from the repo root with `python src/start.py` (after `pip install -r
 requirements.txt` and filling in `.env`).
@@ -65,13 +65,16 @@ EXTENSIONS = (
     "commands.ciphers",
     "commands.encryption",
     "commands.moderation",
+    "commands.afk",
     "commands.whitelist",
     "commands.keys_hwid",
     "commands.database",
     "commands.panel",
     "commands.access",
     "commands.reaction_roles",
+    "commands.autorole",
     "commands.context_menus",
+    "commands.qrcode",
 )
 
 
@@ -243,7 +246,7 @@ async def on_app_command_error(interaction: discord.Interaction, error: app_comm
     # (also error code 50035, Invalid Form Body) -- distinct from the
     # whole-embed 6000-character check above: this one fires when a single
     # field (an embed's description/title/a field value, or message content)
-    # individually exceeds its own limit, e.g. /getkeys or /genkey building
+    # individually exceeds its own limit, e.g. /key fetch or /key generate building
     # a keys list that's short enough to pass the "under 6000 total" check
     # but still blows past a single embed description's own 4096 cap. The
     # inline-vs-file fallbacks those commands use are meant to avoid this in
