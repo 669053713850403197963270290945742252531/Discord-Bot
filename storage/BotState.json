@@ -1,10 +1,19 @@
 {
   "schema_version": 1,
-  "last_updated": "2026-08-02T08:39:17Z",
+  "last_updated": "2026-08-02T10:09:45Z",
   "temp_bans": [],
   "lockdown": null,
   "channel_locks": [],
-  "temp_bot_access": [],
+  "temp_bot_access": [
+    {
+      "id": "ta_5a1626",
+      "discord_id": "1058495565899505763",
+      "granted_at": "2026-08-02T10:09:45Z",
+      "expires_at": "2026-08-02T10:10:45Z",
+      "granted_by_id": "999776749070078004",
+      "granted_by_tag": "corradeknight"
+    }
+  ],
   "pending_breach_alerts": [],
   "reaction_role_panel": null
 }
