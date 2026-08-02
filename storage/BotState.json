@@ -1,18 +1,7 @@
 {
   "schema_version": 1,
-  "last_updated": "2026-08-02T08:35:25Z",
-  "temp_bans": [
-    {
-      "id": "tb_d876a8",
-      "discord_id": "1058495565899505763",
-      "guild_id": "1263334150018961559",
-      "reason": "temp test",
-      "banned_at": "2026-08-02T08:35:24Z",
-      "unban_at": "2026-08-02T08:36:14Z",
-      "banned_by_id": "999776749070078004",
-      "banned_by_tag": "corradeknight"
-    }
-  ],
+  "last_updated": "2026-08-02T08:39:17Z",
+  "temp_bans": [],
   "lockdown": null,
   "channel_locks": [],
   "temp_bot_access": [],
