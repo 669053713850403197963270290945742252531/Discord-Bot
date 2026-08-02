@@ -1,5 +1,7 @@
 import io
+import re
 from datetime import datetime, timezone
+from typing import Optional
 
 import discord
 from discord import app_commands
@@ -15,10 +17,11 @@ from api.github import (
     fetch_stored_script, inject_script_key,
     fetch_stored_script_with_sha, commit_stored_script, validate_stored_script,
     get_cached_users,
+    fetch_botstate_with_sha, update_botstate, new_state_id,
 )
 from api.users import find_user_by_discord_id, find_user_by_hwid, find_user_by_key, build_user_entry, remove_user_by_discord_id, revoke_buyer_role
 from api.keys import is_valid_hwid
-from api.time_utils import format_join_date, humanize_timeleft, hwid_reset_cooldown_remaining
+from api.time_utils import format_join_date, format_iso, humanize_timeleft, hwid_reset_cooldown_remaining
 
 GUILD = discord.Object(id=config.GUILD_ID)
 
@@ -34,65 +37,163 @@ PANEL_RESET_HWID_ID = "panel_reset_hwid"
 PANEL_GET_INFO_ID = "panel_get_info"
 
 
-class HWIDBreachAlertView(View):
-    """Attached to the "Potential Breach" alert posted when a Redeem Key
-    attempt reuses an HWID that's already whitelisted under a different
-    Discord account. The button bans BOTH accounts involved -- the
-    attempting redeemer (for trying to use someone else's HWID) and the
-    existing owner of that HWID (presumed to have shared/leaked their
-    access) -- and unwhitelists the owner's Users.json entry. Only the
-    owner's entry gets removed since the attempting redeemer never
-    actually gets whitelisted in this scenario.
+async def _breach_ban_one(interaction: discord.Interaction, discord_id: str, reason: str) -> str:
+    """Bans a single Discord ID (member or not), DMs them a best-effort
+    notice, and returns a one-line result string for the summary. Free
+    function (rather than a method) so both a fresh HWIDBreachButton and
+    one reconstructed from a stored alert after a restart share the exact
+    same banning logic."""
+    try:
+        user = await interaction.client.fetch_user(int(discord_id))
+    except (discord.NotFound, ValueError):
+        user = None
 
-    Unlike ControlPanelView, this isn't re-registered on restart, so the
-    button only stays clickable until the next bot restart -- past that,
-    fall back to /unwhitelist + /ban manually using the IDs in the embed."""
+    if user:
+        try:
+            await notify_user(user, "banned", interaction.user, reason, interaction.guild.name)
+        except Exception as e:
+            print(f"Failed to DM {user}: {e}")
 
-    def __init__(self, owner_discord_id: str, owner_identifier: str, hwid: str, attempting_discord_id: str):
-        super().__init__(timeout=None)
+    try:
+        await interaction.guild.ban(discord.Object(id=int(discord_id)), reason=reason)
+    except discord.Forbidden:
+        return f"❌ Failed to ban `{discord_id}` (missing permissions)"
+    except discord.HTTPException as e:
+        return f"❌ Failed to ban `{discord_id}`: {e}"
+
+    return f"✅ Banned {user.mention if user else f'`{discord_id}`'}"
+
+
+async def _persist_breach_alert(alert_id: str, message: Optional[discord.Message], owner_discord_id: str, owner_identifier: str, hwid: str, attempting_discord_id: str):
+    """Records a freshly-posted breach alert in BotState.json's
+    "pending_breach_alerts" list, keyed by `alert_id` (the same id embedded
+    in the button's custom_id -- see HWIDBreachButton below). Best-effort:
+    logged rather than raised, since the alert itself has already been
+    posted either way -- a failure here just means the button would show a
+    "couldn't find this alert's data" error if clicked after a restart,
+    same as if it were never persisted at all."""
+    if message is None:
+        return
+    entry = {
+        "id": alert_id,
+        "message_id": str(message.id),
+        "channel_id": str(message.channel.id),
+        "created_at": format_iso(datetime.now(timezone.utc)),
+        "owner_discord_id": owner_discord_id,
+        "owner_identifier": owner_identifier,
+        "hwid": hwid,
+        "attempting_discord_id": attempting_discord_id,
+    }
+    try:
+        def _mutate(state, entry=entry):
+            state.setdefault("pending_breach_alerts", []).append(entry)
+            return state
+        await update_botstate(_mutate, f"Breach alert recorded: {owner_identifier}")
+    except GitHubAPIError as e:
+        print(f"Failed to persist breach alert for {owner_identifier} to BotState.json: {e}")
+
+
+async def _clear_breach_alert_state(alert_id: str):
+    """Removes a resolved breach alert from BotState.json. Best-effort --
+    logged rather than raised, since the Discord-side unwhitelist/ban has
+    already happened by the time this runs."""
+    def _mutate(state):
+        state["pending_breach_alerts"] = [e for e in state.get("pending_breach_alerts", []) if e.get("id") != alert_id]
+        return state
+    try:
+        await update_botstate(_mutate, f"Breach alert resolved: {alert_id}")
+    except GitHubAPIError as e:
+        print(f"Failed to clear resolved breach alert {alert_id} from BotState.json: {e}")
+
+
+class HWIDBreachButton(discord.ui.DynamicItem[Button], template=r"breach_unwhitelist_ban:(?P<alert_id>[a-zA-Z0-9_]+)"):
+    """The "❌ Unwhitelist & Ban Both" button on a "Potential Breach" alert,
+    posted when a Redeem Key / Reset HWID attempt reuses an HWID that's
+    already whitelisted under a different Discord account. The button bans
+    BOTH accounts involved -- the attempting user (for trying to use
+    someone else's HWID) and the existing owner of that HWID (presumed to
+    have shared/leaked their access) -- and unwhitelists the owner's
+    Users.json entry.
+
+    A discord.ui.DynamicItem rather than a plain Button on a plain View,
+    so it keeps responding across a bot restart the same way
+    ControlPanelView's fixed-custom_id buttons do (see
+    bot.add_dynamic_items() in start.py's setup_hook). Unlike
+    ControlPanelView, this button carries real per-alert data -- which is
+    exactly why a *fixed* custom_id (shared by every breach alert) wasn't
+    an option: Discord routes purely on custom_id, so two different
+    pending alerts would collide on the same id with no way to tell them
+    apart. Instead, the alert's own BotState.json entry id rides inside the
+    custom_id (`breach_unwhitelist_ban:<alert_id>`), and from_custom_id()
+    below looks the rest of the data up from there at dispatch time --
+    which works identically whether that dispatch happens two seconds or
+    two weeks (and a restart) after the alert was posted."""
+
+    def __init__(
+        self,
+        alert_id: str,
+        owner_discord_id: Optional[str],
+        owner_identifier: Optional[str],
+        hwid: Optional[str],
+        attempting_discord_id: Optional[str],
+    ):
+        super().__init__(
+            Button(
+                label="❌ Unwhitelist & Ban Both",
+                style=discord.ButtonStyle.danger,
+                custom_id=f"breach_unwhitelist_ban:{alert_id}",
+            )
+        )
+        self.alert_id = alert_id
         self.owner_discord_id = owner_discord_id
         self.owner_identifier = owner_identifier
         self.hwid = hwid
         self.attempting_discord_id = attempting_discord_id
 
-        button = Button(label="❌ Unwhitelist & Ban Both", style=discord.ButtonStyle.danger, custom_id="breach_unwhitelist_ban")
-        button.callback = self.unwhitelist_and_ban
-        self.add_item(button)
-
-    async def _ban(self, interaction: discord.Interaction, discord_id: str, reason: str) -> str:
-        """Bans a single Discord ID (member or not), DMs them a best-effort
-        notice, and returns a one-line result string for the summary."""
+    @classmethod
+    async def from_custom_id(cls, interaction: discord.Interaction, item: Button, match: "re.Match[str]", /):
+        alert_id = match["alert_id"]
         try:
-            user = await interaction.client.fetch_user(int(discord_id))
-        except (discord.NotFound, ValueError):
-            user = None
+            state, _sha = await fetch_botstate_with_sha()
+        except GitHubAPIError as e:
+            print(f"Failed to fetch BotState.json to reconstruct breach alert {alert_id}: {e}")
+            state = {}
 
-        if user:
-            try:
-                await notify_user(user, "banned", interaction.user, reason, interaction.guild.name)
-            except Exception as e:
-                print(f"Failed to DM {user}: {e}")
+        entry = next((e for e in state.get("pending_breach_alerts", []) if e.get("id") == alert_id), None)
+        if entry is None:
+            # Already resolved (double-click racing another moderator), or
+            # its BotState entry was otherwise lost -- reconstruct a stub
+            # whose callback explains that instead of the interaction just
+            # failing outright.
+            return cls(alert_id, None, None, None, None)
 
-        try:
-            await interaction.guild.ban(discord.Object(id=int(discord_id)), reason=reason)
-        except discord.Forbidden:
-            return f"❌ Failed to ban `{discord_id}` (missing permissions)"
-        except discord.HTTPException as e:
-            return f"❌ Failed to ban `{discord_id}`: {e}"
+        return cls(
+            alert_id,
+            entry.get("owner_discord_id"),
+            entry.get("owner_identifier"),
+            entry.get("hwid"),
+            entry.get("attempting_discord_id"),
+        )
 
-        return f"✅ Banned {user.mention if user else f'`{discord_id}`'}"
-
-    async def unwhitelist_and_ban(self, interaction: discord.Interaction):
+    async def callback(self, interaction: discord.Interaction):
         if config.REQUIRED_ROLE_ID not in [role.id for role in interaction.user.roles]:
             return await send_error(interaction, "You do not have the required permissions to do this.")
+
+        if self.owner_discord_id is None:
+            return await send_error(
+                interaction,
+                "This alert's data could not be found -- it may have already been resolved by someone "
+                "else, or its record was lost. Use `/unwhitelist` + `/ban` manually with the IDs shown "
+                "in the embed above.",
+            )
 
         await interaction.response.defer(ephemeral=True)
 
         results = []
 
-        # Unwhitelist the owner's entry -- the attempting redeemer never had
+        # Unwhitelist the owner's entry -- the attempting user never had
         # one to begin with, since the duplicate-HWID check blocks the
-        # redemption before it's committed.
+        # redemption/reset before it's committed.
         try:
             users, sha = await fetch_users_with_sha()
             filtered, removed = remove_user_by_discord_id(users, self.owner_discord_id)
@@ -108,25 +209,38 @@ class HWIDBreachAlertView(View):
         owner_reason = f"HWID breach -- HWID shared/leaked, actioned by {interaction.user}"
         attempting_reason = f"HWID breach -- attempted redemption using another user's HWID, actioned by {interaction.user}"
 
-        results.append(await self._ban(interaction, self.owner_discord_id, owner_reason))
+        results.append(await _breach_ban_one(interaction, self.owner_discord_id, owner_reason))
         if self.attempting_discord_id != self.owner_discord_id:
-            results.append(await self._ban(interaction, self.attempting_discord_id, attempting_reason))
+            results.append(await _breach_ban_one(interaction, self.attempting_discord_id, attempting_reason))
 
         # Mark the alert as handled so it can't be actioned twice, and
         # record who resolved it directly on the original embed.
-        for item in self.children:
-            item.disabled = True
-        self.children[0].label = "Resolved"
+        self.item.disabled = True
+        self.item.label = "Resolved"
 
         try:
             resolved_embed = interaction.message.embeds[0]
             resolved_embed.color = discord.Color.dark_grey()
             resolved_embed.add_field(name="Resolved By", value=f"{interaction.user.mention} (`{interaction.user.id}`)", inline=False)
-            await interaction.message.edit(embed=resolved_embed, view=self)
+            await interaction.message.edit(embed=resolved_embed, view=self.view)
         except Exception as e:
             print(f"Failed to update breach alert message: {e}")
 
+        await _clear_breach_alert_state(self.alert_id)
+
         await send_success(interaction, "\n".join(results), title="Breach Action Complete")
+
+
+class HWIDBreachAlertView(View):
+    """Thin wrapper around a single HWIDBreachButton, used when *freshly*
+    posting a breach alert (RedeemKeyModal/ResetHWIDModal below). Once
+    posted, the button itself is what keeps working across a restart (see
+    HWIDBreachButton's docstring) -- this View is just how discord.py wants
+    a component attached to an outgoing message in the first place."""
+
+    def __init__(self, alert_id: str, owner_discord_id: str, owner_identifier: str, hwid: str, attempting_discord_id: str):
+        super().__init__(timeout=None)
+        self.add_item(HWIDBreachButton(alert_id, owner_discord_id, owner_identifier, hwid, attempting_discord_id))
 
 
 class RedeemKeyModal(Modal, title="Redeem Key"):
@@ -198,7 +312,12 @@ class RedeemKeyModal(Modal, title="Redeem Key"):
                 ],
                 timestamp=datetime.now(timezone.utc),
             )
-            await send_alert(interaction.client, breach_embed, HWIDBreachAlertView(owner_discord_id, owner_identifier, hwid, discord_id_str))
+            alert_id = new_state_id("ba")
+            alert_message = await send_alert(
+                interaction.client, breach_embed,
+                HWIDBreachAlertView(alert_id, owner_discord_id, owner_identifier, hwid, discord_id_str),
+            )
+            await _persist_breach_alert(alert_id, alert_message, owner_discord_id, owner_identifier, hwid, discord_id_str)
 
             return await send_error(interaction, f"This HWID is already whitelisted under **{owner_identifier}**.")
 
@@ -320,7 +439,12 @@ class ResetHWIDModal(Modal, title="Reset HWID"):
                 ],
                 timestamp=datetime.now(timezone.utc),
             )
-            await send_alert(interaction.client, breach_embed, HWIDBreachAlertView(owner_discord_id, owner_identifier, hwid, discord_id_str))
+            alert_id = new_state_id("ba")
+            alert_message = await send_alert(
+                interaction.client, breach_embed,
+                HWIDBreachAlertView(alert_id, owner_discord_id, owner_identifier, hwid, discord_id_str),
+            )
+            await _persist_breach_alert(alert_id, alert_message, owner_discord_id, owner_identifier, hwid, discord_id_str)
 
             return await send_error(interaction, f"This HWID is already whitelisted under **{owner_identifier}**.")
 

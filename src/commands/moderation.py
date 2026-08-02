@@ -1,6 +1,6 @@
 import asyncio
 from datetime import datetime, timezone, timedelta
-from typing import List, Optional, Union
+from typing import Any, Dict, List, Optional, Union
 
 import discord
 from discord import app_commands
@@ -11,7 +11,9 @@ from api.discord_helpers import (
     has_role, is_in_guild, can_moderate, notify_user, build_embed,
     send_success, send_error, edit_or_send_error, error_embed, success_embed,
 )
-from api.alerts import send_alert, alert_embed, ALERT_COLOR_TEMP
+from api.alerts import send_alert, alert_embed, ALERT_COLOR_TEMP, ALERT_COLOR_REMOVE, ALERT_COLOR_CAUTION
+from api.github import GitHubAPIError, fetch_botstate_with_sha, update_botstate, new_state_id
+from api.time_utils import format_iso, parse_iso, seconds_until
 
 GUILD = discord.Object(id=config.GUILD_ID)
 
@@ -21,11 +23,139 @@ GUILD = discord.Object(id=config.GUILD_ID)
 # directly, without needing a bound cog instance)
 # =========================================================================
 
+# =========================================================================
+# /ban's temp-ban duration -- persisted to BotState.json's "temp_bans" list
+# so a restart before the countdown fires reschedules the auto-unban
+# instead of the "temp" ban silently becoming permanent forever. Keyed by a
+# short random id (see api.github.new_state_id) rather than discord_id
+# alone, since -- unlike temp whitelist/temp access -- nothing stops the
+# same user from theoretically being temp-banned again after an earlier
+# temp ban already resolved.
+# =========================================================================
+
+# Running unban tasks, keyed by the BotState entry's id -- lets a manual
+# /unban cancel a still-pending auto-unban instead of leaving it to fire
+# harmlessly-but-uselessly against an already-unbanned user later.
+_temp_ban_tasks: dict = {}
+
+
+async def _clear_temp_ban_state(entry_id: str):
+    """Removes a resolved (fired or manually reversed) temp ban entry from
+    BotState.json. Best-effort -- logged rather than raised, since the
+    Discord-side ban/unban has already happened by the time this runs."""
+    def _mutate(state):
+        state["temp_bans"] = [e for e in state.get("temp_bans", []) if e.get("id") != entry_id]
+        return state
+    try:
+        await update_botstate(_mutate, f"Temp ban resolved: {entry_id}")
+    except GitHubAPIError as e:
+        print(f"Failed to clear resolved temp ban {entry_id} from BotState.json: {e}")
+
+
+async def _run_temp_ban_unban(bot: commands.Bot, entry: dict):
+    """Sleeps until `entry`'s unban_at (or fires almost immediately if
+    that's already in the past -- e.g. the bot was down past it), then
+    unbans and clears the BotState entry. Shared by both a fresh /ban
+    duration grant and startup reconciliation, so there's exactly one code
+    path for "what happens when a temp ban's timer goes off.\""""
+    entry_id = entry["id"]
+    try:
+        await asyncio.sleep(seconds_until(parse_iso(entry.get("unban_at"))))
+
+        guild = bot.get_guild(int(entry["guild_id"]))
+        if guild is None:
+            print(f"Could not find guild {entry['guild_id']} to auto-unban temp ban {entry_id}.")
+        else:
+            try:
+                await guild.unban(discord.Object(id=int(entry["discord_id"])), reason="Temporary ban expired")
+            except discord.NotFound:
+                pass  # Already unbanned (manually, or by a duplicate timer) -- nothing left to do.
+            except Exception as e:
+                print(f"Failed to auto-unban {entry['discord_id']} in guild {entry['guild_id']} (temp ban {entry_id}): {e}")
+    except asyncio.CancelledError:
+        raise
+    finally:
+        _temp_ban_tasks.pop(entry_id, None)
+        await _clear_temp_ban_state(entry_id)
+
+
+def _schedule_temp_ban(bot: commands.Bot, entry: dict):
+    """(Re)schedules the auto-unban task for `entry`. Cancels whatever task
+    was already tracked for this entry id first (shouldn't normally happen
+    -- each entry only gets scheduled once, at grant time or at startup --
+    but keeps this safe to call more than once for the same entry)."""
+    entry_id = entry["id"]
+    existing = _temp_ban_tasks.get(entry_id)
+    if existing and not existing.done():
+        existing.cancel()
+    _temp_ban_tasks[entry_id] = bot.loop.create_task(_run_temp_ban_unban(bot, entry))
+
+
+async def _cancel_temp_ban_for(discord_id, guild_id) -> bool:
+    """Cancels and clears any pending temp-ban auto-unban entry for
+    `discord_id` in `guild_id` -- called from /unban so a manual early
+    unban doesn't leave a stale (harmless, but confusing) BotState entry
+    and in-memory task sitting around until its original timer fires.
+    Returns True if an entry was found and cleared."""
+    try:
+        state, _sha = await fetch_botstate_with_sha()
+    except GitHubAPIError as e:
+        print(f"Failed to fetch BotState.json while checking for a temp ban to cancel: {e}")
+        return False
+
+    match = next(
+        (e for e in state.get("temp_bans", []) if e.get("discord_id") == str(discord_id) and e.get("guild_id") == str(guild_id)),
+        None,
+    )
+    if not match:
+        return False
+
+    task = _temp_ban_tasks.pop(match["id"], None)
+    if task:
+        task.cancel()
+    await _clear_temp_ban_state(match["id"])
+    return True
+
+
+async def reconcile_temp_bans(bot: commands.Bot, state: Optional[Dict[str, Any]] = None):
+    """Called once from on_ready: re-schedules every temp ban's auto-unban
+    timer using the durable unban_at recorded in BotState.json, so a
+    restart before the original timer fired no longer leaves a "temp" ban
+    permanent. Entries whose unban_at has already passed fire (almost)
+    immediately via seconds_until()'s clamp-to-zero, rather than staying
+    banned indefinitely until someone notices.
+
+    `state` lets a caller that's already fetched BotState.json (e.g.
+    start.py's on_ready, reconciling several categories back to back) hand
+    it over directly instead of this making its own redundant fetch of the
+    exact same file. Falls back to fetching it itself when called on its
+    own with nothing passed in."""
+    if state is None:
+        try:
+            state, _sha = await fetch_botstate_with_sha()
+        except GitHubAPIError as e:
+            print(f"Failed to fetch BotState.json for temp ban reconciliation: {e}")
+            return
+
+    entries = state.get("temp_bans", [])
+    for entry in entries:
+        _schedule_temp_ban(bot, entry)
+
+    if entries:
+        print(f"Reconciled {len(entries)} temp ban(s) from BotState.json.")
+
+
 async def _ban_impl(interaction: discord.Interaction, target: discord.User, reason: str = "None", duration: int = None, preserve_messages: bool = True):
     try:
         await interaction.response.send_message(f"Processing ban for {target.mention}...", ephemeral=True)
 
         member = interaction.guild.get_member(target.id)
+
+        # Computed once up front (rather than inside the `if member:` DM
+        # block below) so the same value backs the DM, the summary embed,
+        # and the BotState.json entry persisted further down -- regardless
+        # of whether `target` is a current member.
+        unban_time = datetime.now(timezone.utc) + timedelta(minutes=duration) if duration else None
 
         # Only run moderation checks and message deletion for members
         if member:
@@ -35,7 +165,6 @@ async def _ban_impl(interaction: discord.Interaction, target: discord.User, reas
                 embed = discord.Embed(title=f"You have been banned from {interaction.guild.name}", description=f"**Reason:** {reason}", color=discord.Color.red(), timestamp=datetime.now(timezone.utc))
 
                 if duration:
-                    unban_time = datetime.now(timezone.utc) + timedelta(minutes=duration)
                     timestamp = int(unban_time.timestamp())
                     minute_label = "minute" if duration == 1 else "minutes"
 
@@ -80,14 +209,40 @@ async def _ban_impl(interaction: discord.Interaction, target: discord.User, reas
         await interaction.edit_original_response(content=None, embed=summary_embed)
 
         if duration:
-            async def unban_later():
-                await asyncio.sleep(duration * 60)
-                try:
-                    await interaction.guild.unban(target, reason="Temporary ban expired")
-                except Exception as e:
-                    print(f"Failed to unban {target}: {e}")
+            entry = {
+                "id": new_state_id("tb"),
+                "discord_id": str(target.id),
+                "guild_id": str(interaction.guild.id),
+                "reason": reason,
+                "banned_at": format_iso(datetime.now(timezone.utc)),
+                "unban_at": format_iso(unban_time),
+                "banned_by_id": str(interaction.user.id),
+                "banned_by_tag": str(interaction.user),
+            }
+            try:
+                def _mutate(state, entry=entry):
+                    state.setdefault("temp_bans", []).append(entry)
+                    return state
+                await update_botstate(_mutate, f"Temp ban recorded: {target} ({target.id})")
+            except GitHubAPIError as e:
+                # The ban itself already succeeded (guild.ban() above) --
+                # this only means the auto-unban timer won't survive a
+                # restart until BotState.json can be reached again. Still
+                # schedule the in-memory task below so this process's own
+                # timer works regardless, and flag it to staff since a
+                # "temp" ban silently becoming permanent on the next
+                # restart is exactly the failure mode this persistence
+                # exists to prevent.
+                print(f"Failed to persist temp ban for {target} to BotState.json: {e}")
+                await send_alert(interaction.client, alert_embed(
+                    "⚠️ Temp Ban Not Persisted",
+                    f"{target.mention}'s temporary ban couldn't be saved to BotState.json ({e}). "
+                    "It will still auto-unban on schedule *this session*, but would become permanent "
+                    "if the bot restarts before then.",
+                    color=ALERT_COLOR_CAUTION,
+                ))
 
-            interaction.client.loop.create_task(unban_later())
+            _schedule_temp_ban(interaction.client, entry)
 
     except app_commands.CheckFailure as e:
         await edit_or_send_error(interaction, str(e))
@@ -472,8 +627,106 @@ async def _send_lock_announcement(channel, *, title: str, message: str, duration
 # Pending auto-unlock tasks scheduled by a `duration` on /togglelock, keyed
 # by channel id. Popped and cancelled the moment that channel's lock state
 # changes again for any reason, so a stale timer never fires after someone
-# has already manually toggled it back.
+# has already manually toggled it back. Persisted to BotState.json's
+# "channel_locks" list (same shape/reasoning as "temp_bans" above) so a
+# restart mid-timer reschedules the auto-unlock instead of leaving the
+# channel locked forever until someone happens to notice.
 _lock_duration_tasks: dict = {}
+
+
+async def _clear_channel_lock_state(channel_id: int):
+    """Removes the persisted BotState.json entry (if any) for `channel_id`.
+    Best-effort -- logged rather than raised, since the Discord-side
+    permission change (a manual re-toggle, or the timer itself firing) has
+    already happened by the time this runs. Safe to call even when the
+    channel was never in "channel_locks" to begin with (e.g. it was locked
+    with no duration) -- filtering an already-empty match is a no-op."""
+    def _mutate(state):
+        state["channel_locks"] = [e for e in state.get("channel_locks", []) if str(e.get("channel_id")) != str(channel_id)]
+        return state
+    try:
+        await update_botstate(_mutate, f"Channel lock resolved: {channel_id}")
+    except GitHubAPIError as e:
+        print(f"Failed to clear resolved channel lock for channel {channel_id} from BotState.json: {e}")
+
+
+async def _run_channel_lock_auto_unlock(bot: commands.Bot, channel_id: int, unlock_at: datetime):
+    """Sleeps until `unlock_at` (or fires almost immediately if that's
+    already passed), then restores the channel's @everyone overwrite and
+    clears the persisted BotState entry. Shared by both a fresh /togglelock
+    duration grant and startup reconciliation."""
+    try:
+        await asyncio.sleep(seconds_until(unlock_at))
+
+        guild = bot.get_guild(config.GUILD_ID)
+        channel = guild.get_channel(channel_id) if guild else None
+        if channel is None:
+            print(f"Could not find channel {channel_id} to auto-unlock.")
+            return
+
+        everyone_role = guild.default_role
+        overwrite = channel.overwrites_for(everyone_role)
+        perm_names = _lock_perms(channel)
+        for perm in perm_names:
+            setattr(overwrite, perm, None)
+        try:
+            await channel.set_permissions(everyone_role, overwrite=overwrite, reason="Lock duration expired")
+            await _send_lock_announcement(
+                channel,
+                title=_LOCK_ANNOUNCEMENT_TITLES[("togglelock", "unlocked")],
+                message="Lock duration expired -- channel automatically unlocked.",
+            )
+        except Exception as e:
+            print(f"Failed to auto-unlock {getattr(channel, 'name', channel)}: {e}")
+    except asyncio.CancelledError:
+        raise
+    finally:
+        _lock_duration_tasks.pop(channel_id, None)
+        await _clear_channel_lock_state(channel_id)
+
+
+def _schedule_channel_lock(bot: commands.Bot, channel_id: int, entry: dict):
+    """(Re)schedules the auto-unlock task for `entry` (a BotState.json
+    "channel_locks" entry). Cancels whatever task was already tracked for
+    this channel first -- shouldn't normally happen (each entry only gets
+    scheduled once, at lock time or at startup), but keeps this safe to
+    call more than once for the same channel."""
+    existing = _lock_duration_tasks.pop(channel_id, None)
+    if existing and not existing.done():
+        existing.cancel()
+    unlock_at = parse_iso(entry.get("unlock_at"))
+    _lock_duration_tasks[channel_id] = bot.loop.create_task(_run_channel_lock_auto_unlock(bot, channel_id, unlock_at))
+
+
+async def reconcile_channel_locks(bot: commands.Bot, state: Optional[Dict[str, Any]] = None):
+    """Called once from on_ready: re-schedules every per-channel lock's
+    auto-unlock timer using the durable unlock_at recorded in
+    BotState.json, so a restart before the original timer fired no longer
+    leaves the channel locked forever until someone happens to notice and
+    manually toggles it.
+
+    `state` lets a caller that's already fetched BotState.json hand it
+    over directly instead of this making its own redundant fetch -- see
+    reconcile_temp_bans() above for the full reasoning."""
+    if state is None:
+        try:
+            state, _sha = await fetch_botstate_with_sha()
+        except GitHubAPIError as e:
+            print(f"Failed to fetch BotState.json for channel lock reconciliation: {e}")
+            return
+
+    entries = state.get("channel_locks", [])
+    reconciled = 0
+    for entry in entries:
+        try:
+            channel_id = int(entry["channel_id"])
+        except (KeyError, TypeError, ValueError):
+            continue
+        _schedule_channel_lock(bot, channel_id, entry)
+        reconciled += 1
+
+    if reconciled:
+        print(f"Reconciled {reconciled} channel lock(s) from BotState.json.")
 
 
 async def _togglelock_impl(
@@ -499,10 +752,14 @@ async def _togglelock_impl(
     is_locked = any(getattr(overwrite, perm) is False for perm in perm_names)
 
     # Whatever timer was previously scheduled for this channel no longer
-    # applies once its lock state is about to change again.
+    # applies once its lock state is about to change again -- cancel the
+    # in-memory task and clear any persisted BotState.json entry so a stale
+    # timer can't resurrect itself (or clash with a fresh one below) on the
+    # next restart.
     pending_task = _lock_duration_tasks.pop(target.id, None)
     if pending_task:
         pending_task.cancel()
+    await _clear_channel_lock_state(target.id)
 
     if is_locked:
         # None clears the explicit deny rather than granting an explicit
@@ -542,23 +799,39 @@ async def _togglelock_impl(
         )
 
     if action == "locked" and duration:
-        async def _auto_unlock():
-            await asyncio.sleep(duration * 60)
-            _lock_duration_tasks.pop(target.id, None)
-            fresh_overwrite = target.overwrites_for(everyone_role)
-            for perm in perm_names:
-                setattr(fresh_overwrite, perm, None)
-            try:
-                await target.set_permissions(everyone_role, overwrite=fresh_overwrite, reason="Lock duration expired")
-                await _send_lock_announcement(
-                    target,
-                    title=_LOCK_ANNOUNCEMENT_TITLES[("togglelock", "unlocked")],
-                    message="Lock duration expired -- channel automatically unlocked.",
-                )
-            except Exception as e:
-                print(f"Failed to auto-unlock {target.name}: {e}")
+        locked_at = datetime.now(timezone.utc)
+        unlock_at = locked_at + timedelta(minutes=duration)
+        entry = {
+            "id": new_state_id("cl"),
+            "channel_id": str(target.id),
+            "locked_at": format_iso(locked_at),
+            "unlock_at": format_iso(unlock_at),
+            "locked_by_id": str(interaction.user.id),
+            "locked_by_tag": str(interaction.user),
+        }
+        try:
+            def _mutate(state, entry=entry):
+                state.setdefault("channel_locks", []).append(entry)
+                return state
+            await update_botstate(_mutate, f"Channel lock recorded: {getattr(target, 'name', target.id)} ({target.id})")
+        except GitHubAPIError as e:
+            # The lock itself already succeeded (set_permissions() above) --
+            # this only means the auto-unlock timer won't survive a restart
+            # until BotState.json can be reached again. Still schedule the
+            # in-memory task below so this process's own timer works
+            # regardless, and flag it to staff since a timed lock silently
+            # becoming permanent on the next restart is exactly the failure
+            # mode this persistence exists to prevent.
+            print(f"Failed to persist channel lock for {getattr(target, 'name', target.id)} to BotState.json: {e}")
+            await send_alert(interaction.client, alert_embed(
+                "⚠️ Channel Lock Not Persisted",
+                f"{target.mention}'s timed lock couldn't be saved to BotState.json ({e}). "
+                "It will still auto-unlock on schedule *this session*, but would stay locked "
+                "permanently if the bot restarts before then.",
+                color=ALERT_COLOR_CAUTION,
+            ))
 
-        _lock_duration_tasks[target.id] = interaction.client.loop.create_task(_auto_unlock())
+        _schedule_channel_lock(interaction.client, target.id, entry)
 
 
 # Forum channels are now included here too (see the module-level note above
@@ -644,6 +917,126 @@ async def _lockdown_restore(channels, everyone_role) -> int:
     return count
 
 
+async def _persist_lockdown_state(
+    active: bool,
+    *,
+    started_at: Optional[datetime] = None,
+    unlock_at: Optional[datetime] = None,
+    started_by_id=None,
+    started_by_tag: Optional[str] = None,
+    announce_channel_id=None,
+    message: str,
+):
+    """Writes (or clears) BotState.json's "lockdown" key. `active=True`
+    snapshots the *current* in-memory _lockdown_snapshots dict (so this must
+    be called right after _lockdown_apply() populates it); `active=False`
+    just clears it back to null."""
+    def _mutate(state):
+        if active:
+            state["lockdown"] = {
+                "active": True,
+                "started_at": format_iso(started_at),
+                "unlock_at": format_iso(unlock_at) if unlock_at else None,
+                "started_by_id": str(started_by_id),
+                "started_by_tag": started_by_tag,
+                "announce_channel_id": str(announce_channel_id) if announce_channel_id else None,
+                "channel_snapshots": {str(cid): snap for cid, snap in _lockdown_snapshots.items()},
+            }
+        else:
+            state["lockdown"] = None
+        return state
+
+    try:
+        await update_botstate(_mutate, message)
+    except GitHubAPIError as e:
+        print(f"Failed to persist lockdown state to BotState.json: {e}")
+
+
+async def _run_lockdown_auto_unlock(bot: commands.Bot, guild_id: int, unlock_at: datetime, announce_channel_id: Optional[int]):
+    """Sleeps until `unlock_at` (or fires almost immediately if that's
+    already passed), then restores every channel and clears the persisted
+    lockdown state. Shared by both a fresh /togglelockdown duration grant
+    and startup reconciliation."""
+    global _lockdown_duration_task
+    try:
+        await asyncio.sleep(seconds_until(unlock_at))
+
+        guild = bot.get_guild(guild_id)
+        if guild is None:
+            print(f"Could not find guild {guild_id} to auto-lift lockdown.")
+            return
+
+        everyone_role = guild.default_role
+        current_channels = [ch for ch in guild.channels if isinstance(ch, LOCKDOWN_CHANNEL_TYPES)]
+        await _lockdown_restore(current_channels, everyone_role)
+        await _persist_lockdown_state(False, message="Lockdown duration expired -- auto-lifted")
+
+        if announce_channel_id:
+            channel = bot.get_channel(announce_channel_id)
+            await _send_lock_announcement(
+                channel,
+                title=_LOCK_ANNOUNCEMENT_TITLES[("togglelockdown", "unlocked")],
+                message="Lockdown duration expired -- server automatically unlocked.",
+            )
+    except asyncio.CancelledError:
+        raise
+    finally:
+        _lockdown_duration_task = None
+
+
+def _schedule_lockdown_auto_unlock(bot: commands.Bot, guild_id: int, unlock_at: datetime, announce_channel_id: Optional[int]):
+    global _lockdown_duration_task
+    if _lockdown_duration_task:
+        _lockdown_duration_task.cancel()
+    _lockdown_duration_task = bot.loop.create_task(_run_lockdown_auto_unlock(bot, guild_id, unlock_at, announce_channel_id))
+
+
+async def reconcile_lockdown(bot: commands.Bot, state: Optional[Dict[str, Any]] = None):
+    """Called once from on_ready: restores _lockdown_snapshots from
+    BotState.json if a lockdown was active when the bot last stopped (so
+    /togglelockdown correctly recognizes it's still active and can restore
+    each channel's exact prior state), and reschedules the auto-lift timer
+    if one was running. Without this, a restart mid-lockdown would forget
+    lockdown was even happening -- any scheduled auto-lift is lost, and
+    there's no way left to restore each channel's original per-channel
+    state short of reconstructing it by hand.
+
+    `state` lets a caller that's already fetched BotState.json hand it
+    over directly instead of this making its own redundant fetch -- see
+    reconcile_temp_bans() above for the full reasoning."""
+    if state is None:
+        try:
+            state, _sha = await fetch_botstate_with_sha()
+        except GitHubAPIError as e:
+            print(f"Failed to fetch BotState.json for lockdown reconciliation: {e}")
+            return
+
+    lockdown = state.get("lockdown")
+    if not lockdown or not lockdown.get("active"):
+        return
+
+    _lockdown_snapshots.clear()
+    for cid, snapshot in (lockdown.get("channel_snapshots") or {}).items():
+        try:
+            _lockdown_snapshots[int(cid)] = snapshot
+        except (TypeError, ValueError):
+            continue
+
+    unlock_at = parse_iso(lockdown.get("unlock_at"))
+    raw_announce_id = lockdown.get("announce_channel_id")
+    announce_channel_id = int(raw_announce_id) if raw_announce_id else None
+
+    if unlock_at is None:
+        # Indefinite lockdown (no duration was set) -- the snapshot restore
+        # above is all reconciliation needs to do; there's no timer to
+        # reschedule, same as it would've had no timer before the restart.
+        print("Reconciled an active indefinite lockdown from BotState.json.")
+        return
+
+    _schedule_lockdown_auto_unlock(bot, config.GUILD_ID, unlock_at, announce_channel_id)
+    print(f"Reconciled an active lockdown from BotState.json (auto-lift at {lockdown.get('unlock_at')}).")
+
+
 async def _togglelockdown_impl(
     interaction: discord.Interaction,
     duration: Optional[int] = None,
@@ -669,6 +1062,12 @@ async def _togglelockdown_impl(
         _lockdown_duration_task.cancel()
         _lockdown_duration_task = None
 
+    # There's no single "the channel" a lockdown applies to, so the public
+    # announcement (if any) -- and, on a duration-driven auto-lift, the
+    # "lockdown expired" notice -- is posted wherever the command was run
+    # rather than fanned out across every affected channel.
+    announce_channel = interaction.channel
+
     if _lockdown_snapshots:
         # Lockdown is currently active -> disable it by restoring each
         # channel to whatever state it actually had *before* lockdown was
@@ -676,10 +1075,22 @@ async def _togglelockdown_impl(
         # channels that were already manually locked beforehand locked.
         count = await _lockdown_restore(channels, everyone_role)
         action = "unlocked"
+        await _persist_lockdown_state(False, message=f"Lockdown lifted by {interaction.user}")
     else:
         # Not currently in lockdown -> enable it.
         count = await _lockdown_apply(channels, everyone_role)
         action = "locked"
+        started_at = datetime.now(timezone.utc)
+        unlock_at = started_at + timedelta(minutes=duration) if duration else None
+        await _persist_lockdown_state(
+            True,
+            started_at=started_at,
+            unlock_at=unlock_at,
+            started_by_id=interaction.user.id,
+            started_by_tag=str(interaction.user),
+            announce_channel_id=announce_channel.id if announce_channel else None,
+            message=f"Lockdown enabled by {interaction.user}",
+        )
 
     # Duration only means anything when this toggle just enabled lockdown;
     # flag it rather than silently ignoring it if it was passed on a lift.
@@ -687,10 +1098,6 @@ async def _togglelockdown_impl(
     confirmation_fields = [("Note", "Duration is ignored when unlocking.", False)] if ignored_duration else None
     await send_success(interaction, f"{action.capitalize()} {count} channel(s).", fields=confirmation_fields)
 
-    # There's no single "the channel" a lockdown applies to, so the public
-    # announcement (if any) is posted wherever the command was run rather
-    # than fanned out across every affected channel.
-    announce_channel = interaction.channel
     if message:
         await _send_lock_announcement(
             announce_channel,
@@ -700,19 +1107,9 @@ async def _togglelockdown_impl(
         )
 
     if action == "locked" and duration:
-        async def _auto_unlockdown():
-            global _lockdown_duration_task
-            await asyncio.sleep(duration * 60)
-            _lockdown_duration_task = None
-            current_channels = [ch for ch in guild.channels if isinstance(ch, LOCKDOWN_CHANNEL_TYPES)]
-            await _lockdown_restore(current_channels, everyone_role)
-            await _send_lock_announcement(
-                announce_channel,
-                title=_LOCK_ANNOUNCEMENT_TITLES[("togglelockdown", "unlocked")],
-                message="Lockdown duration expired -- server automatically unlocked.",
-            )
-
-        _lockdown_duration_task = interaction.client.loop.create_task(_auto_unlockdown())
+        _schedule_lockdown_auto_unlock(
+            interaction.client, guild.id, unlock_at, announce_channel.id if announce_channel else None,
+        )
 
 
 # =========================================================================
@@ -919,6 +1316,14 @@ class Moderation(commands.Cog):
                 return
 
             await interaction.guild.unban(banned_entry.user, reason=f"Unbanned by {interaction.user}")
+
+            # If this was a temp ban, cancel its still-pending auto-unban
+            # timer and clear the BotState entry -- otherwise it's harmless
+            # (the scheduled unban() would just hit a NotFound and no-op)
+            # but leaves a confusing stray entry sitting in BotState.json
+            # until its original timer eventually fires.
+            await _cancel_temp_ban_for(user.id, interaction.guild.id)
+
             await send_success(interaction, f"Successfully unbanned {user.mention}.")
 
         except discord.Forbidden:

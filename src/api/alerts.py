@@ -53,7 +53,7 @@ def set_alerts_enabled(value: bool) -> bool:
     return _alerts_enabled
 
 
-async def send_alert(bot: commands.Bot, embed: discord.Embed, view: Optional[View] = None, *, bypass_mute: bool = False):
+async def send_alert(bot: commands.Bot, embed: discord.Embed, view: Optional[View] = None, *, bypass_mute: bool = False) -> Optional[discord.Message]:
     """Best-effort delivery to the staff Alerts channel. A missing channel
     or delivery failure here is logged and swallowed rather than surfaced
     to the acting user -- their command already succeeded or failed on its
@@ -62,22 +62,28 @@ async def send_alert(bot: commands.Bot, embed: discord.Embed, view: Optional[Vie
     Silently no-ops while alerts are muted via /togglealerts, unless
     `bypass_mute` is set -- used only by /togglealerts itself, so the
     on/off toggle is always visible even though everything else it would
-    otherwise trigger is suppressed."""
+    otherwise trigger is suppressed.
+
+    Returns the sent Message (so a caller that needs its id -- e.g. to
+    persist a breach alert's message_id to BotState.json for reconciliation
+    on restart -- can capture it), or None if nothing was actually sent
+    (muted, missing channel, or a delivery failure)."""
     if not _alerts_enabled and not bypass_mute:
-        return
+        return None
 
     channel = bot.get_channel(config.ALERTS_CHANNEL_ID)
     if not channel:
         print(f"Alerts channel not found (ALERTS_CHANNEL_ID={config.ALERTS_CHANNEL_ID}).")
-        return
+        return None
 
     try:
         if view is not None:
-            await channel.send(embed=embed, view=view)
+            return await channel.send(embed=embed, view=view)
         else:
-            await channel.send(embed=embed)
+            return await channel.send(embed=embed)
     except Exception as e:
         print(f"Failed to send alert to Alerts channel: {e}")
+        return None
 
 
 def alert_embed(

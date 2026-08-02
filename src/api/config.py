@@ -84,6 +84,18 @@ STORED_SCRIPT_FILE_PATH = "storage/storedscript.lua"
 STORED_SCRIPT_RAW_URL = f"https://raw.githubusercontent.com/{OWNER}/{STORAGE_REPO}/refs/heads/{STORAGE_BRANCH}/{STORED_SCRIPT_FILE_PATH}"
 STORED_SCRIPT_API_URL = f"https://api.github.com/repos/{OWNER}/{STORAGE_REPO}/contents/{STORED_SCRIPT_FILE_PATH}?ref={STORAGE_BRANCH}"
 
+# storage/BotState.json -- durable checkpoint for everything that used to
+# live only in process memory: temp ban unban timers, server lockdown/
+# per-channel lock snapshots+timers, temp Bot Access grants, pending HWID-
+# breach alert buttons, and the reaction-role panel message pointer. Read
+# back on every startup (see each cog's reconcile_*() function, called from
+# start.py's on_ready) so a restart degrades to "resume where it left off"
+# instead of "silently forget this was ever temporary." Lives in this bot's
+# own storage repo, same as permittedKeys.txt/storedscript.lua above.
+BOTSTATE_FILE_PATH = "storage/BotState.json"
+BOTSTATE_RAW_URL = f"https://raw.githubusercontent.com/{OWNER}/{STORAGE_REPO}/refs/heads/{STORAGE_BRANCH}/{BOTSTATE_FILE_PATH}"
+BOTSTATE_API_URL = f"https://api.github.com/repos/{OWNER}/{STORAGE_REPO}/contents/{BOTSTATE_FILE_PATH}?ref={STORAGE_BRANCH}"
+
 HEADERS = {
     "Authorization": f"Bearer {GITHUB_TOKEN}",
     "Accept": "application/vnd.github+json",

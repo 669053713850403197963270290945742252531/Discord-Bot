@@ -154,6 +154,49 @@ def humanize_timeleft(delta: timedelta, *, suffix: bool = True) -> str:
     return "Expired"
 
 
+# =========================================================================
+# UTC ISO-8601 timestamps (storage/BotState.json)
+# =========================================================================
+#
+# BotState.json's timestamps (banned_at/unban_at, started_at/unlock_at,
+# granted_at/expires_at, etc.) always use this format -- plain UTC with a
+# trailing Z, unlike JoinDate's local-timezone "m/d/yyyy, h:mm:ss AM/PM"
+# above -- since BotState entries are read back by reconcile_*() functions
+# to re-derive a precise "how many seconds until this fires" figure, not
+# just displayed to a human.
+
+def format_iso(dt: datetime) -> str:
+    """Formats a datetime as UTC ISO-8601 with a trailing Z, e.g.
+    '2026-07-31T18:42:07Z'. Naive datetimes are assumed to already be UTC."""
+    if dt.tzinfo is None:
+        dt = dt.replace(tzinfo=timezone.utc)
+    return dt.astimezone(timezone.utc).strftime("%Y-%m-%dT%H:%M:%SZ")
+
+
+def parse_iso(value: Optional[str]) -> Optional[datetime]:
+    """Reverses format_iso(). Returns None if `value` is empty or doesn't
+    match the expected format -- callers should treat that as "nothing
+    scheduled" rather than an error."""
+    if not value:
+        return None
+    try:
+        return datetime.strptime(value, "%Y-%m-%dT%H:%M:%SZ").replace(tzinfo=timezone.utc)
+    except ValueError:
+        return None
+
+
+def seconds_until(dt: Optional[datetime]) -> float:
+    """How many seconds from now until `dt`, clamped to 0 -- never negative,
+    so a timer whose target time has already passed (e.g. the bot was down
+    past a scheduled unban/unlock/expiry) fires almost immediately on
+    reconciliation instead of raising or waiting a negative amount of time.
+    A missing `dt` (None) also resolves to 0, so a caller doesn't need a
+    separate branch for "nothing to wait for -- do it now"."""
+    if dt is None:
+        return 0.0
+    return max(0.0, (dt - datetime.now(timezone.utc)).total_seconds())
+
+
 def hwid_reset_cooldown_remaining(entry: Dict[str, Any]) -> Optional[timedelta]:
     """Returns how much time is left before `entry` can use the control
     panel's "Reset HWID" button again, based on its LastHwidReset field and
