@@ -1,16 +1,10 @@
 {
   "schema_version": 1,
-  "last_updated": null,
-
+  "last_updated": "2026-08-02T08:39:17Z",
   "temp_bans": [],
-
   "lockdown": null,
-
   "channel_locks": [],
-
   "temp_bot_access": [],
-
   "pending_breach_alerts": [],
-
   "reaction_role_panel": null
 }
