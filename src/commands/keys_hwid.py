@@ -54,7 +54,7 @@ _temp_whitelist_tasks: dict = {}
 # implementations (standalone so context_menus.py can call them directly)
 # =========================================================================
 
-def _schedule_temp_whitelist_expiry(bot: commands.Bot, guild: Optional[discord.Guild], user: discord.User, discord_id: str, expiration_time: datetime):
+def _schedule_temp_whitelist_expiry(bot: commands.Bot, guild: Optional[discord.Guild], user: Optional[discord.User], discord_id: str, expiration_time: datetime):
     """
     (Re)schedules the background task that DMs a "5 minutes left" warning
     and then removes `discord_id` from the whitelist at `expiration_time`.
@@ -64,9 +64,17 @@ def _schedule_temp_whitelist_expiry(bot: commands.Bot, guild: Optional[discord.G
     pushing an existing expiration back, so there's never more than one
     removal task racing against the current expiration, and an extension
     can't be silently undone by a task still counting down to the old time.
+
+    `user` may be None -- reconcile_temp_whitelists() passes this when the
+    account couldn't be fetched on startup (e.g. it was deleted). The
+    removal itself only needs `discord_id`, so this still degrades to
+    "silently skip the DMs, still auto-remove on schedule" rather than
+    failing to schedule anything at all.
     """
     guild_name = guild.name if guild else "the server"
     expires_ts = int(expiration_time.timestamp())
+    mention = user.mention if user else f"<@{discord_id}>"
+    fallback_name = user.name if user else discord_id
 
     existing_task = _temp_whitelist_tasks.get(discord_id)
     if existing_task and not existing_task.done():
@@ -78,17 +86,18 @@ def _schedule_temp_whitelist_expiry(bot: commands.Bot, guild: Optional[discord.G
             now = datetime.now(timezone.utc)
             if notify_time > now:
                 await asyncio.sleep((notify_time - now).total_seconds())
-                try:
-                    expiring_embed = discord.Embed(
-                        title="Temporary Whitelist Expiring Soon",
-                        description=f"Your temporary whitelist access to **{guild_name}** will expire in 5 minutes.",
-                        color=discord.Color.orange(),
-                        timestamp=datetime.now(timezone.utc),
-                    )
-                    expiring_embed.add_field(name="Expires", value=f"<t:{expires_ts}:F>\n<t:{expires_ts}:R>", inline=False)
-                    await user.send(embed=expiring_embed)
-                except Exception:
-                    pass
+                if user is not None:
+                    try:
+                        expiring_embed = discord.Embed(
+                            title="Temporary Whitelist Expiring Soon",
+                            description=f"Your temporary whitelist access to **{guild_name}** will expire in 5 minutes.",
+                            color=discord.Color.orange(),
+                            timestamp=datetime.now(timezone.utc),
+                        )
+                        expiring_embed.add_field(name="Expires", value=f"<t:{expires_ts}:F>\n<t:{expires_ts}:R>", inline=False)
+                        await user.send(embed=expiring_embed)
+                    except Exception:
+                        pass
 
             now = datetime.now(timezone.utc)
             if expiration_time > now:
@@ -98,7 +107,7 @@ def _schedule_temp_whitelist_expiry(bot: commands.Bot, guild: Optional[discord.G
                 current_whitelist, current_sha = await fetch_users_with_sha()
                 removed_entry = find_user_by_discord_id(current_whitelist, discord_id)
                 current_whitelist, _ = remove_user_by_discord_id(current_whitelist, discord_id)
-                await commit_users(current_whitelist, current_sha, f"Temp whitelist expired: {user.name} ({discord_id})")
+                await commit_users(current_whitelist, current_sha, f"Temp whitelist expired: {fallback_name} ({discord_id})")
             except GitHubAPIError:
                 return
 
@@ -106,28 +115,77 @@ def _schedule_temp_whitelist_expiry(bot: commands.Bot, guild: Optional[discord.G
             _active_temp_whitelists.pop(discord_id, None)
             _temp_whitelist_tasks.pop(discord_id, None)
 
-            identifier = removed_entry.get("Identifier", user.name) if removed_entry else user.name
+            identifier = removed_entry.get("Identifier", fallback_name) if removed_entry else fallback_name
             await send_alert(bot, alert_embed(
                 "⌛ Temp Whitelist Expired",
-                f"{user.mention} (**{identifier}**)'s temporary whitelist expired and was auto-removed.",
+                f"{mention} (**{identifier}**)'s temporary whitelist expired and was auto-removed.",
                 color=ALERT_COLOR_REMOVE,
             ))
 
-            try:
-                removed_embed = discord.Embed(
-                    title="Temporary Whitelist Access Removed",
-                    description=f"Your temporary whitelist has expired and your access to **{guild_name}** has now been removed.",
-                    color=discord.Color.red(),
-                    timestamp=datetime.now(timezone.utc),
-                )
-                await user.send(embed=removed_embed)
-            except Exception:
-                pass
+            if user is not None:
+                try:
+                    removed_embed = discord.Embed(
+                        title="Temporary Whitelist Access Removed",
+                        description=f"Your temporary whitelist has expired and your access to **{guild_name}** has now been removed.",
+                        color=discord.Color.red(),
+                        timestamp=datetime.now(timezone.utc),
+                    )
+                    await user.send(embed=removed_embed)
+                except Exception:
+                    pass
         except asyncio.CancelledError:
             pass
 
     _active_temp_whitelists[discord_id] = expiration_time
     _temp_whitelist_tasks[discord_id] = asyncio.create_task(notify_and_remove())
+
+
+async def reconcile_temp_whitelists(bot: commands.Bot):
+    """Called once from on_ready: re-schedules notify_and_remove() for
+    every Users.json entry whose Notes field still carries an unexpired
+    "Expires on ..." marker (api.time_utils.format_expiration_note /
+    parse_expiration_note).
+
+    Unlike temp bans/lockdown/channel locks/temp access, the expiration
+    itself is already durable here -- it lives in the Notes field, on
+    GitHub -- so a restart never loses *that*. What it does lose is the
+    mechanism that ever acts on it: nothing else DMs the 5-minute warning
+    or actually removes the user at expiry, so without this the user just
+    stays whitelisted indefinitely until a staff member happens to notice
+    and runs /unwhitelist by hand. This is a read-back-and-reschedule pass,
+    not a "start persisting the data" one.
+
+    Entries whose expiration has already passed are scheduled anyway --
+    _schedule_temp_whitelist_expiry's own now-vs-expiration checks make the
+    removal fire almost immediately rather than waiting on a negative
+    duration."""
+    try:
+        whitelist_users, _sha = await fetch_users_with_sha()
+    except GitHubAPIError as e:
+        print(f"Failed to fetch Users.json for temp whitelist reconciliation: {e}")
+        return
+
+    guild = bot.get_guild(config.GUILD_ID)
+    reconciled = 0
+    for entry in whitelist_users:
+        expiration_time = parse_expiration_note(entry.get("Notes"))
+        if not expiration_time:
+            continue
+
+        discord_id = str(entry.get("DiscordId") or "")
+        if not discord_id:
+            continue
+
+        try:
+            user = await bot.fetch_user(int(discord_id))
+        except (discord.NotFound, discord.HTTPException, ValueError):
+            user = None
+
+        _schedule_temp_whitelist_expiry(bot, guild, user, discord_id, expiration_time)
+        reconciled += 1
+
+    if reconciled:
+        print(f"Reconciled {reconciled} temp whitelist(s) from Users.json.")
 
 
 async def _tempwhitelist_impl(interaction: discord.Interaction, user: discord.User, hwid: str, minutes: int):

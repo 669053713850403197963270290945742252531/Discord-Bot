@@ -12,6 +12,7 @@ import sys
 import os
 import re
 import shutil
+import signal
 import traceback
 from pathlib import Path
 
@@ -46,10 +47,14 @@ from discord import app_commands
 from discord.app_commands import errors as app_errors
 
 from api import config
-from api.github import GitHubAPIError, refresh_users_cache, register_refresh_task, register_bot_loop
+from api.github import GitHubAPIError, refresh_users_cache, register_refresh_task, register_bot_loop, fetch_botstate_with_sha, get_cached_users
 from api.webhook_sync import sync_webhook_url
 from api.discord_helpers import send_error, notify_permission_error
-from commands.panel import ControlPanelView
+from commands.panel import ControlPanelView, HWIDBreachButton
+from commands.moderation import reconcile_temp_bans, reconcile_channel_locks, reconcile_lockdown
+from commands.keys_hwid import reconcile_temp_whitelists
+from commands.access import reconcile_temp_access
+from commands.reaction_roles import reconcile_reaction_role_panel
 
 # // Intents & Client //
 
@@ -77,6 +82,12 @@ EXTENSIONS = (
     "commands.qrcode",
 )
 
+# Guards the BotState.json reconciliation block in on_ready() so it only
+# ever runs once per process -- on_ready can fire again on reconnect, and
+# re-running reconciliation would double-schedule every temp ban/lock/
+# access timer it already rescheduled the first time.
+_botstate_reconciled = False
+
 
 class Client(commands.Bot):
     async def setup_hook(self):
@@ -88,6 +99,42 @@ class Client(commands.Bot):
         # load keeps the startup window where an early webhook would find no
         # loop registered as small as possible.
         register_bot_loop(asyncio.get_running_loop())
+
+        # discord.py's own run() already turns Ctrl+C (SIGINT) into a
+        # graceful close() -- see the `async with self:` in its run(), whose
+        # __aexit__ calls close() as KeyboardInterrupt unwinds the runner.
+        # SIGTERM isn't covered by that at all, though, and it's what
+        # process managers actually send on a stop/restart (Render, Docker,
+        # systemd -- anywhere this is actually hosted). Without this, a
+        # SIGTERM just kills the process outright: close() (and, with it,
+        # the presence-clearing step below) never runs, Discord gets no
+        # clean disconnect to react to, and falls back to its own
+        # heartbeat timeout to notice the bot's gone -- which can leave it
+        # showing online with its last activity for a while after the
+        # process is actually dead. Not supported on Windows
+        # (add_signal_handler raises NotImplementedError there) -- SIGTERM
+        # isn't meaningfully delivered to Windows processes the way it is
+        # on POSIX anyway, so this only matters, and only applies, on
+        # whatever POSIX host this actually ends up running on.
+        try:
+            asyncio.get_running_loop().add_signal_handler(
+                signal.SIGTERM, lambda: asyncio.create_task(self.close())
+            )
+        except NotImplementedError:
+            pass
+
+        # Registers HWIDBreachButton's regex-templated custom_id
+        # (`breach_unwhitelist_ban:<alert_id>`) so Discord keeps routing
+        # clicks on a "Potential Breach" alert's "Unwhitelist & Ban Both"
+        # button back to it after a restart -- same purpose as
+        # self.add_view(ControlPanelView()) below, but via
+        # add_dynamic_items() since each alert carries its own per-alert
+        # data rather than sharing one fixed custom_id. Only needs to
+        # happen once per process (not per alert): HWIDBreachButton.
+        # from_custom_id() looks up which alert it is, and its data, from
+        # BotState.json at dispatch time -- see that class's docstring in
+        # commands/panel.py.
+        self.add_dynamic_items(HWIDBreachButton)
 
         # Fire-and-forget: points the GitHub webhook's Payload URL at
         # wherever this process is reachable right now (Render's own URL,
@@ -139,9 +186,52 @@ class Client(commands.Bot):
                 "across extensions."
             )
 
+    async def close(self):
+        """Every path that ends up shutting the bot down -- Ctrl+C (handled
+        by discord.py's own run(), see the SIGTERM comment in setup_hook
+        above), the SIGTERM handler registered there, or a direct
+        bot.close() call -- funnels through here, since discord.py calls
+        this itself either way. Clears the presence *before* the gateway
+        connection actually drops, instead of leaving whatever
+        rotate_presence_task last set (a stale "Watching X") displayed
+        until Discord's own heartbeat timeout notices the client's gone.
+
+        Stops both background loops first -- specifically so a stray
+        rotate_presence_task tick can't land in the gap between clearing
+        the presence and the connection actually closing and re-set an
+        activity right as the bot's shutting down.
+
+        Doesn't help with a hard kill (kill -9, Windows' TerminateProcess,
+        an IDE's "Stop" button that doesn't deliver a real signal) --
+        nothing running in-process can, since the OS ends the process
+        before any of this code gets a chance to run. This only covers
+        shutdowns the process actually gets a chance to react to.
+        """
+        if rotate_presence_task.is_running():
+            rotate_presence_task.cancel()
+        if refresh_users_cache_task.is_running():
+            refresh_users_cache_task.cancel()
+
+        if not self.is_closed():
+            try:
+                await self.change_presence(status=discord.Status.invisible, activity=None)
+            except Exception as e:
+                # Best-effort -- e.g. the gateway connection is already
+                # unhealthy. Shouldn't block the actual close() below.
+                print(f"Failed to clear presence before shutdown: {e}")
+
+        await super().close()
+
     async def on_ready(self):
         print(f"Logged in as {self.user} ({self.user.id})")
-        await self.change_presence(activity=discord.Activity(type=discord.ActivityType.watching, name="database"))
+
+        # Guarded with is_running() since on_ready can fire again on
+        # reconnect, and tasks.loop.start() raises if it's already going.
+        # start() runs the loop body immediately (not after the first
+        # interval), so this also sets the very first status -- no separate
+        # change_presence() call needed here.
+        if not rotate_presence_task.is_running():
+            rotate_presence_task.start()
 
         # Re-registers the /createpanel control panel's button handlers so
         # they keep responding after a bot restart. This does NOT resend the
@@ -156,6 +246,46 @@ class Client(commands.Bot):
         if not refresh_users_cache_task.is_running():
             refresh_users_cache_task.start()
 
+        # Reads storage/BotState.json back and reschedules every timer/
+        # pointer that only ever lived in process memory before -- temp
+        # ban auto-unbans, an in-progress lockdown/its auto-lift, per-
+        # channel lock auto-unlocks, temp whitelist expiry notifications
+        # (Users.json's own read-back), temp Bot Access auto-removals, and
+        # the reaction-role panel's message pointer. Without this, a
+        # restart mid-timer either makes a "temp" action silently
+        # permanent, or silently stops a mechanism that was already
+        # correctly persisted elsewhere. Guarded the same way as
+        # refresh_users_cache_task above -- on_ready can fire again on
+        # reconnect, and this should only ever run once per process.
+        global _botstate_reconciled
+        if not _botstate_reconciled:
+            _botstate_reconciled = True
+
+            # Fetched once here and handed to every BotState.json-reading
+            # reconcile_*() below, rather than each of them independently
+            # re-fetching the exact same file -- reconciliation never
+            # writes anything, so nothing changes it in between those
+            # calls, and five separate GitHub round trips for one
+            # unchanged file just adds latency to every startup for
+            # nothing. reconcile_temp_whitelists() reads Users.json
+            # instead, so it's unaffected and keeps fetching for itself.
+            # Falls back to None (each reconcile_*() then fetches for
+            # itself, same as before this optimization) if this fetch
+            # fails, so one transient GitHub error here doesn't skip
+            # reconciliation outright.
+            try:
+                botstate, _sha = await fetch_botstate_with_sha()
+            except GitHubAPIError as e:
+                print(f"Failed to fetch BotState.json for startup reconciliation: {e}")
+                botstate = None
+
+            await reconcile_temp_bans(self, botstate)
+            await reconcile_lockdown(self, botstate)
+            await reconcile_channel_locks(self, botstate)
+            await reconcile_temp_whitelists(self)
+            await reconcile_temp_access(self, botstate)
+            await reconcile_reaction_role_panel(self, botstate)
+
         try:
             guild_obj = discord.Object(id=config.GUILD_ID)
             synced = await self.tree.sync(guild=guild_obj)
@@ -165,6 +295,56 @@ class Client(commands.Bot):
 
 
 bot = Client(command_prefix="!", intents=intents)
+
+# --- Rotating status ---
+#
+# Cycles the bot's presence through a handful of activities built from data
+# that's already sitting in memory -- get_cached_users() (kept warm by the
+# cache task right below this) and the gateway-cached Guild object -- so
+# none of this costs an extra GitHub or Discord API call beyond the
+# presence update itself. Falls back to skipping a slot if the data it
+# needs isn't populated yet (e.g. get_cached_users() before the very first
+# refresh_users_cache() call in setup_hook has landed) rather than showing
+# "None whitelisted users".
+_PRESENCE_ROTATION_INTERVAL = 30  # seconds
+_presence_index = 0
+
+
+def _build_presence_activities(guild_obj: discord.Object) -> list:
+    guild = bot.get_guild(config.GUILD_ID)
+    member_count = guild.member_count if guild else None
+    cached_users = get_cached_users()
+    whitelisted_count = len(cached_users) if cached_users is not None else None
+    command_count = len(bot.tree.get_commands(guild=guild_obj))
+
+    activities = []
+    if whitelisted_count is not None:
+        label = "user" if whitelisted_count == 1 else "users"
+        activities.append(discord.Activity(type=discord.ActivityType.watching, name=f"{whitelisted_count} whitelisted {label}"))
+    if member_count is not None:
+        label = "member" if member_count == 1 else "members"
+        activities.append(discord.Activity(type=discord.ActivityType.watching, name=f"over {member_count} {label}"))
+    activities.append(discord.Activity(type=discord.ActivityType.watching, name="for HWID breaches"))
+    activities.append(discord.Activity(type=discord.ActivityType.listening, name=f"{command_count} slash commands"))
+    activities.append(discord.Activity(type=discord.ActivityType.watching, name="the whitelist"))
+    return activities
+
+
+@tasks.loop(seconds=_PRESENCE_ROTATION_INTERVAL)
+async def rotate_presence_task():
+    global _presence_index
+    guild_obj = discord.Object(id=config.GUILD_ID)
+    activities = _build_presence_activities(guild_obj)
+    if not activities:
+        return
+    await bot.change_presence(activity=activities[_presence_index % len(activities)])
+    _presence_index += 1
+
+
+@rotate_presence_task.before_loop
+async def before_rotate_presence_task():
+    await bot.wait_until_ready()
+
 
 # --- Users.json cache refresh task ---
 #

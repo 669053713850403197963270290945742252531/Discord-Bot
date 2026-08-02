@@ -1,6 +1,6 @@
 import re
 from datetime import datetime
-from typing import Optional
+from typing import Any, Dict, Optional
 
 import discord
 from discord import app_commands
@@ -8,6 +8,7 @@ from discord.ext import commands
 
 from api import config
 from api.discord_helpers import has_role, is_in_guild, send_success, send_error
+from api.github import GitHubAPIError, fetch_botstate_with_sha, update_botstate
 
 GUILD = discord.Object(id=config.GUILD_ID)
 
@@ -15,6 +16,98 @@ GUILD = discord.Object(id=config.GUILD_ID)
 # when they gain/lose a reaction role. No slash command controls this;
 # flip it here and restart the bot.
 REACTION_ROLE_DMS_ENABLED = True
+
+# =========================================================================
+# Reaction-role panel message pointer -- persisted to BotState.json's
+# "reaction_role_panel" key.
+#
+# The emoji->role mappings themselves already live durably: they're written
+# straight into the live Discord message's embed description by
+# /reactionrole add/remove. What's NOT durable without this is the pointer
+# to *which* message that is -- self.reaction_roles_message_id resets to
+# None on every restart, which makes on_raw_reaction_add/remove silently
+# no-op forever (they both bail immediately if payload.message_id doesn't
+# match), and makes /reactionrole apply think there's no existing panel and
+# create a duplicate one on top of the still-live one.
+# =========================================================================
+
+
+async def _persist_reaction_role_panel(channel_id: int, message_id: int):
+    """Records the panel's current channel/message id in BotState.json.
+    Best-effort -- logged rather than raised, since the panel message
+    itself has already been created/edited by the time this is called."""
+    def _mutate(state):
+        state["reaction_role_panel"] = {"channel_id": str(channel_id), "message_id": str(message_id)}
+        return state
+    try:
+        await update_botstate(_mutate, f"Reaction role panel recorded: {message_id}")
+    except GitHubAPIError as e:
+        print(f"Failed to persist reaction role panel pointer to BotState.json: {e}")
+
+
+async def _clear_reaction_role_panel_state():
+    """Clears BotState.json's "reaction_role_panel" key back to null --
+    called once the panel message itself is confirmed gone, so a stale
+    pointer to a deleted message doesn't stick around."""
+    def _mutate(state):
+        state["reaction_role_panel"] = None
+        return state
+    try:
+        await update_botstate(_mutate, "Reaction role panel cleared")
+    except GitHubAPIError as e:
+        print(f"Failed to clear reaction role panel pointer from BotState.json: {e}")
+
+
+async def reconcile_reaction_role_panel(bot: commands.Bot, state: Optional[Dict[str, Any]] = None):
+    """Called once from on_ready: restores the ReactionRoles cog's
+    reaction_roles_message_id from BotState.json, so a restart no longer
+    permanently silences on_raw_reaction_add/remove or risks
+    /reactionrole add creating a duplicate panel next to the still-live
+    one. Confirms the message still actually exists first -- if it was
+    deleted while the bot was down, blindly trusting a stale pointer would
+    just reproduce the same silent-no-op failure this exists to fix.
+
+    `state` lets a caller that's already fetched BotState.json hand it
+    over directly instead of this making its own redundant fetch -- see
+    commands.moderation.reconcile_temp_bans() for the full reasoning."""
+    cog = bot.get_cog("ReactionRoles")
+    if cog is None:
+        return
+
+    if state is None:
+        try:
+            state, _sha = await fetch_botstate_with_sha()
+        except GitHubAPIError as e:
+            print(f"Failed to fetch BotState.json for reaction role panel reconciliation: {e}")
+            return
+
+    panel = state.get("reaction_role_panel")
+    if not panel or not panel.get("message_id"):
+        return
+
+    try:
+        channel_id = int(panel["channel_id"])
+        message_id = int(panel["message_id"])
+    except (KeyError, TypeError, ValueError):
+        return
+
+    channel = bot.get_channel(channel_id)
+    if channel is None:
+        print(f"Could not find channel {channel_id} to reconcile the reaction role panel.")
+        return
+
+    try:
+        await channel.fetch_message(message_id)
+    except discord.NotFound:
+        print(f"Reaction role panel message {message_id} no longer exists -- clearing BotState.json entry.")
+        await _clear_reaction_role_panel_state()
+        return
+    except discord.HTTPException as e:
+        print(f"Failed to verify reaction role panel message {message_id}: {e}")
+        return
+
+    cog.reaction_roles_message_id = message_id
+    print(f"Reconciled the reaction role panel (message {message_id}) from BotState.json.")
 
 
 class ReactionRoles(commands.Cog):
@@ -58,6 +151,7 @@ class ReactionRoles(commands.Cog):
             embed = discord.Embed(title="React to assign roles", description="", color=discord.Color.blurple())
             msg = await channel.send(embed=embed)
             self.reaction_roles_message_id = msg.id
+            await _persist_reaction_role_panel(channel.id, msg.id)
         else:
             try:
                 msg = await channel.fetch_message(self.reaction_roles_message_id)
@@ -66,6 +160,7 @@ class ReactionRoles(commands.Cog):
                 embed = discord.Embed(title="React to assign roles", description="", color=discord.Color.blurple())
                 msg = await channel.send(embed=embed)
                 self.reaction_roles_message_id = msg.id
+                await _persist_reaction_role_panel(channel.id, msg.id)
 
         embed = msg.embeds[0] if msg.embeds else discord.Embed(title="React to assign roles", color=discord.Color.blurple())
         lines = embed.description.split("\n") if embed.description else []
@@ -114,6 +209,7 @@ class ReactionRoles(commands.Cog):
             msg = await channel.fetch_message(self.reaction_roles_message_id)
         except discord.NotFound:
             self.reaction_roles_message_id = None
+            await _clear_reaction_role_panel_state()
             return await send_error(interaction, "The reaction role panel no longer exists.")
 
         embed = msg.embeds[0] if msg.embeds else None

@@ -9,8 +9,9 @@ import asyncio
 import base64
 import json
 import re
+import secrets
 from datetime import datetime, timezone, timedelta
-from typing import Any, Dict, List, Optional, Tuple
+from typing import Any, Callable, Dict, List, Optional, Tuple
 
 import aiohttp
 
@@ -508,3 +509,153 @@ def validate_stored_script(script_text: str) -> Optional[str]:
         return "Line 2 must be the loading line (containing `loadstring(`)."
 
     return None
+
+
+# =========================================================================
+# Bot state (storage/BotState.json)
+# =========================================================================
+#
+# Durable checkpoint for everything that used to live only in process
+# memory -- temp ban unban timers, server lockdown / per-channel lock
+# snapshots+timers, temp Bot Access grants, pending HWID-breach alert
+# buttons, and the reaction-role panel message pointer. Same "fetch -> get
+# sha -> mutate -> commit" shape as Users.json above, with one addition:
+# BotState.json is written to from many independent places that can
+# legitimately race each other (a ban timer firing at the same moment as a
+# moderator running /togglelock, for instance) rather than Users.json's
+# mostly-one-moderator-at-a-time pattern, so update_botstate() below adds a
+# fetch/mutate/commit retry loop on top of the plain fetch+commit pair.
+
+BOTSTATE_SCHEMA_VERSION = 1
+
+# Every key any BotState-backed feature reads/writes, with the "nothing
+# going on" value for each. fetch_botstate_with_sha() shallow-merges this
+# under whatever's actually in the file, so every reader can assume the
+# full shape exists (state.get("temp_bans", [])-with-a-fallback isn't
+# needed) even against a hand-edited or older-schema file that's missing a
+# key entirely.
+DEFAULT_BOTSTATE: Dict[str, Any] = {
+    "schema_version": BOTSTATE_SCHEMA_VERSION,
+    "last_updated": None,
+    "temp_bans": [],
+    "lockdown": None,
+    "channel_locks": [],
+    "temp_bot_access": [],
+    "pending_breach_alerts": [],
+    "reaction_role_panel": None,
+}
+
+
+def new_state_id(prefix: str) -> str:
+    """Short random id for a BotState.json entry (e.g. 'tb_9f2a1c'), used to
+    find-and-remove a specific temp ban / channel lock / temp access grant /
+    breach alert later without relying on list position."""
+    return f"{prefix}_{secrets.token_hex(3)}"
+
+
+async def fetch_botstate_with_sha(session: Optional[aiohttp.ClientSession] = None) -> Tuple[Dict[str, Any], str]:
+    """Fetches storage/BotState.json + its sha via the Contents API. Use
+    this before any write (see update_botstate() below for the usual way to
+    do that), or on its own for a read-only reconcile_*() pass on startup."""
+    sess, should_close = await _get_session(session)
+    try:
+        async with sess.get(config.BOTSTATE_API_URL, headers=config.HEADERS) as resp:
+            if resp.status != 200:
+                raise GitHubAPIError(f"Failed to fetch BotState.json metadata (HTTP {resp.status})", resp.status)
+            data = await resp.json()
+    finally:
+        if should_close:
+            await sess.close()
+
+    sha = data["sha"]
+    try:
+        state = json.loads(base64.b64decode(data["content"]).decode("utf-8"))
+    except (json.JSONDecodeError, UnicodeDecodeError, ValueError) as e:
+        raise GitHubAPIError(f"BotState.json is not valid JSON: {e}")
+
+    if not isinstance(state, dict):
+        raise GitHubAPIError("BotState.json's contents aren't a JSON object.")
+
+    return {**DEFAULT_BOTSTATE, **state}, sha
+
+
+async def commit_botstate(state: Dict[str, Any], sha: str, message: str, session: Optional[aiohttp.ClientSession] = None) -> Dict[str, Any]:
+    """Serializes `state` to indented JSON (stamping schema_version and
+    last_updated) and commits it as the new storage/BotState.json.
+
+    Most callers should go through update_botstate() instead, which wraps
+    this together with fetch_botstate_with_sha() and retries on a stale
+    sha -- call this directly only when you already hold a freshly-fetched
+    sha and know nothing else could have written in between."""
+    to_write = {
+        **state,
+        "schema_version": BOTSTATE_SCHEMA_VERSION,
+        "last_updated": datetime.now(timezone.utc).strftime("%Y-%m-%dT%H:%M:%SZ"),
+    }
+    content_str = json.dumps(to_write, indent=2) + "\n"
+
+    sess, should_close = await _get_session(session)
+    try:
+        payload = {
+            "message": message,
+            "content": base64.b64encode(content_str.encode()).decode("utf-8"),
+            "branch": config.STORAGE_BRANCH,
+            "sha": sha,
+        }
+        async with sess.put(config.BOTSTATE_API_URL, headers=config.HEADERS, json=payload) as resp:
+            if resp.status != 200:
+                err = await resp.text()
+                raise GitHubAPIError(f"Failed to commit BotState.json changes (HTTP {resp.status}): {err}", resp.status)
+            return await resp.json()
+    finally:
+        if should_close:
+            await sess.close()
+
+
+async def update_botstate(
+    mutate: Callable[[Dict[str, Any]], Dict[str, Any]],
+    message: str,
+    session: Optional[aiohttp.ClientSession] = None,
+    max_retries: int = 3,
+) -> Dict[str, Any]:
+    """
+    Read-modify-write helper for BotState.json: fetches the current state +
+    sha, calls `mutate(state)` (may mutate the dict in place and return it,
+    or return a fresh one), and commits the result.
+
+    If another write landed in between (the sha this attempt started with
+    is now stale -- GitHub returns HTTP 409), this re-fetches the now-
+    current state, re-applies `mutate`, and retries, up to `max_retries`
+    attempts total. This is the one place BotState.json's write path
+    diverges from Users.json's plain fetch-then-commit: BotState.json is
+    written from many independent places that can legitimately race each
+    other (a ban timer firing while a moderator runs /togglelock, two
+    background reconcile tasks resolving around the same moment, etc.),
+    where Users.json is mostly one moderator command at a time.
+
+    Raises GitHubAPIError if every attempt fails (a stale-sha conflict on
+    the last attempt, or any other failure at any point) -- callers should
+    catch this and log it (the Discord-side action, e.g. the actual ban/
+    lock/role change, has almost always already happened by this point and
+    shouldn't be rolled back over a bookkeeping failure) rather than let it
+    bubble up as a command error.
+    """
+    sess, should_close = await _get_session(session)
+    try:
+        last_error: Optional[GitHubAPIError] = None
+        for attempt in range(max_retries):
+            state, sha = await fetch_botstate_with_sha(sess)
+            new_state = mutate(state)
+            try:
+                await commit_botstate(new_state, sha, message, sess)
+                return new_state
+            except GitHubAPIError as e:
+                last_error = e
+                if e.status == 409 and attempt < max_retries - 1:
+                    await asyncio.sleep(0.5 * (attempt + 1))
+                    continue
+                raise
+        raise last_error  # pragma: no cover -- loop always returns or raises
+    finally:
+        if should_close:
+            await sess.close()
