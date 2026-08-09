@@ -49,7 +49,7 @@ from discord.app_commands import errors as app_errors
 from api import config
 from api.github import GitHubAPIError, refresh_users_cache, register_refresh_task, register_bot_loop, fetch_botstate_with_sha, get_cached_users
 from api.webhook_sync import sync_webhook_url
-from api.discord_helpers import send_error, notify_permission_error
+from api.discord_helpers import send_error, notify_permission_error, reconcile_dms_enabled
 from api.alerts import reconcile_alerts_enabled
 from commands.panel import ControlPanelView, HWIDBreachButton
 from commands.moderation import (
@@ -401,6 +401,7 @@ class Client(commands.Bot):
             await reconcile_ghostping_mode(self, botstate)
             await reconcile_autorole(self, botstate)
             await reconcile_alerts_enabled(self, botstate)
+            await reconcile_dms_enabled(self, botstate)
 
         try:
             guild_obj = discord.Object(id=config.GUILD_ID)

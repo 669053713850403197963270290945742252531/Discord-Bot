@@ -7,15 +7,10 @@ from discord import app_commands
 from discord.ext import commands
 
 from api import config
-from api.discord_helpers import has_role, is_in_guild, send_success, send_error
+from api.discord_helpers import has_role, is_in_guild, send_success, send_error, dms_enabled
 from api.github import GitHubAPIError, fetch_botstate_with_sha, update_botstate
 
 GUILD = discord.Object(id=config.GUILD_ID)
-
-# Code-only feature toggle: set to False to stop the bot from DMing users
-# when they gain/lose a reaction role. No slash command controls this;
-# flip it here and restart the bot.
-REACTION_ROLE_DMS_ENABLED = True
 
 # =========================================================================
 # Reaction-role panel message pointer -- persisted to BotState.json's
@@ -277,7 +272,7 @@ class ReactionRoles(commands.Cog):
                     if role:
                         await member.add_roles(role, reason="Reaction role assigned")
 
-                        if REACTION_ROLE_DMS_ENABLED:
+                        if dms_enabled():
                             dm_embed = discord.Embed(
                                 title="Role Added!",
                                 description=f"You have been **granted** the role **{role.name}** in **{guild.name}**.",
@@ -329,7 +324,7 @@ class ReactionRoles(commands.Cog):
                     if role and role in member.roles:
                         await member.remove_roles(role, reason="Reaction role unassigned")
 
-                        if REACTION_ROLE_DMS_ENABLED:
+                        if dms_enabled():
                             dm_embed = discord.Embed(
                                 title="Role Removed!",
                                 description=f"You have **lost** the role **{role.name}** in **{guild.name}**.",

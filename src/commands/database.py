@@ -13,7 +13,7 @@ from discord.ui import LayoutView, Container, TextDisplay, ActionRow, Button, Fi
 from api import config
 from api.discord_helpers import (
     has_role, is_in_guild, send_error, file_success_layout, status_layout,
-    build_unified_diff,
+    build_unified_diff, default_ui_error,
 )
 from api.alerts import send_alert, alert_embed, ALERT_COLOR_CAUTION
 from api.github import (
@@ -71,6 +71,9 @@ class DbSearchView(LayoutView):
 
         self.add_item(container)
         self.refresh_content()
+
+    async def on_error(self, interaction: discord.Interaction, error: Exception, item) -> None:
+        await default_ui_error(interaction, error, item, label="DbSearchView")
 
     def update_button_states(self):
         self.prev_button.disabled = self.current_index == 0
@@ -141,6 +144,9 @@ class RollbackResultView(LayoutView):
         )
         self.container.add_item(ActionRow(self.show_diff_button))
         self.add_item(self.container)
+
+    async def on_error(self, interaction: discord.Interaction, error: Exception, item) -> None:
+        await default_ui_error(interaction, error, item, label="RollbackResultView")
 
     async def on_show_diff(self, interaction: discord.Interaction):
         diff_text = "\n".join(self.diff_lines)

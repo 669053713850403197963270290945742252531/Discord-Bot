@@ -10,6 +10,7 @@ from api import config
 from api.discord_helpers import (
     has_role, is_in_guild, can_moderate, notify_user, build_embed,
     send_success, send_error, edit_or_send_error, error_embed, success_embed,
+    dms_enabled,
 )
 from api.alerts import (
     send_moderation_alert, alert_embed,
@@ -174,7 +175,8 @@ async def _ban_impl(interaction: discord.Interaction, target: discord.User, reas
                     embed.add_field(name="Duration", value=f"{duration} {minute_label}", inline=True)
                     embed.add_field(name="Unban Time", value=f"<t:{timestamp}:F>\n<t:{timestamp}:T> (<t:{timestamp}:R>)", inline=True)
 
-                await target.send(embed=embed)
+                if dms_enabled():
+                    await target.send(embed=embed)
             except Exception as e:
                 print(f"Could not DM {member}: {e}")
 
@@ -466,7 +468,8 @@ async def _run_temp_role_removal(bot: commands.Bot, entry: dict):
                         color=discord.Color.red(),
                         timestamp=datetime.now(timezone.utc),
                     )
-                    await fresh_member.send(embed=dm_embed)
+                    if dms_enabled():
+                        await fresh_member.send(embed=dm_embed)
                 except discord.Forbidden:
                     pass
     except asyncio.CancelledError:
@@ -606,7 +609,8 @@ async def _temprole_impl(interaction: discord.Interaction, target: discord.Membe
         dm_embed.add_field(name="Expires", value=f"<t:{timestamp}:F>", inline=False)
         dm_embed.set_thumbnail(url=role.icon.url if role.icon else interaction.guild.icon.url if interaction.guild.icon else None)
         dm_embed.set_footer(text="Temporary Role")
-        await target.send(embed=dm_embed)
+        if dms_enabled():
+            await target.send(embed=dm_embed)
     except discord.Forbidden:
         pass
 
@@ -1546,6 +1550,14 @@ class Moderation(commands.Cog):
     @has_role(config.REQUIRED_ROLE_ID)
     @is_in_guild(config.GUILD_ID)
     async def unban(self, interaction: discord.Interaction, user: discord.User):
+        # Deferred up front, same as /checkban's identical bans() call --
+        # this iterates the guild's *entire* ban list with no limit, which
+        # can easily blow past Discord's 3 second initial-response window
+        # on a server with a large ban list. Without this, the very first
+        # response (send_error/send_success below) can land after the
+        # interaction token has already gone stale, surfacing to the user
+        # as a silent "Unknown interaction" failure with no error shown.
+        await interaction.response.defer(ephemeral=True)
         try:
             bans = [ban async for ban in interaction.guild.bans()]
             banned_entry = discord.utils.find(lambda b: b.user.id == user.id, bans)

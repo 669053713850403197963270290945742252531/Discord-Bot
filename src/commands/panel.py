@@ -9,7 +9,7 @@ from discord.ext import commands
 from discord.ui import Modal, TextInput, Label, LayoutView, Container, TextDisplay, ActionRow, Button, View, File
 
 from api import config
-from api.discord_helpers import has_role, is_in_guild, send_success, send_error, build_embed, notify_user
+from api.discord_helpers import has_role, is_in_guild, send_success, send_error, build_embed, notify_user, default_ui_error
 from api.alerts import send_alert
 from api.github import (
     GitHubAPIError, fetch_users_with_sha, commit_users,
@@ -262,6 +262,9 @@ class RedeemKeyModal(Modal, title="Redeem Key"):
         component=TextInput(placeholder="64-character hex string", min_length=64, max_length=64),
     )
 
+    async def on_error(self, interaction: discord.Interaction, error: Exception) -> None:
+        await default_ui_error(interaction, error, label="RedeemKeyModal")
+
     async def on_submit(self, interaction: discord.Interaction):
         key = self.key.component.value.strip()
         hwid = self.hwid.component.value.strip()
@@ -391,6 +394,9 @@ class ResetHWIDModal(Modal, title="Reset HWID"):
         description="Pre-hashed HWID in SHA-256 (64 hex characters). Run /hwidhelp for help getting yours.",
         component=TextInput(placeholder="64-character hex string", min_length=64, max_length=64),
     )
+
+    async def on_error(self, interaction: discord.Interaction, error: Exception) -> None:
+        await default_ui_error(interaction, error, label="ResetHWIDModal")
 
     async def on_submit(self, interaction: discord.Interaction):
         hwid = self.hwid.component.value.strip()
