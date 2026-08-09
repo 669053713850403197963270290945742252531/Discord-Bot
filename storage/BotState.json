@@ -1,22 +1,11 @@
 {
   "schema_version": 1,
-  "last_updated": "2026-08-09T11:42:22Z",
+  "last_updated": "2026-08-09T11:43:25Z",
   "temp_bans": [],
   "lockdown": null,
   "channel_locks": [],
   "temp_bot_access": [],
-  "pending_breach_alerts": [
-    {
-      "id": "ba_ff0cd5",
-      "message_id": "1535976537822728193",
-      "channel_id": "1528301092826517595",
-      "created_at": "2026-08-09T11:42:22Z",
-      "owner_discord_id": "1161658957513895946",
-      "owner_identifier": "Wemmbu",
-      "hwid": "569c7f0b41ce9649602a0218cd02ed0b0a3d93130329451cc782b7dfda79ce71",
-      "attempting_discord_id": "999776749070078004"
-    }
-  ],
+  "pending_breach_alerts": [],
   "reaction_role_panel": null,
   "temp_roles": [],
   "ghostping_mode": "nothing",
