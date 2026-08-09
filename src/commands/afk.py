@@ -11,8 +11,7 @@ from api.discord_helpers import has_role, is_in_guild, safe_respond, send_succes
 GUILD = discord.Object(id=config.GUILD_ID)
 
 # In-memory AFK registry -- process-local and intentionally not persisted
-# (no file, no GitHub commit), the same tradeoff /togglealerts' mute switch
-# makes in api/alerts.py: AFK is a lightweight, session-scoped courtesy
+# (no file, no GitHub commit): AFK is a lightweight, session-scoped courtesy
 # feature rather than whitelist data, so it resets on restart instead of
 # needing a durable store. Keyed by Discord ID string -> {"message": str,
 # "since": datetime}.

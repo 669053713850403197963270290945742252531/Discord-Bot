@@ -7,8 +7,8 @@ encryption, string entropy analysis, a QR code generator, and a persistent
 control panel. Originally a single ~4,100-line `main.py` + ~1,600-line
 `bot_api.py`, refactored into this package -- and extended since with
 newer commands (classic ciphers + Identify, `/entropy`, bulk `/genpass`,
-modern `/encrypt`/`/decrypt`, `/qrcode`, and more). 83 commands total
-today (68 slash commands + 15 user context menus) -- `start.py` logs the
+modern `/encrypt`/`/decrypt`, `/qrcode`, and more). 84 commands total
+today (69 slash commands + 15 user context menus) -- `start.py` logs the
 live count on every boot rather than this README (or any hardcoded
 constant in the code) needing to be hand-updated as commands are added or
 removed.
@@ -51,7 +51,7 @@ Discord-Bot/
 │       ├── keys_hwid.py         # /key generate|validate|fetch|clear, /tempwhitelist, /checktemp, /extend, /forceresethwid, /resethwidcooldown
 │       ├── database.py          # /dbsearch, /export, /upload, /rollback, /commithistory, /fetchcommit, /verifydata
 │       ├── panel.py             # /createpanel, /updatescript + the persistent ControlPanelView
-│       ├── access.py            # /toggleaccess, /tempaccess, /togglealerts
+│       ├── access.py            # /toggleaccess, /tempaccess, /togglealerts (whitelist/moderation subcommands)
 │       ├── reaction_roles.py    # /reactionrole
 │       ├── afk.py               # /afk (set/clear/mod clear/mod check subcommands) -- AFK status with ping/reply notifications
 │       ├── qrcode.py            # /qrcode (generate/decode/help subcommands) -- QR code generator + scanner

@@ -50,11 +50,16 @@ from api import config
 from api.github import GitHubAPIError, refresh_users_cache, register_refresh_task, register_bot_loop, fetch_botstate_with_sha, get_cached_users
 from api.webhook_sync import sync_webhook_url
 from api.discord_helpers import send_error, notify_permission_error
+from api.alerts import reconcile_alerts_enabled
 from commands.panel import ControlPanelView, HWIDBreachButton
-from commands.moderation import reconcile_temp_bans, reconcile_channel_locks, reconcile_lockdown
+from commands.moderation import (
+    reconcile_temp_bans, reconcile_channel_locks, reconcile_lockdown,
+    reconcile_temp_roles, reconcile_ghostping_mode,
+)
 from commands.keys_hwid import reconcile_temp_whitelists
 from commands.access import reconcile_temp_access
 from commands.reaction_roles import reconcile_reaction_role_panel
+from commands.autorole import reconcile_autorole
 
 # // Intents & Client //
 
@@ -143,18 +148,55 @@ class Client(commands.Bot):
         # can't delay the rest of startup; it logs its own outcome.
         asyncio.create_task(sync_webhook_url())
 
+        def _count_leaf_commands(group):
+            """Recursively counts leaf (directly-invokable) commands nested
+            under `group`, drilling into nested subcommand groups -- e.g.
+            afk.py's /afk mod, a Group living inside the top-level /afk
+            group -- so those get counted as their own subcommands instead
+            of the nested group swallowing them into a single opaque
+            child."""
+            total = 0
+            for child in group.commands:
+                if isinstance(child, app_commands.Group):
+                    total += _count_leaf_commands(child)
+                else:
+                    total += 1
+            return total
+
+        def _split_top_level(top_level):
+            """top_level is whatever tree.get_commands(guild=...) or
+            Cog.get_app_commands() returns: a flat list of top-level chat
+            -input entries, standalone commands and groups alike, with each
+            group counted once regardless of how many subcommands live
+            under it. Splits that into (command_count, group_count,
+            subcommand_count) so "commands" always means standalone,
+            directly-invokable top-level commands -- never a mixed
+            command+group total -- matching /botstatus's own Commands
+            Registered/Groups Registered split in commands/info.py.
+            subcommand_count is every leaf command nested under any of
+            those groups (see _count_leaf_commands above), which the
+            "commands" figure deliberately excludes."""
+            groups = [c for c in top_level if isinstance(c, app_commands.Group)]
+            subcommands = sum(_count_leaf_commands(g) for g in groups)
+            return len(top_level) - len(groups), len(groups), subcommands
+
         guild_obj = discord.Object(id=config.GUILD_ID)
         total_extensions = len(EXTENSIONS)
         loaded_extensions = 0
-        # Sum of the per-extension before/after deltas below -- this is the
-        # dynamically-observed "expected" total, rather than a hardcoded
-        # constant that would need to be hand-updated (and could silently
-        # drift out of sync) every time a command is added/removed from any
-        # extension.
+        # Sums of the per-extension actual/expected figures below -- these
+        # are dynamically observed, rather than hardcoded constants that
+        # would need to be hand-updated (and could silently drift out of
+        # sync) every time a command is added/removed from any extension.
         commands_added = 0
+        groups_added = 0
+        subcommands_added = 0
+        commands_expected = 0
+        groups_expected = 0
+        subcommands_expected = 0
 
         for extension in EXTENSIONS:
-            before = len(self.tree.get_commands(guild=guild_obj))
+            before_commands, before_groups, before_subcommands = _split_top_level(self.tree.get_commands(guild=guild_obj))
+            before_cogs = set(self.cogs)
             print(f"Loading extension: {extension}")
             try:
                 await self.load_extension(extension)
@@ -163,27 +205,95 @@ class Client(commands.Bot):
                 traceback.print_exc()
                 continue
             loaded_extensions += 1
-            after = len(self.tree.get_commands(guild=guild_obj))
-            added = after - before
-            commands_added += added
-            print(f"Loaded extension:  {extension} ({added} commands loaded)")
+            after_commands, after_groups, after_subcommands = _split_top_level(self.tree.get_commands(guild=guild_obj))
+            added_commands = after_commands - before_commands
+            added_groups = after_groups - before_groups
+            added_subcommands = after_subcommands - before_subcommands
+            commands_added += added_commands
+            groups_added += added_groups
+            subcommands_added += added_subcommands
 
-        registered_commands = len(self.tree.get_commands(guild=guild_obj))
+            # How many commands/groups this extension's *source* actually
+            # defines, independent of what landed in the tree above -- so a
+            # mismatch (a name collision clobbering an earlier extension's
+            # command, a Discord-side platform limit like context_menus.py's
+            # 5-per-guild USER-command cap, etc.) is visible per-extension
+            # instead of only surfacing in the final tally below.
+            new_cog_name = next(iter(set(self.cogs) - before_cogs), None)
+            if new_cog_name is not None:
+                # Cog-based extension (every one of these except
+                # context_menus.py) -- Cog.get_app_commands() returns
+                # exactly what that cog's source defines, in the same
+                # top-level-only shape as tree.get_commands() above.
+                expected_commands, expected_groups, expected_subcommands = _split_top_level(self.get_cog(new_cog_name).get_app_commands())
+            else:
+                # No Cog was added -- e.g. commands.context_menus, which
+                # (per its own module docstring) hands its ContextMenu
+                # commands to the tree directly in setup() instead of via
+                # a Cog. Fall back to counting top-level app-command
+                # objects defined directly in the module's own namespace.
+                module_vars = vars(sys.modules[extension]).values() if extension in sys.modules else ()
+                module_commands = [
+                    obj for obj in module_vars
+                    if isinstance(obj, (app_commands.Command, app_commands.ContextMenu, app_commands.Group))
+                ]
+                expected_commands, expected_groups, expected_subcommands = _split_top_level(module_commands)
+
+            commands_expected += expected_commands
+            groups_expected += expected_groups
+            subcommands_expected += expected_subcommands
+            # Builds the "(...)" segment out of only the categories this
+            # extension actually has -- by expectation or by what landed in
+            # the tree -- rather than always listing commands/groups/
+            # subcommands regardless. A group-only cog like qrcode.py no
+            # longer prints a pointless "0/0 commands loaded" for the
+            # standalone-command slot it was never going to fill, and
+            # whichever groups it does have now report how many of their
+            # subcommands loaded (e.g. qrcode.py's generate/decode/help,
+            # or a nested group like afk.py's /afk mod) instead of the
+            # group count alone leaving that invisible.
+            segments = []
+            if added_commands or expected_commands:
+                segments.append(f"{added_commands}/{expected_commands} commands loaded")
+            if added_groups or expected_groups:
+                segments.append(f"{added_groups}/{expected_groups} groups loaded")
+            if added_subcommands or expected_subcommands:
+                segments.append(f"{added_subcommands}/{expected_subcommands} subcommands loaded")
+            if not segments:
+                # Nothing registered and nothing expected either -- flag it
+                # plainly instead of printing an empty, confusing-looking
+                # "()" (e.g. a listener-only extension with no app
+                # commands at all).
+                segments.append("no commands registered")
+            print(f"Loaded extension:  {extension} ({', '.join(segments)})")
+
+        registered_commands, registered_groups, registered_subcommands = _split_top_level(self.tree.get_commands(guild=guild_obj))
         print(
             f"All {loaded_extensions}/{total_extensions} extensions loaded, "
-            f"{registered_commands}/{commands_added} commands registered."
+            f"{registered_groups}/{groups_expected} groups, "
+            f"{registered_subcommands}/{subcommands_expected} subcommands, and "
+            f"{registered_commands}/{commands_expected} commands registered."
         )
-        if registered_commands != commands_added:
-            # Only possible if some extension's commands got clobbered by a
-            # same-named command from a later extension (before/after would
-            # show 0 added for the second one, but the first one's slot in
-            # the tree was silently overwritten rather than net-new). Worth
-            # flagging since it means two extensions collided on a command
-            # name.
+        if (
+            registered_commands != commands_added or registered_groups != groups_added
+            or registered_subcommands != subcommands_added
+            or registered_commands != commands_expected or registered_groups != groups_expected
+            or registered_subcommands != subcommands_expected
+        ):
+            # The first pair can only differ if some extension's commands got
+            # clobbered by a same-named command/group from a later extension
+            # (before/after would show 0 added for the second one, but the
+            # first one's slot in the tree was silently overwritten rather
+            # than net-new). The second pair differs whenever what actually
+            # registered doesn't match what an extension's source defines --
+            # e.g. a Discord-side platform limit (like context_menus.py's
+            # 5-per-guild USER-command cap) silently dropped some commands.
+            # Either way it means something's worth a closer look above.
             print(
-                "Warning: registered command count doesn't match the sum of "
-                "per-extension additions -- check for duplicate command names "
-                "across extensions."
+                "Warning: registered command/group counts don't match the "
+                "per-extension additions/expectations -- check for duplicate "
+                "command names across extensions, or a platform limit "
+                "silently dropping commands."
             )
 
     async def close(self):
@@ -250,8 +360,10 @@ class Client(commands.Bot):
         # pointer that only ever lived in process memory before -- temp
         # ban auto-unbans, an in-progress lockdown/its auto-lift, per-
         # channel lock auto-unlocks, temp whitelist expiry notifications
-        # (Users.json's own read-back), temp Bot Access auto-removals, and
-        # the reaction-role panel's message pointer. Without this, a
+        # (Users.json's own read-back), temp Bot Access auto-removals, the
+        # reaction-role panel's message pointer, temp role auto-removals,
+        # ghost ping detection mode, the autorole toggle+role, and the
+        # /togglealerts whitelist/moderation mute switches. Without this, a
         # restart mid-timer either makes a "temp" action silently
         # permanent, or silently stops a mechanism that was already
         # correctly persisted elsewhere. Guarded the same way as
@@ -285,6 +397,10 @@ class Client(commands.Bot):
             await reconcile_temp_whitelists(self)
             await reconcile_temp_access(self, botstate)
             await reconcile_reaction_role_panel(self, botstate)
+            await reconcile_temp_roles(self, botstate)
+            await reconcile_ghostping_mode(self, botstate)
+            await reconcile_autorole(self, botstate)
+            await reconcile_alerts_enabled(self, botstate)
 
         try:
             guild_obj = discord.Object(id=config.GUILD_ID)

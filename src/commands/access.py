@@ -9,9 +9,11 @@ from discord.ext import commands
 from api import config
 from api.discord_helpers import has_role, is_in_guild, send_success, send_error
 from api.alerts import (
-    send_alert, alert_embed,
+    send_alert, send_moderation_alert, alert_embed,
     ALERT_COLOR_ADD, ALERT_COLOR_REMOVE, ALERT_COLOR_TEMP, ALERT_COLOR_CAUTION,
     alerts_enabled, set_alerts_enabled,
+    moderation_alerts_enabled, set_moderation_alerts_enabled,
+    persist_alerts_enabled_state,
 )
 from api.github import GitHubAPIError, fetch_botstate_with_sha, update_botstate, new_state_id
 from api.time_utils import format_iso, parse_iso, seconds_until
@@ -235,30 +237,64 @@ async def _tempaccess_impl(interaction: discord.Interaction, user: discord.Membe
     await send_success(interaction, f"Given Bot Access role to {user.mention} for {minutes} minutes.")
 
 
-async def _togglealerts_impl(interaction: discord.Interaction):
-    """Flips api.alerts's mute switch. This is process-local and resets to
-    enabled on every restart -- see api.alerts._alerts_enabled -- so it's
-    meant for a single testing session, not a lasting setting. The toggle
+async def _togglealerts_whitelist_impl(interaction: discord.Interaction):
+    """Flips api.alerts's whitelist-side mute switch (the Alerts channel --
+    whitelist/keys/HWID/temp access/Bot Access role changes). The toggle
     itself always posts to the Alerts channel (bypass_mute=True) even when
     turning alerts *off*, so there's a visible record of exactly when/why
-    the channel went quiet instead of it just stopping with no trace."""
+    the channel went quiet instead of it just stopping with no trace.
+    Persisted to BotState.json so the mute state survives a restart
+    instead of failing back open."""
     now_enabled = set_alerts_enabled(not alerts_enabled())
+    await persist_alerts_enabled_state(
+        f"Whitelist alerts {'enabled' if now_enabled else 'disabled'} by {interaction.user} ({interaction.user.id})"
+    )
 
     if now_enabled:
         await send_alert(interaction.client, alert_embed(
             "🔔 Alerts Re-Enabled",
-            f"{interaction.user.mention} re-enabled staff alerts via `/togglealerts`.",
+            f"{interaction.user.mention} re-enabled whitelist alerts via `/togglealerts whitelist`.",
             color=ALERT_COLOR_ADD,
         ), bypass_mute=True)
-        await send_success(interaction, "Alerts have been **re-enabled** -- staff will see alert embeds again.")
+        await send_success(interaction, "Whitelist alerts have been **re-enabled** -- staff will see alert embeds again.")
     else:
         await send_alert(interaction.client, alert_embed(
             "🔕 Alerts Disabled",
-            f"{interaction.user.mention} disabled staff alerts via `/togglealerts`. "
+            f"{interaction.user.mention} disabled whitelist alerts via `/togglealerts whitelist`. "
             "No further alert embeds will post here until this is toggled back on.",
             color=ALERT_COLOR_CAUTION,
         ), bypass_mute=True)
-        await send_success(interaction, "Alerts have been **disabled** -- no alert embeds will post to the Alerts channel until this is toggled back on.")
+        await send_success(interaction, "Whitelist alerts have been **disabled** -- no alert embeds will post to the Alerts channel until this is toggled back on.")
+
+
+async def _togglealerts_moderation_impl(interaction: discord.Interaction):
+    """Moderation-side counterpart to _togglealerts_whitelist_impl() above --
+    flips api.alerts's moderation-side mute switch (the separate Moderation
+    Alerts channel that /ban, /kick, /mute, lock/lockdown toggles, and the
+    rest of commands.moderation post to) instead of the whitelist one. Same
+    always-visible-toggle, persisted-to-BotState.json conventions as the
+    whitelist version -- see that function's docstring for the full
+    reasoning."""
+    now_enabled = set_moderation_alerts_enabled(not moderation_alerts_enabled())
+    await persist_alerts_enabled_state(
+        f"Moderation alerts {'enabled' if now_enabled else 'disabled'} by {interaction.user} ({interaction.user.id})"
+    )
+
+    if now_enabled:
+        await send_moderation_alert(interaction.client, alert_embed(
+            "🔔 Alerts Re-Enabled",
+            f"{interaction.user.mention} re-enabled moderation alerts via `/togglealerts moderation`.",
+            color=ALERT_COLOR_ADD,
+        ), bypass_mute=True)
+        await send_success(interaction, "Moderation alerts have been **re-enabled** -- staff will see alert embeds again.")
+    else:
+        await send_moderation_alert(interaction.client, alert_embed(
+            "🔕 Alerts Disabled",
+            f"{interaction.user.mention} disabled moderation alerts via `/togglealerts moderation`. "
+            "No further alert embeds will post here until this is toggled back on.",
+            color=ALERT_COLOR_CAUTION,
+        ), bypass_mute=True)
+        await send_success(interaction, "Moderation alerts have been **disabled** -- no alert embeds will post to the Moderation Alerts channel until this is toggled back on.")
 
 
 class Access(commands.Cog):
@@ -281,12 +317,28 @@ class Access(commands.Cog):
     async def tempaccess(self, interaction: discord.Interaction, user: discord.Member, minutes: int):
         await _tempaccess_impl(interaction, user, minutes)
 
-    @app_commands.command(name="togglealerts", description="Toggles whether alert embeds post to the staff Alerts channel (e.g. during testing).")
-    @app_commands.guilds(GUILD)
+    # /togglealerts whitelist and /togglealerts moderation share a single
+    # guild-scoped group -- same pattern as afk.py's afk_group / moderation.py's
+    # ghostping_group -- so the guild restriction only needs to live once,
+    # here on the top-level group, for both subcommands to inherit it.
+    togglealerts_group = app_commands.guilds(GUILD)(
+        app_commands.Group(
+            name="togglealerts",
+            description="Toggles whether alert embeds post to a staff alerts channel (e.g. during testing).",
+        )
+    )
+
+    @togglealerts_group.command(name="whitelist", description="Toggles whether alert embeds post to the staff Alerts channel (whitelist/keys/HWID/access changes).")
     @has_role(config.REQUIRED_ROLE_ID)
     @is_in_guild(config.GUILD_ID)
-    async def togglealerts(self, interaction: discord.Interaction):
-        await _togglealerts_impl(interaction)
+    async def togglealerts_whitelist(self, interaction: discord.Interaction):
+        await _togglealerts_whitelist_impl(interaction)
+
+    @togglealerts_group.command(name="moderation", description="Toggles whether alert embeds post to the staff Moderation Alerts channel (bans/kicks/mutes/locks).")
+    @has_role(config.REQUIRED_ROLE_ID)
+    @is_in_guild(config.GUILD_ID)
+    async def togglealerts_moderation(self, interaction: discord.Interaction):
+        await _togglealerts_moderation_impl(interaction)
 
 
 async def setup(bot: commands.Bot):
