@@ -1,10 +1,21 @@
 {
   "schema_version": 1,
-  "last_updated": "2026-08-02T10:10:45Z",
+  "last_updated": "2026-08-09T11:08:07Z",
   "temp_bans": [],
   "lockdown": null,
   "channel_locks": [],
   "temp_bot_access": [],
   "pending_breach_alerts": [],
-  "reaction_role_panel": null
+  "reaction_role_panel": null,
+  "temp_roles": [],
+  "ghostping_mode": "nothing",
+  "autorole": {
+    "enabled": false,
+    "role_id": null
+  },
+  "alerts_enabled": {
+    "whitelist": false,
+    "moderation": true
+  },
+  "dms_enabled": true
 }
