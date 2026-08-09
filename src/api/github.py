@@ -518,7 +518,9 @@ def validate_stored_script(script_text: str) -> Optional[str]:
 # Durable checkpoint for everything that used to live only in process
 # memory -- temp ban unban timers, server lockdown / per-channel lock
 # snapshots+timers, temp Bot Access grants, pending HWID-breach alert
-# buttons, and the reaction-role panel message pointer. Same "fetch -> get
+# buttons, the reaction-role panel message pointer, temp role auto-removal
+# timers, ghost ping detection mode, the autorole toggle+role, and the
+# /togglealerts whitelist/moderation mute switches. Same "fetch -> get
 # sha -> mutate -> commit" shape as Users.json above, with one addition:
 # BotState.json is written to from many independent places that can
 # legitimately race each other (a ban timer firing at the same moment as a
@@ -543,6 +545,10 @@ DEFAULT_BOTSTATE: Dict[str, Any] = {
     "temp_bot_access": [],
     "pending_breach_alerts": [],
     "reaction_role_panel": None,
+    "temp_roles": [],
+    "ghostping_mode": "nothing",
+    "autorole": {"enabled": False, "role_id": None},
+    "alerts_enabled": {"whitelist": True, "moderation": True},
 }
 
 

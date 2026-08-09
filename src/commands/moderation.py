@@ -11,7 +11,10 @@ from api.discord_helpers import (
     has_role, is_in_guild, can_moderate, notify_user, build_embed,
     send_success, send_error, edit_or_send_error, error_embed, success_embed,
 )
-from api.alerts import send_alert, alert_embed, ALERT_COLOR_TEMP, ALERT_COLOR_REMOVE, ALERT_COLOR_CAUTION
+from api.alerts import (
+    send_moderation_alert, alert_embed,
+    ALERT_COLOR_ADD, ALERT_COLOR_REMOVE, ALERT_COLOR_EDIT, ALERT_COLOR_TEMP, ALERT_COLOR_CAUTION,
+)
 from api.github import GitHubAPIError, fetch_botstate_with_sha, update_botstate, new_state_id
 from api.time_utils import format_iso, parse_iso, seconds_until
 
@@ -208,6 +211,13 @@ async def _ban_impl(interaction: discord.Interaction, target: discord.User, reas
         summary_embed = success_embed(title="Ban Summary", fields=summary_fields)
         await interaction.edit_original_response(content=None, embed=summary_embed)
 
+        await send_moderation_alert(interaction.client, alert_embed(
+            "🔨 Member Banned",
+            f"{interaction.user.mention} banned {target.mention} via `/ban`.",
+            color=ALERT_COLOR_REMOVE,
+            fields=summary_fields,
+        ))
+
         if duration:
             entry = {
                 "id": new_state_id("tb"),
@@ -234,7 +244,7 @@ async def _ban_impl(interaction: discord.Interaction, target: discord.User, reas
                 # restart is exactly the failure mode this persistence
                 # exists to prevent.
                 print(f"Failed to persist temp ban for {target} to BotState.json: {e}")
-                await send_alert(interaction.client, alert_embed(
+                await send_moderation_alert(interaction.client, alert_embed(
                     "⚠️ Temp Ban Not Persisted",
                     f"{target.mention}'s temporary ban couldn't be saved to BotState.json ({e}). "
                     "It will still auto-unban on schedule *this session*, but would become permanent "
@@ -257,6 +267,12 @@ async def _kick_impl(interaction: discord.Interaction, target: discord.Member, r
         await can_moderate(interaction, target)
         await notify_user(target, "kicked", interaction.user, reason, interaction.guild.name)
         await target.kick(reason=reason)
+        await send_moderation_alert(interaction.client, alert_embed(
+            "👢 Member Kicked",
+            f"{interaction.user.mention} kicked {target.mention} via `/kick`.",
+            color=ALERT_COLOR_REMOVE,
+            fields=[("Reason", reason, False)],
+        ))
         await send_success(interaction, f"{target.mention} has been kicked.", fields=[("Reason", reason, False)])
     except app_commands.CheckFailure as e:
         await send_error(interaction, str(e))
@@ -322,6 +338,13 @@ async def _mute_impl(interaction: discord.Interaction, target: discord.Member, r
             embed=success_embed(f"{target.mention} has been muted.", fields=[("Reason", reason, False)]),
         )
 
+        await send_moderation_alert(interaction.client, alert_embed(
+            "🔇 Member Muted",
+            f"{interaction.user.mention} muted {target.mention} via `/mute`.",
+            color=ALERT_COLOR_REMOVE,
+            fields=[("Reason", reason, False)],
+        ))
+
         await notify_user(target, "muted", interaction.user, reason, guild.name)
 
     except Exception as e:
@@ -346,6 +369,12 @@ async def _unmute_impl(interaction: discord.Interaction, target: discord.Member,
 
     try:
         await target.remove_roles(muted_role, reason=f"Unmuted by {interaction.user}")
+        await send_moderation_alert(interaction.client, alert_embed(
+            "🔊 Member Unmuted",
+            f"{interaction.user.mention} unmuted {target.mention} via `/unmute`.",
+            color=ALERT_COLOR_ADD,
+            fields=[("Reason", reason, False)],
+        ))
         await send_success(interaction, f"{target.mention} has been unmuted.")
         await notify_user(target, "unmuted", interaction.user, reason, interaction.guild.name)
     except discord.Forbidden:
@@ -355,37 +384,80 @@ async def _unmute_impl(interaction: discord.Interaction, target: discord.Member,
 # =========================================================================
 # /temprole -- generalizes access.py's /tempaccess (which only ever grants
 # the single, fixed Bot Access role) to any role at all.
+#
+# The pending-removal timer used to live only in process memory -- a
+# restart mid-duration meant that particular auto-removal simply never
+# fired again, silently leaving the role on the member until someone
+# noticed and removed it by hand. Persisted to BotState.json's
+# "temp_roles" list now, same "fetch -> mutate -> commit" shape as
+# moderation.py's temp_bans -- see that section's comments for the full
+# reasoning. Keyed by a short random id (see api.github.new_state_id)
+# rather than (member_id, role_id) alone, since nothing stops the same
+# member+role pair from theoretically getting a fresh /temprole grant
+# after an earlier one already resolved.
 # =========================================================================
 
 # (member_id, role_id) pairs currently holding a role granted via
 # /temprole, so a second grant for the same member+role can be rejected
 # instead of stacking timers -- same convention as access.py's
 # _active_temp_access, just keyed on the role too since this isn't scoped
-# to one fixed role.
+# to one fixed role. Fast in-memory membership check; BotState.json's
+# "temp_roles" list is the durable source of truth.
 _active_temp_roles: set = set()
 
+# Running removal tasks, keyed by the BotState entry's id -- mirrors
+# moderation.py's _temp_ban_tasks / access.py's _temp_access_tasks, so a
+# reconciled (post-restart) task can be tracked the same way as a
+# freshly-granted one.
+_temp_role_tasks: dict = {}
 
-async def _remove_temp_role_after(interaction: discord.Interaction, target: discord.Member, role: discord.Role, minutes: int):
-    key = (target.id, role.id)
+
+async def _clear_temp_role_state(entry_id: str):
+    """Removes a resolved (fired, or the role/member disappeared) temp role
+    entry from BotState.json. Best-effort -- logged rather than raised,
+    since the Discord-side role removal (or the discovery that there was
+    nothing left to remove) has already happened by the time this runs."""
+    def _mutate(state):
+        state["temp_roles"] = [e for e in state.get("temp_roles", []) if e.get("id") != entry_id]
+        return state
     try:
-        await asyncio.sleep(minutes * 60)
+        await update_botstate(_mutate, f"Temp role resolved: {entry_id}")
+    except GitHubAPIError as e:
+        print(f"Failed to clear resolved temp role {entry_id} from BotState.json: {e}")
+
+
+async def _run_temp_role_removal(bot: commands.Bot, entry: dict):
+    """Sleeps until `entry`'s expires_at (or fires almost immediately if
+    that's already in the past -- e.g. the bot was down past it), then
+    removes the role and clears the BotState entry. Shared by both a fresh
+    /temprole grant and startup reconciliation, so there's exactly one code
+    path for "what happens when a temp role's timer goes off.\""""
+    entry_id = entry["id"]
+    key = (int(entry["discord_id"]), int(entry["role_id"]))
+    try:
+        await asyncio.sleep(seconds_until(parse_iso(entry.get("expires_at"))))
+
+        guild = bot.get_guild(int(entry["guild_id"]))
+        role = guild.get_role(int(entry["role_id"])) if guild else None
 
         # Fetch a fresh member since roles aren't always reflected on the
         # cached object right away, and the member may have left and
         # rejoined (or the role may have been removed manually) in the
         # meantime.
-        guild = interaction.client.get_guild(target.guild.id)
-        fresh_member = guild.get_member(target.id) if guild else None
-        if fresh_member and role in fresh_member.roles:
+        fresh_member = guild.get_member(int(entry["discord_id"])) if guild else None
+
+        if guild is None or role is None:
+            print(f"Could not find guild/role to auto-remove expired temp role for {entry['discord_id']} (temp role {entry_id}).")
+        elif fresh_member and role in fresh_member.roles:
             try:
                 await fresh_member.remove_roles(role, reason="Temporary role expired")
             except discord.Forbidden:
                 print(f"Missing permissions to remove expired temp role {role} from {fresh_member}")
             else:
-                await send_alert(interaction.client, alert_embed(
+                await send_moderation_alert(bot, alert_embed(
                     "⌛ Temp Role Expired",
-                    f"{target.mention}'s temporary {role.mention} role expired and was auto-removed.",
-                    color=discord.Color.red(),
+                    f"{fresh_member.mention}'s temporary {role.mention} role expired and was auto-removed.",
+                    color=ALERT_COLOR_REMOVE,
                 ))
                 try:
                     dm_embed = discord.Embed(
@@ -397,10 +469,57 @@ async def _remove_temp_role_after(interaction: discord.Interaction, target: disc
                     await fresh_member.send(embed=dm_embed)
                 except discord.Forbidden:
                     pass
+    except asyncio.CancelledError:
+        raise
     except Exception as e:
-        print(f"Error removing temporary role {role} from {target}: {e}")
+        print(f"Error removing temporary role for {entry.get('discord_id')} (temp role {entry_id}): {e}")
     finally:
         _active_temp_roles.discard(key)
+        _temp_role_tasks.pop(entry_id, None)
+        await _clear_temp_role_state(entry_id)
+
+
+def _schedule_temp_role(bot: commands.Bot, entry: dict):
+    """(Re)schedules the auto-removal task for `entry`. Cancels whatever
+    task was already tracked for this entry id first (shouldn't normally
+    happen -- each entry only gets scheduled once, at grant time or at
+    startup -- but keeps this safe to call more than once for the same
+    entry)."""
+    entry_id = entry["id"]
+    key = (int(entry["discord_id"]), int(entry["role_id"]))
+    existing = _temp_role_tasks.get(entry_id)
+    if existing and not existing.done():
+        existing.cancel()
+    _active_temp_roles.add(key)
+    _temp_role_tasks[entry_id] = bot.loop.create_task(_run_temp_role_removal(bot, entry))
+
+
+async def reconcile_temp_roles(bot: commands.Bot, state: Optional[Dict[str, Any]] = None):
+    """Called once from on_ready: re-schedules every temp role's
+    auto-removal timer using the durable expires_at recorded in
+    BotState.json, so a restart before the original timer fired no longer
+    leaves the role on the member indefinitely. Entries whose expires_at
+    has already passed fire (almost) immediately via seconds_until()'s
+    clamp-to-zero, rather than staying granted until someone notices.
+
+    `state` lets a caller that's already fetched BotState.json (e.g.
+    start.py's on_ready, reconciling several categories back to back) hand
+    it over directly instead of this making its own redundant fetch of the
+    exact same file. Falls back to fetching it itself when called on its
+    own with nothing passed in."""
+    if state is None:
+        try:
+            state, _sha = await fetch_botstate_with_sha()
+        except GitHubAPIError as e:
+            print(f"Failed to fetch BotState.json for temp role reconciliation: {e}")
+            return
+
+    entries = state.get("temp_roles", [])
+    for entry in entries:
+        _schedule_temp_role(bot, entry)
+
+    if entries:
+        print(f"Reconciled {len(entries)} temp role(s) from BotState.json.")
 
 
 async def _temprole_impl(interaction: discord.Interaction, target: discord.Member, role: discord.Role, duration: int, reason: str = "No reason provided"):
@@ -423,11 +542,43 @@ async def _temprole_impl(interaction: discord.Interaction, target: discord.Membe
     except discord.HTTPException as e:
         return await send_error(interaction, f"Failed to assign role: {e}")
 
-    _active_temp_roles.add(key)
-
     expiry = datetime.now(timezone.utc) + timedelta(minutes=duration)
     timestamp = int(expiry.timestamp())
     minute_label = "minute" if duration == 1 else "minutes"
+
+    entry = {
+        "id": new_state_id("tr"),
+        "discord_id": str(target.id),
+        "guild_id": str(interaction.guild.id),
+        "role_id": str(role.id),
+        "reason": reason,
+        "granted_at": format_iso(datetime.now(timezone.utc)),
+        "expires_at": format_iso(expiry),
+        "granted_by_id": str(interaction.user.id),
+        "granted_by_tag": str(interaction.user),
+    }
+
+    try:
+        def _mutate(state, entry=entry):
+            state.setdefault("temp_roles", []).append(entry)
+            return state
+        await update_botstate(_mutate, f"Temp role recorded: {target} <- {role} ({target.id})")
+    except GitHubAPIError as e:
+        # The role grant itself already succeeded (add_roles() above) --
+        # this only means the auto-removal timer won't survive a restart
+        # until BotState.json can be reached again. Still schedule the
+        # in-memory task below so this process's own timer works
+        # regardless, and flag it to staff since a "temp" role silently
+        # becoming permanent on the next restart is exactly the failure
+        # mode this persistence exists to prevent.
+        print(f"Failed to persist temp role for {target} to BotState.json: {e}")
+        await send_moderation_alert(interaction.client, alert_embed(
+            "⚠️ Temp Role Not Persisted",
+            f"{target.mention}'s temporary {role.mention} role couldn't be saved to BotState.json ({e}). "
+            "It will still auto-remove on schedule *this session*, but would stay on the member "
+            "permanently if the bot restarts before then.",
+            color=ALERT_COLOR_CAUTION,
+        ))
 
     await send_success(
         interaction,
@@ -438,7 +589,7 @@ async def _temprole_impl(interaction: discord.Interaction, target: discord.Membe
         ],
     )
 
-    await send_alert(interaction.client, alert_embed(
+    await send_moderation_alert(interaction.client, alert_embed(
         "⏳ Temp Role Granted",
         f"{interaction.user.mention} granted {target.mention} the {role.mention} role for {duration} {minute_label} via `/temprole`.",
         color=ALERT_COLOR_TEMP,
@@ -459,7 +610,7 @@ async def _temprole_impl(interaction: discord.Interaction, target: discord.Membe
     except discord.Forbidden:
         pass
 
-    interaction.client.loop.create_task(_remove_temp_role_after(interaction, target, role, duration))
+    _schedule_temp_role(interaction.client, entry)
 
 
 # =========================================================================
@@ -543,6 +694,12 @@ async def _slowmode_impl(interaction: discord.Interaction, seconds: int, channel
 
     try:
         await target.edit(slowmode_delay=seconds, reason=f"Slowmode set by {interaction.user}")
+        await send_moderation_alert(interaction.client, alert_embed(
+            "🐌 Slowmode Changed",
+            f"{interaction.user.mention} set slowmode for {target.mention} to "
+            f"**{_format_slowmode(seconds)}** via `/slowmode`.",
+            color=ALERT_COLOR_EDIT,
+        ))
         await send_success(
             interaction,
             f"Slowmode for {target.mention} set to **{_format_slowmode(seconds)}**.",
@@ -790,6 +947,19 @@ async def _togglelock_impl(
     confirmation_fields = [("Note", "Duration is ignored when unlocking.", False)] if ignored_duration else None
     await send_success(interaction, f"{target.mention} has been {action}.", fields=confirmation_fields)
 
+    alert_fields = []
+    if duration and action == "locked":
+        minute_label = "minute" if duration == 1 else "minutes"
+        alert_fields.append(("Duration", f"{duration} {minute_label}", False))
+    if message:
+        alert_fields.append(("Announcement", message, False))
+    await send_moderation_alert(interaction.client, alert_embed(
+        "🔒 Channel Locked" if action == "locked" else "🔓 Channel Unlocked",
+        f"{interaction.user.mention} {action} {target.mention} via `/togglelock`.",
+        color=ALERT_COLOR_CAUTION if action == "locked" else ALERT_COLOR_ADD,
+        fields=alert_fields or None,
+    ))
+
     if message:
         await _send_lock_announcement(
             target,
@@ -823,7 +993,7 @@ async def _togglelock_impl(
             # becoming permanent on the next restart is exactly the failure
             # mode this persistence exists to prevent.
             print(f"Failed to persist channel lock for {getattr(target, 'name', target.id)} to BotState.json: {e}")
-            await send_alert(interaction.client, alert_embed(
+            await send_moderation_alert(interaction.client, alert_embed(
                 "⚠️ Channel Lock Not Persisted",
                 f"{target.mention}'s timed lock couldn't be saved to BotState.json ({e}). "
                 "It will still auto-unlock on schedule *this session*, but would stay locked "
@@ -1098,6 +1268,20 @@ async def _togglelockdown_impl(
     confirmation_fields = [("Note", "Duration is ignored when unlocking.", False)] if ignored_duration else None
     await send_success(interaction, f"{action.capitalize()} {count} channel(s).", fields=confirmation_fields)
 
+    alert_fields = [("Channels Affected", str(count), True)]
+    if duration and action == "locked":
+        minute_label = "minute" if duration == 1 else "minutes"
+        alert_fields.append(("Duration", f"{duration} {minute_label}", True))
+    if message:
+        alert_fields.append(("Announcement", message, False))
+    await send_moderation_alert(interaction.client, alert_embed(
+        "🔒 Server Locked Down" if action == "locked" else "🔓 Server Unlocked",
+        f"{interaction.user.mention} {'locked down' if action == 'locked' else 'lifted the lockdown on'} "
+        f"the server via `/togglelockdown`.",
+        color=ALERT_COLOR_CAUTION if action == "locked" else ALERT_COLOR_ADD,
+        fields=alert_fields,
+    ))
+
     if message:
         await _send_lock_announcement(
             announce_channel,
@@ -1133,12 +1317,51 @@ async def _togglelockdown_impl(
 GHOSTPING_MODE_NOTHING = "nothing"
 GHOSTPING_MODE_ANNOUNCED = "announced"
 
-# Runtime-only detection mode for /ghostping toggle. In-memory and
-# process-local -- deliberately not persisted anywhere (no file, no GitHub
-# commit), same tradeoff api.alerts._alerts_enabled makes for
-# /togglealerts -- so it resets to the default (Nothing) on every restart
-# instead of being a durable guild setting.
+# Detection mode for /ghostping toggle. Kept in-memory for fast access from
+# on_message_delete below, mirrored to BotState.json's "ghostping_mode" key
+# on every toggle so it survives a restart instead of silently resetting to
+# Nothing -- reconcile_ghostping_mode() reads it back in on_ready.
 _ghostping_mode = GHOSTPING_MODE_NOTHING
+
+
+async def _persist_ghostping_mode(message: str):
+    """Mirrors the in-memory `_ghostping_mode` to BotState.json. Best-effort
+    -- logged rather than raised, since the toggle itself has already taken
+    effect in-process by the time this runs; a failure here only means the
+    mode would fall back to Nothing on the next restart instead of resuming
+    where it left off."""
+    def _mutate(state):
+        state["ghostping_mode"] = _ghostping_mode
+        return state
+    try:
+        await update_botstate(_mutate, message)
+    except GitHubAPIError as e:
+        print(f"Failed to persist ghost ping detection mode to BotState.json: {e}")
+
+
+async def reconcile_ghostping_mode(bot: commands.Bot, state: Optional[Dict[str, Any]] = None):
+    """Called once from on_ready: restores `_ghostping_mode` from
+    BotState.json, so a restart resumes whichever mode staff last set via
+    /ghostping toggle instead of silently reverting to Nothing.
+
+    `state` lets a caller that's already fetched BotState.json hand it over
+    directly instead of this making its own redundant fetch -- see
+    reconcile_temp_bans() above for the full reasoning."""
+    global _ghostping_mode
+    if state is None:
+        try:
+            state, _sha = await fetch_botstate_with_sha()
+        except GitHubAPIError as e:
+            print(f"Failed to fetch BotState.json for ghost ping mode reconciliation: {e}")
+            return
+
+    mode = state.get("ghostping_mode", GHOSTPING_MODE_NOTHING)
+    if mode not in (GHOSTPING_MODE_NOTHING, GHOSTPING_MODE_ANNOUNCED):
+        mode = GHOSTPING_MODE_NOTHING
+
+    _ghostping_mode = mode
+    if _ghostping_mode != GHOSTPING_MODE_NOTHING:
+        print(f"Reconciled ghost ping detection mode from BotState.json: {_ghostping_mode}.")
 
 
 async def _find_message_deleter(message: discord.Message) -> Optional[discord.abc.User]:
@@ -1240,17 +1463,28 @@ async def _ghostping_user_impl(interaction: discord.Interaction, user: discord.U
     except discord.HTTPException as e:
         return await send_error(interaction, f"Failed to ghost ping: {e}")
 
+    await send_moderation_alert(interaction.client, alert_embed(
+        "👻 Ghost Ping Sent",
+        f"{interaction.user.mention} ghost pinged {user.mention} in {interaction.channel.mention} via `/ghostping user`.",
+        color=ALERT_COLOR_CAUTION,
+    ))
     await send_success(interaction, f"Ghost pinged {user.mention}.")
 
 
 async def _ghostping_toggle_impl(interaction: discord.Interaction):
-    """Flips between GHOSTPING_MODE_NOTHING and GHOSTPING_MODE_ANNOUNCED.
-    Process-local and resets to the Nothing default on every restart --
-    see _ghostping_mode above -- same convention as /togglealerts."""
+    """Flips between GHOSTPING_MODE_NOTHING and GHOSTPING_MODE_ANNOUNCED,
+    persisting the new mode to BotState.json so it survives a restart --
+    see _ghostping_mode above."""
     global _ghostping_mode
     _ghostping_mode = GHOSTPING_MODE_ANNOUNCED if _ghostping_mode == GHOSTPING_MODE_NOTHING else GHOSTPING_MODE_NOTHING
+    await _persist_ghostping_mode(f"Ghost ping detection mode set to {_ghostping_mode} by {interaction.user} ({interaction.user.id})")
 
     if _ghostping_mode == GHOSTPING_MODE_ANNOUNCED:
+        await send_moderation_alert(interaction.client, alert_embed(
+            "👻 Ghost Ping Detection Enabled",
+            f"{interaction.user.mention} set ghost ping detection to **Announced** via `/ghostping toggle`.",
+            color=ALERT_COLOR_ADD,
+        ))
         await send_success(
             interaction,
             "Ghost ping detection is now **Announced**. Deleting a message that mentions a user or role will "
@@ -1258,6 +1492,11 @@ async def _ghostping_toggle_impl(interaction: discord.Interaction):
             "sender also deleted it themselves.",
         )
     else:
+        await send_moderation_alert(interaction.client, alert_embed(
+            "👻 Ghost Ping Detection Disabled",
+            f"{interaction.user.mention} set ghost ping detection to **Nothing** via `/ghostping toggle`.",
+            color=ALERT_COLOR_CAUTION,
+        ))
         await send_success(
             interaction,
             "Ghost ping detection is now **Nothing**. Deleted mentions will be ignored -- same as normal.",
@@ -1324,6 +1563,11 @@ class Moderation(commands.Cog):
             # until its original timer eventually fires.
             await _cancel_temp_ban_for(user.id, interaction.guild.id)
 
+            await send_moderation_alert(interaction.client, alert_embed(
+                "🔓 Member Unbanned",
+                f"{interaction.user.mention} unbanned {user.mention} via `/unban`.",
+                color=ALERT_COLOR_ADD,
+            ))
             await send_success(interaction, f"Successfully unbanned {user.mention}.")
 
         except discord.Forbidden:
@@ -1360,6 +1604,11 @@ class Moderation(commands.Cog):
             return
 
         count = len(deleted)
+        await send_moderation_alert(interaction.client, alert_embed(
+            "🧹 Messages Purged",
+            f"{interaction.user.mention} purged {count} {'message' if count == 1 else 'messages'} in {interaction.channel.mention} via `/purge`.",
+            color=ALERT_COLOR_CAUTION,
+        ))
         await send_success(interaction, f"Purged {count} {'message' if count == 1 else 'messages'}.")
 
     @app_commands.command(name="kick", description="Kicks a member from the server.")
@@ -1414,6 +1663,13 @@ class Moderation(commands.Cog):
     async def dm(self, interaction: discord.Interaction, target: discord.User, message: str):
         try:
             await target.send(message)
+            trimmed_message = message if len(message) <= 500 else message[:497] + "..."
+            await send_moderation_alert(interaction.client, alert_embed(
+                "✉️ DM Sent",
+                f"{interaction.user.mention} sent a DM to {target.mention} via `/dm`.",
+                color=ALERT_COLOR_EDIT,
+                fields=[("Message", trimmed_message, False)],
+            ))
             await send_success(interaction, f"Sent message to {target.mention}.")
         except discord.Forbidden as e:
             if e.code == 50007:

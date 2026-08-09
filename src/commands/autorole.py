@@ -1,4 +1,4 @@
-from typing import Optional
+from typing import Any, Dict, Optional
 
 import discord
 from discord import app_commands
@@ -6,6 +6,7 @@ from discord.ext import commands
 
 from api import config
 from api.discord_helpers import has_role, is_in_guild, send_success, send_error
+from api.github import GitHubAPIError, fetch_botstate_with_sha, update_botstate
 
 GUILD = discord.Object(id=config.GUILD_ID)
 
@@ -13,21 +14,62 @@ GUILD = discord.Object(id=config.GUILD_ID)
 # /autorole -- /autorole set (which role) and /autorole toggle (whether it's
 # currently applied to new members).
 #
-# Both pieces of state are in-memory and process-local -- deliberately not
-# persisted anywhere (no file, no GitHub commit), the same tradeoff
-# api.alerts._alerts_enabled makes for /togglealerts and _ghostping_mode
-# makes for /ghostping toggle in moderation.py. That means a restart clears
-# both the configured role *and* the enabled/disabled state, rather than
-# quietly resuming whatever was set before -- so autorole always comes back
-# up requiring an explicit /autorole set + /autorole toggle rather than
-# silently auto-assigning a role someone might not expect after a redeploy.
-# If persistence across restarts turns out to matter more than that
-# fail-safe default, this is a good candidate to move into a GitHub-backed
-# settings file the way permittedKeys.txt/storedscript.lua already work.
+# Both pieces of state are kept in-memory for fast access from
+# on_member_join below, and mirrored to BotState.json's "autorole" key
+# ({"enabled": ..., "role_id": ...}) on every /autorole set or /autorole
+# toggle so a restart resumes whatever was configured instead of silently
+# clearing it -- reconcile_autorole() below reads it back in on_ready.
 # =========================================================================
 
 _autorole_enabled: bool = False
 _autorole_role_id: Optional[int] = None
+
+
+async def _persist_autorole_state(message: str):
+    """Mirrors the in-memory `_autorole_enabled`/`_autorole_role_id` to
+    BotState.json. Best-effort -- logged rather than raised, since the
+    setting itself has already taken effect in-process by the time this
+    runs; a failure here only means it would fall back to disabled/unset on
+    the next restart instead of resuming where it left off."""
+    def _mutate(state):
+        state["autorole"] = {
+            "enabled": _autorole_enabled,
+            "role_id": str(_autorole_role_id) if _autorole_role_id is not None else None,
+        }
+        return state
+    try:
+        await update_botstate(_mutate, message)
+    except GitHubAPIError as e:
+        print(f"Failed to persist autorole state to BotState.json: {e}")
+
+
+async def reconcile_autorole(bot: commands.Bot, state: Optional[Dict[str, Any]] = None):
+    """Called once from on_ready: restores `_autorole_enabled` and
+    `_autorole_role_id` from BotState.json, so a restart resumes whatever
+    was configured via /autorole set + /autorole toggle instead of silently
+    reverting to disabled/unset.
+
+    `state` lets a caller that's already fetched BotState.json hand it over
+    directly instead of this making its own redundant fetch -- see
+    commands.moderation.reconcile_temp_bans() for the full reasoning."""
+    global _autorole_enabled, _autorole_role_id
+    if state is None:
+        try:
+            state, _sha = await fetch_botstate_with_sha()
+        except GitHubAPIError as e:
+            print(f"Failed to fetch BotState.json for autorole reconciliation: {e}")
+            return
+
+    saved = state.get("autorole") or {}
+    _autorole_enabled = bool(saved.get("enabled", False))
+    raw_role_id = saved.get("role_id")
+    try:
+        _autorole_role_id = int(raw_role_id) if raw_role_id else None
+    except (TypeError, ValueError):
+        _autorole_role_id = None
+
+    if _autorole_enabled or _autorole_role_id is not None:
+        print(f"Reconciled autorole from BotState.json (enabled={_autorole_enabled}, role_id={_autorole_role_id}).")
 
 
 def _autorole_assignability_warning(guild: discord.Guild, role: discord.Role) -> Optional[str]:
@@ -78,6 +120,7 @@ class Autorole(commands.Cog):
             return await send_error(interaction, f"{role.mention} is managed by a bot/integration and can't be manually assigned.")
 
         _autorole_role_id = role.id
+        await _persist_autorole_state(f"Autorole role set to {role} ({role.id}) by {interaction.user} ({interaction.user.id})")
 
         fields = [("Currently", "Enabled" if _autorole_enabled else "Disabled -- run `/autorole toggle` to turn it on", False)]
         warning = _autorole_assignability_warning(interaction.guild, role)
@@ -92,6 +135,7 @@ class Autorole(commands.Cog):
     async def autorole_toggle(self, interaction: discord.Interaction):
         global _autorole_enabled
         _autorole_enabled = not _autorole_enabled
+        await _persist_autorole_state(f"Autorole toggled {'enabled' if _autorole_enabled else 'disabled'} by {interaction.user} ({interaction.user.id})")
 
         if not _autorole_enabled:
             await send_success(interaction, "Autorole is now **disabled** -- new members won't be given a role automatically.")

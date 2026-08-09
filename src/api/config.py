@@ -51,6 +51,14 @@ BUYER_ROLE_ID = _require_int("BUYER_ROLE_ID")
 # file so existing deployments don't need to change anything.
 ALERTS_CHANNEL_ID = _require_int("REDEEM_ALERTS_CHANNEL_ID")
 
+# Staff-only channel that receives an alert for every moderation action --
+# bans, kicks, mutes, unmutes, unbans, purges, temp roles, DMs, ghost pings,
+# slowmode changes, and channel/server lock toggles. Kept separate from
+# ALERTS_CHANNEL_ID above so a busy moderation channel doesn't drown out
+# whitelist/key/access alerts (or vice versa), and so either stream can be
+# muted independently via /togglealerts whitelist|moderation.
+MODERATION_ALERTS_CHANNEL_ID = _require_int("MODERATION_ALERTS_CHANNEL_ID")
+
 # Timezone JoinDate values are displayed/stored in (handles EST/EDT automatically)
 LOCAL_TZ = ZoneInfo("America/New_York")
 
@@ -87,8 +95,10 @@ STORED_SCRIPT_API_URL = f"https://api.github.com/repos/{OWNER}/{STORAGE_REPO}/co
 # storage/BotState.json -- durable checkpoint for everything that used to
 # live only in process memory: temp ban unban timers, server lockdown/
 # per-channel lock snapshots+timers, temp Bot Access grants, pending HWID-
-# breach alert buttons, and the reaction-role panel message pointer. Read
-# back on every startup (see each cog's reconcile_*() function, called from
+# breach alert buttons, the reaction-role panel message pointer, temp role
+# auto-removal timers, ghost ping detection mode, the autorole toggle+role,
+# and the /togglealerts whitelist/moderation mute switches. Read back on
+# every startup (see each cog's reconcile_*() function, called from
 # start.py's on_ready) so a restart degrades to "resume where it left off"
 # instead of "silently forget this was ever temporary." Lives in this bot's
 # own storage repo, same as permittedKeys.txt/storedscript.lua above.

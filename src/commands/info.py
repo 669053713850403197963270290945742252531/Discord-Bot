@@ -214,6 +214,20 @@ class Info(commands.Cog):
             else "No longer live -- run /botstatus again for current status"
         )
 
+        # get_commands(guild=GUILD) returns every top-level chat-input entry
+        # -- standalone commands AND groups alike -- with a group counted
+        # once regardless of how many subcommands live under it (adding a
+        # leaf to an existing group, e.g. /togglealerts moderation, doesn't
+        # move this number; only registering a brand new top-level group
+        # does). Splitting that combined list into the two counts below
+        # keeps "Commands Registered" meaning what it says -- standalone,
+        # directly-invokable commands -- instead of silently double-duty as
+        # a mixed command+group total, with groups now visible in their own
+        # right alongside it.
+        top_level = self.bot.tree.get_commands(guild=GUILD)
+        group_count = sum(1 for c in top_level if isinstance(c, app_commands.Group))
+        command_count = len(top_level) - group_count
+
         return build_embed(
             title="🤖 Bot Status",
             color=sync_state["color"],
@@ -224,7 +238,8 @@ class Info(commands.Cog):
                 ("🌐 Guilds", str(len(self.bot.guilds)), True),
                 ("📦 User Cache", sync_state["status"], False),
                 ("🕒 Cache Last Updated", last_updated, True),
-                ("🧩 Commands Registered", str(len(self.bot.tree.get_commands(guild=GUILD))), True),
+                ("🧩 Commands Registered", str(command_count), True),
+                ("🗂️ Groups Registered", str(group_count), True),
                 ("📚 discord.py", discord.__version__, True),
                 ("🐍 Python", platform.python_version(), True),
             ],
