@@ -11,6 +11,7 @@ from discord.ext import commands
 from api import config
 from api.discord_helpers import (
     has_role, is_in_guild, send_success, send_error, file_success_layout, resolve_user_option,
+    dms_enabled,
 )
 from commands.whitelist import whitelisted_user_autocomplete
 from api.alerts import (
@@ -95,7 +96,8 @@ def _schedule_temp_whitelist_expiry(bot: commands.Bot, guild: Optional[discord.G
                             timestamp=datetime.now(timezone.utc),
                         )
                         expiring_embed.add_field(name="Expires", value=f"<t:{expires_ts}:F>\n<t:{expires_ts}:R>", inline=False)
-                        await user.send(embed=expiring_embed)
+                        if dms_enabled():
+                            await user.send(embed=expiring_embed)
                     except Exception:
                         pass
 
@@ -130,7 +132,8 @@ def _schedule_temp_whitelist_expiry(bot: commands.Bot, guild: Optional[discord.G
                         color=discord.Color.red(),
                         timestamp=datetime.now(timezone.utc),
                     )
-                    await user.send(embed=removed_embed)
+                    if dms_enabled():
+                        await user.send(embed=removed_embed)
                 except Exception:
                     pass
         except asyncio.CancelledError:
@@ -254,7 +257,8 @@ async def _tempwhitelist_impl(interaction: discord.Interaction, user: discord.Us
         granted_embed.add_field(name="Duration", value=f"{minutes} {minute_label}", inline=True)
         granted_embed.add_field(name="Expires", value=f"<t:{expires_ts}:F>\n<t:{expires_ts}:R>", inline=True)
         granted_embed.set_footer(text=f"Granted by: {interaction.user}")
-        await user.send(embed=granted_embed)
+        if dms_enabled():
+            await user.send(embed=granted_embed)
     except Exception as e:
         print(f"Could not DM temp whitelist grant to {user}: {e}")
 
@@ -338,7 +342,8 @@ async def _extend_impl(interaction: discord.Interaction, user: discord.User, min
         )
         extended_embed.add_field(name="New Expiry", value=f"<t:{expires_ts}:F>\n<t:{expires_ts}:R>", inline=False)
         extended_embed.set_footer(text=f"Extended by: {interaction.user}")
-        await user.send(embed=extended_embed)
+        if dms_enabled():
+            await user.send(embed=extended_embed)
     except Exception as e:
         print(f"Could not DM temp whitelist extension to {user}: {e}")
 

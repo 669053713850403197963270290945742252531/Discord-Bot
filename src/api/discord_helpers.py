@@ -9,12 +9,14 @@ plain no-button status layout).
 import difflib
 import io
 from datetime import datetime, timezone
-from typing import Any, List, Optional, Tuple
+from typing import Any, Dict, List, Optional, Tuple
 
 import discord
 from discord import app_commands
+from discord.ext import commands
 from discord.ui import Container, File, LayoutView, TextDisplay
 
+from api.github import GitHubAPIError, fetch_botstate_with_sha, update_botstate
 from api.keys import is_valid_discord_id
 
 # =========================================================================
@@ -88,6 +90,82 @@ def error_embed(
 ) -> discord.Embed:
     """Red-flagged embed for validation failures, exceptions, or 'not found' results."""
     return build_embed(title, description, color=color, **kwargs)
+
+
+# =========================================================================
+# /toggledms -- global switch for non-essential member-facing DMs
+# =========================================================================
+#
+# Runtime mute switch for /toggledms, gating notify_user()/
+# notify_permission_error() below plus every "manual" DM site that doesn't
+# go through either of those (temp whitelist grant/extend/expiry, the ban
+# member-path DM, temprole grant/expiry, reaction role add/remove -- see
+# each of those modules for their own `if dms_enabled():` guard). Kept
+# in-memory for fast access from every DM call site, and mirrored to
+# BotState.json's "dms_enabled" key on every toggle -- see
+# persist_dms_enabled_state()/reconcile_dms_enabled() below -- so a restart
+# resumes whichever state staff last left it in instead of silently
+# reopening DMs. Defaults to enabled so a restart before reconciliation
+# runs (or if reconciliation itself fails) fails open (DMs resume) instead
+# of silently staying muted with no indication why. Deliberately doesn't
+# cover /dm or /checktemp's tracker -- see access.py's _toggledms_impl()
+# docstring for why those two are excluded.
+_dms_enabled = True
+
+
+def dms_enabled() -> bool:
+    """Current state of the /toggledms switch, for anything that wants to
+    reflect it (e.g. a status command) without importing the private flag
+    directly."""
+    return _dms_enabled
+
+
+def set_dms_enabled(value: bool) -> bool:
+    """Sets the /toggledms switch. Returns the new state for convenience at
+    call sites that want to immediately report it back. In-memory only --
+    callers that want the change to survive a restart should follow up with
+    persist_dms_enabled_state()."""
+    global _dms_enabled
+    _dms_enabled = value
+    return _dms_enabled
+
+
+async def persist_dms_enabled_state(message: str):
+    """Mirrors the in-memory switch to BotState.json. Called after
+    set_dms_enabled() so the new state survives a restart. Best-effort --
+    logged rather than raised, since the mute switch itself has already
+    taken effect in-process by the time this runs; a failure here only
+    means it would fall back to enabled on the next restart instead of
+    resuming where it left off."""
+    def _mutate(state):
+        state["dms_enabled"] = _dms_enabled
+        return state
+    try:
+        await update_botstate(_mutate, message)
+    except GitHubAPIError as e:
+        print(f"Failed to persist DM mute state to BotState.json: {e}")
+
+
+async def reconcile_dms_enabled(bot: commands.Bot, state: Optional[Dict[str, Any]] = None):
+    """Called once from on_ready: restores the switch from BotState.json,
+    so a restart resumes whatever /toggledms state staff last left it in
+    instead of silently reopening DMs.
+
+    `state` lets a caller that's already fetched BotState.json hand it over
+    directly instead of this making its own redundant fetch -- see
+    commands.moderation.reconcile_temp_bans() for the full reasoning."""
+    global _dms_enabled
+    if state is None:
+        try:
+            state, _sha = await fetch_botstate_with_sha()
+        except GitHubAPIError as e:
+            print(f"Failed to fetch BotState.json for DM mute state reconciliation: {e}")
+            return
+
+    _dms_enabled = bool(state.get("dms_enabled", True))
+
+    if not _dms_enabled:
+        print("Reconciled DM mute state from BotState.json (dms_enabled=False).")
 
 
 # =========================================================================
@@ -195,6 +273,35 @@ async def edit_or_send_error(
         await send_error(interaction, description, title=title, fields=fields, footer=footer, thumbnail=thumbnail)
 
 
+async def default_ui_error(
+    interaction: discord.Interaction,
+    error: Exception,
+    item=None,
+    *,
+    label: str = "UI component",
+):
+    """
+    Shared View/Modal on_error implementation.
+
+    discord.py's default View.on_error/Modal.on_error only print to
+    stderr and never touch the interaction -- so any exception that
+    escapes a button/select/modal callback (and isn't already caught
+    internally) leaves the interaction completely unanswered. Discord
+    then shows the user a bare "This interaction failed" with no
+    explanation, and the only trace is this print() on the server.
+
+    Wire this in per-class as:
+        async def on_error(self, interaction, error, item):
+            await default_ui_error(interaction, error, item, label="MyView")
+    (Modal.on_error has the same shape minus `item`.)
+    """
+    print(f"Error in {label} for item {item!r}: {error}")
+    try:
+        await send_error(interaction, "Something went wrong. Please try again, and let a moderator know if it keeps happening.")
+    except Exception as e:
+        print(f"Failed to notify user of {label} error: {e}")
+
+
 async def resolve_user_option(interaction: discord.Interaction, raw_user: str) -> Optional[discord.User]:
     """
     Resolves a raw `user` slash-command option -- typed or picked from a
@@ -232,6 +339,9 @@ async def resolve_user_option(interaction: discord.Interaction, raw_user: str) -
 
 
 async def notify_user(user, action: str, moderator, reason: str, guild_name: str):
+    if not dms_enabled():
+        return
+
     titles = {
         "muted": (f"You have been muted in {guild_name}", discord.Color.red()),
         "banned": (f"You have been banned from {guild_name}", discord.Color.red()),
@@ -262,7 +372,13 @@ async def notify_permission_error(user, action: str, guild_name: str):
     Meant for raw gateway event handlers (reaction roles, etc.) where
     there's no interaction to reply to, so a discord.Forbidden would
     otherwise vanish into the console with no feedback to anyone.
+
+    Gated behind /toggledms like every other non-essential member-facing
+    DM -- see the _dms_enabled block above.
     """
+    if not dms_enabled():
+        return
+
     embed = error_embed(
         title="Action Failed",
         description=(

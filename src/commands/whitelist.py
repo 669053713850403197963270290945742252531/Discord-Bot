@@ -17,6 +17,7 @@ from discord.ui import (
 from api import config
 from api.discord_helpers import (
     has_role, is_in_guild, send_success, send_error, status_layout, resolve_user_option,
+    default_ui_error,
 )
 from api.alerts import (
     send_alert, alert_embed,
@@ -86,8 +87,8 @@ class WhitelistModal(Modal, title="Whitelist a User"):
     )
     target_user = Label(
         text="Discord User",
-        description="Discord ID or @mention. Works even if they aren't in this server.",
-        component=TextInput(placeholder="e.g. 123456789012345678 or <@123456789012345678>", max_length=32),
+        description="Right-click their name/pfp → Copy User ID. Works whether they're in this server or not.",
+        component=TextInput(placeholder="e.g. 123456789012345678", max_length=32),
     )
     rank = Label(
         text="Rank",
@@ -117,6 +118,9 @@ class WhitelistModal(Modal, title="Whitelist a User"):
             # editable in case the wrong user was right-clicked.
             self.target_user.component.default = str(target.id)
 
+    async def on_error(self, interaction: discord.Interaction, error: Exception) -> None:
+        await default_ui_error(interaction, error, label="WhitelistModal")
+
     async def on_submit(self, interaction: discord.Interaction):
         identifier = self.identifier.component.value.strip()
         hwid = self.hwid.component.value.strip()
@@ -124,15 +128,19 @@ class WhitelistModal(Modal, title="Whitelist a User"):
         notes = (self.notes.component.value or "").strip() or None
 
         raw_target = self.target_user.component.value.strip()
+        # A pasted mention (<@id>) is still tolerated so an accidental
+        # right-click "Copy" of the wrong thing (or an @-mention pasted out
+        # of habit) doesn't bounce -- but the field only ever needs a bare
+        # ID typed in, in-server or not, so that's the only thing surfaced
+        # in the label/placeholder/error text below.
         mention_match = re.fullmatch(r"<@!?(\d{17,20})>", raw_target)
         discord_id = mention_match.group(1) if mention_match else raw_target
 
         if not is_valid_discord_id(discord_id):
             return await send_error(
                 interaction,
-                "Invalid Discord User. Enter a valid Discord ID or @mention "
-                "(e.g. `123456789012345678` or `<@123456789012345678>`) -- this works "
-                "even if the user isn't in this server.",
+                f"`{raw_target}` isn't a valid Discord ID. Right-click their name/pfp → Copy User ID "
+                "and paste that -- this works the same whether they're in this server or not.",
             )
         mention = f"<@{discord_id}>"
 
@@ -220,7 +228,7 @@ def _parse_bulk_whitelist_row(
     mention_match = re.fullmatch(r"<@!?(\d{17,20})>", raw_discord)
     discord_id = mention_match.group(1) if mention_match else raw_discord
     if not is_valid_discord_id(discord_id):
-        return None, f"Invalid Discord ID/mention (`{raw_discord or 'blank'}`)"
+        return None, f"Invalid Discord ID (`{raw_discord or 'blank'}`)"
 
     if not is_valid_hwid(hwid):
         return None, "Invalid HWID (must be 64 hex characters)"
@@ -498,6 +506,9 @@ class EditWhitelistModal(Modal):
         )
         self.add_item(self.json_input)
 
+    async def on_error(self, interaction: discord.Interaction, error: Exception) -> None:
+        await default_ui_error(interaction, error, label="EditWhitelistModal")
+
     async def on_submit(self, interaction: discord.Interaction):
         new_content = self.json_input.value.strip()
 
@@ -604,8 +615,8 @@ class EditUserCommandModal(Modal):
         )
         self.discord_user = Label(
             text="Discord User",
-            description="Discord ID or @mention. Works even if not in server.",
-            component=TextInput(default=self.original_discord_id[:32], placeholder="e.g. 123456789012345678 or <@123...>", max_length=32),
+            description="Right-click their name/pfp → Copy User ID. Works whether they're in this server or not.",
+            component=TextInput(default=self.original_discord_id[:32], placeholder="e.g. 123456789012345678", max_length=32),
         )
         self.rank = Label(
             text="Rank",
@@ -631,6 +642,9 @@ class EditUserCommandModal(Modal):
         for field in (self.identifier, self.discord_user, self.rank, self.hwid, self.notes):
             self.add_item(field)
 
+    async def on_error(self, interaction: discord.Interaction, error: Exception) -> None:
+        await default_ui_error(interaction, error, label="EditUserCommandModal")
+
     async def on_submit(self, interaction: discord.Interaction):
         identifier = self.identifier.component.value.strip()
         rank = self.rank.component.value.strip()
@@ -638,14 +652,16 @@ class EditUserCommandModal(Modal):
         notes = (self.notes.component.value or "").strip() or None
 
         raw_target = self.discord_user.component.value.strip()
+        # See WhitelistModal.on_submit -- a pasted mention is tolerated as
+        # a fallback, but the field only ever asks for a bare ID.
         mention_match = re.fullmatch(r"<@!?(\d{17,20})>", raw_target)
         discord_id = mention_match.group(1) if mention_match else raw_target
 
         if not is_valid_discord_id(discord_id):
             return await send_error(
                 interaction,
-                "Invalid Discord User. Enter a valid Discord ID or @mention "
-                "(e.g. `123456789012345678` or `<@123456789012345678>`).",
+                f"`{raw_target}` isn't a valid Discord ID. Right-click their name/pfp → Copy User ID "
+                "and paste that -- this works the same whether they're in this server or not.",
             )
 
         # Only enforce the HWID format if it was actually changed, so a
@@ -813,6 +829,9 @@ class EditUserModal(Modal):
         for field in (self.identifier, self.rank, self.hwid, self.key, self.notes):
             self.add_item(field)
 
+    async def on_error(self, interaction: discord.Interaction, error: Exception) -> None:
+        await default_ui_error(interaction, error, label="EditUserModal")
+
     async def on_submit(self, interaction: discord.Interaction):
         new_notes = self.notes.value or None
         discord_id = self.user_data.get("DiscordId")
@@ -920,6 +939,9 @@ class DeleteUserConfirmView(LayoutView):
         container.add_item(row)
         self.add_item(container)
 
+    async def on_error(self, interaction: discord.Interaction, error: Exception, item) -> None:
+        await default_ui_error(interaction, error, item, label="DeleteUserConfirmView")
+
     async def confirm(self, interaction: discord.Interaction):
         view = self.whitelist_view
 
@@ -975,6 +997,9 @@ class WhitelistView(LayoutView):
         self.edit_button.callback = self.on_edit
         self.delete_button.callback = self.on_delete
         self.refresh_button.callback = self.on_refresh
+
+    async def on_error(self, interaction: discord.Interaction, error: Exception, item) -> None:
+        await default_ui_error(interaction, error, item, label="WhitelistView")
 
     def update_button_states(self):
         self.prev_button.disabled = self.current_index == 0
@@ -1105,6 +1130,9 @@ class ConfirmClearLayout(LayoutView):
 
     async def on_timeout(self):
         self.confirmed = None
+
+    async def on_error(self, interaction: discord.Interaction, error: Exception, item) -> None:
+        await default_ui_error(interaction, error, item, label="ConfirmClearLayout")
 
     async def confirm(self, interaction: discord.Interaction):
         if interaction.user.id != self.author_id:

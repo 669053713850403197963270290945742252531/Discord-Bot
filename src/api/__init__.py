@@ -92,6 +92,7 @@ from .discord_helpers import (
     build_embed, success_embed, error_embed,
     safe_respond, send_success, send_error, edit_or_send_error,
     notify_user, notify_permission_error,
+    dms_enabled, set_dms_enabled, persist_dms_enabled_state, reconcile_dms_enabled,
     has_role, is_in_guild, can_moderate,
     file_success_layout, status_layout,
 )

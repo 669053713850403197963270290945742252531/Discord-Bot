@@ -53,7 +53,7 @@ from discord.ext import commands
 from discord.ui import ActionRow, Button, Container, LayoutView, TextDisplay
 
 from api import config
-from api.discord_helpers import has_role, is_in_guild, safe_respond, send_error
+from api.discord_helpers import has_role, is_in_guild, safe_respond, send_error, default_ui_error
 from api.entropy import analyze_entropy, crack_times_for_bits, rating_for
 from api.passwords import (
     generate_random_password, generate_passphrase, passphrase_entropy_bits,
@@ -263,6 +263,9 @@ class GenPassLayout(LayoutView):
         container.add_item(ActionRow(regenerate_button))
 
         self.add_item(container)
+
+    async def on_error(self, interaction: discord.Interaction, error: Exception, item) -> None:
+        await default_ui_error(interaction, error, item, label="GenPassLayout")
 
     async def on_regenerate(self, interaction: discord.Interaction):
         try:

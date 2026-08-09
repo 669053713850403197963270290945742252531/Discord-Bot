@@ -7,7 +7,10 @@ from discord import app_commands
 from discord.ext import commands
 
 from api import config
-from api.discord_helpers import has_role, is_in_guild, send_success, send_error
+from api.discord_helpers import (
+    has_role, is_in_guild, send_success, send_error,
+    dms_enabled, set_dms_enabled, persist_dms_enabled_state,
+)
 from api.alerts import (
     send_alert, send_moderation_alert, alert_embed,
     ALERT_COLOR_ADD, ALERT_COLOR_REMOVE, ALERT_COLOR_TEMP, ALERT_COLOR_CAUTION,
@@ -297,6 +300,44 @@ async def _togglealerts_moderation_impl(interaction: discord.Interaction):
         await send_success(interaction, "Moderation alerts have been **disabled** -- no alert embeds will post to the Moderation Alerts channel until this is toggled back on.")
 
 
+async def _toggledms_impl(interaction: discord.Interaction):
+    """Flips api.discord_helpers's global DM switch, which every
+    non-essential member-facing DM the bot sends checks before going out --
+    temp whitelist grant/extend/expiry notices, ban/kick/mute/unmute
+    notices, temprole grant/expiry notices, and reaction role add/remove
+    notices. Deliberately leaves /dm and /checktemp's tracker alone, since
+    those commands' entire purpose is to deliver a DM rather than notify
+    about a side effect of something else. Persisted to BotState.json so
+    the state survives a restart instead of failing back open."""
+    now_enabled = set_dms_enabled(not dms_enabled())
+    await persist_dms_enabled_state(
+        f"DM notifications {'enabled' if now_enabled else 'disabled'} by {interaction.user} ({interaction.user.id})"
+    )
+
+    if now_enabled:
+        await send_moderation_alert(interaction.client, alert_embed(
+            "🔔 DM Notifications Enabled",
+            f"{interaction.user.mention} re-enabled DM notifications via `/toggledms`.",
+            color=ALERT_COLOR_ADD,
+        ))
+        await send_success(
+            interaction,
+            "DM notifications are now **enabled** -- members will again be DMed about temp whitelist, "
+            "ban/kick/mute/unmute, temprole, and reaction role changes.",
+        )
+    else:
+        await send_moderation_alert(interaction.client, alert_embed(
+            "🔕 DM Notifications Disabled",
+            f"{interaction.user.mention} disabled DM notifications via `/toggledms`.",
+            color=ALERT_COLOR_CAUTION,
+        ))
+        await send_success(
+            interaction,
+            "DM notifications are now **disabled** -- members will no longer be DMed about temp whitelist, "
+            "ban/kick/mute/unmute, temprole, or reaction role changes. `/dm` and `/checktemp` are unaffected.",
+        )
+
+
 class Access(commands.Cog):
     def __init__(self, bot: commands.Bot):
         self.bot = bot
@@ -339,6 +380,13 @@ class Access(commands.Cog):
     @is_in_guild(config.GUILD_ID)
     async def togglealerts_moderation(self, interaction: discord.Interaction):
         await _togglealerts_moderation_impl(interaction)
+
+    @app_commands.command(name="toggledms", description="Toggles DM notifications for whitelist, moderation, temprole, and reaction role changes.")
+    @app_commands.guilds(GUILD)
+    @has_role(config.REQUIRED_ROLE_ID)
+    @is_in_guild(config.GUILD_ID)
+    async def toggledms(self, interaction: discord.Interaction):
+        await _toggledms_impl(interaction)
 
 
 async def setup(bot: commands.Bot):
