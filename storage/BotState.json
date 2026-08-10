@@ -1,21 +1,11 @@
 {
   "schema_version": 1,
-  "last_updated": "2026-08-10T01:43:36Z",
+  "last_updated": "2026-08-10T01:44:27Z",
   "temp_bans": [],
   "lockdown": null,
   "channel_locks": [],
   "temp_bot_access": [],
   "pending_breach_alerts": [
-    {
-      "id": "ba_70dfd5",
-      "message_id": "1536187862104412281",
-      "channel_id": "1528301092826517595",
-      "created_at": "2026-08-10T01:42:06Z",
-      "owner_discord_id": "1058495565899505763",
-      "owner_identifier": "Knit",
-      "hwid": "76958b38b94f9c0bcf4556140624b71831857159ca53a339b3d3d256aafe9b42",
-      "attempting_discord_id": "1027811163653816360"
-    },
     {
       "id": "ba_8ee114",
       "message_id": "1536188240938274897",
