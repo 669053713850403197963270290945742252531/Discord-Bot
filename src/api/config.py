@@ -97,7 +97,8 @@ STORED_SCRIPT_API_URL = f"https://api.github.com/repos/{OWNER}/{STORAGE_REPO}/co
 # per-channel lock snapshots+timers, temp Bot Access grants, pending HWID-
 # breach alert buttons, the reaction-role panel message pointer, temp role
 # auto-removal timers, ghost ping detection mode, the autorole toggle+role,
-# and the /togglealerts whitelist/moderation mute switches. Read back on
+# the /togglealerts whitelist/moderation mute switches, and /warnings'
+# warning records. Read back on
 # every startup (see each cog's reconcile_*() function, called from
 # start.py's on_ready) so a restart degrades to "resume where it left off"
 # instead of "silently forget this was ever temporary." Lives in this bot's

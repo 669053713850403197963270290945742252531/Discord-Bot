@@ -1,7 +1,7 @@
 """
 Entry point. Everything else in this package is a library (api/) or an
 extension (commands/); this is the only file that actually constructs the
-Client, wires the 14 extensions into it, and calls bot.run().
+Client, wires the 17 extensions into it, and calls bot.run().
 
 Run from the repo root with `python src/start.py` (after `pip install -r
 requirements.txt` and filling in `.env`).
@@ -60,6 +60,7 @@ from commands.keys_hwid import reconcile_temp_whitelists
 from commands.access import reconcile_temp_access
 from commands.reaction_roles import reconcile_reaction_role_panel
 from commands.autorole import reconcile_autorole
+from commands.warnings import reconcile_warnings_cache, reconcile_warning_config
 
 # // Intents & Client //
 
@@ -85,6 +86,7 @@ EXTENSIONS = (
     "commands.autorole",
     "commands.context_menus",
     "commands.qrcode",
+    "commands.warnings",
 )
 
 # Guards the BotState.json reconciliation block in on_ready() so it only
@@ -362,8 +364,9 @@ class Client(commands.Bot):
         # channel lock auto-unlocks, temp whitelist expiry notifications
         # (Users.json's own read-back), temp Bot Access auto-removals, the
         # reaction-role panel's message pointer, temp role auto-removals,
-        # ghost ping detection mode, the autorole toggle+role, and the
-        # /togglealerts whitelist/moderation mute switches. Without this, a
+        # ghost ping detection mode, the autorole toggle+role, the
+        # /togglealerts whitelist/moderation mute switches, and the
+        # /warnings autocomplete cache. Without this, a
         # restart mid-timer either makes a "temp" action silently
         # permanent, or silently stops a mechanism that was already
         # correctly persisted elsewhere. Guarded the same way as
@@ -402,6 +405,8 @@ class Client(commands.Bot):
             await reconcile_autorole(self, botstate)
             await reconcile_alerts_enabled(self, botstate)
             await reconcile_dms_enabled(self, botstate)
+            await reconcile_warnings_cache(self, botstate)
+            await reconcile_warning_config(self, botstate)
 
         try:
             guild_obj = discord.Object(id=config.GUILD_ID)
