@@ -1,12 +1,15 @@
 {
   "schema_version": 1,
-  "last_updated": "2026-08-10T01:24:32Z",
+  "last_updated": "2026-08-10T01:26:46Z",
   "temp_bans": [],
   "lockdown": null,
   "channel_locks": [],
   "temp_bot_access": [],
   "pending_breach_alerts": [],
-  "reaction_role_panel": null,
+  "reaction_role_panel": {
+    "channel_id": "1403125677925863484",
+    "message_id": "1536184003361640541"
+  },
   "temp_roles": [],
   "ghostping_mode": "announced",
   "autorole": {
