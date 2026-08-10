@@ -1,6 +1,6 @@
 {
   "schema_version": 1,
-  "last_updated": "2026-08-10T01:23:31Z",
+  "last_updated": "2026-08-10T01:23:40Z",
   "temp_bans": [],
   "lockdown": null,
   "channel_locks": [],
@@ -11,7 +11,7 @@
   "ghostping_mode": "announced",
   "autorole": {
     "enabled": true,
-    "role_id": null
+    "role_id": "1403129577269760090"
   },
   "alerts_enabled": {
     "whitelist": true,
