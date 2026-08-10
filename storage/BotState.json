@@ -1,6 +1,6 @@
 {
   "schema_version": 1,
-  "last_updated": "2026-08-09T21:31:43Z",
+  "last_updated": "2026-08-10T00:50:19Z",
   "temp_bans": [],
   "lockdown": null,
   "channel_locks": [],
@@ -15,7 +15,7 @@
   },
   "alerts_enabled": {
     "whitelist": false,
-    "moderation": false
+    "moderation": true
   },
   "dms_enabled": true
 }
