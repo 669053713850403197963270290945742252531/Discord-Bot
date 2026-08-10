@@ -1,25 +1,13 @@
 {
   "schema_version": 1,
-  "last_updated": "2026-08-10T00:51:57Z",
+  "last_updated": "2026-08-10T00:52:57Z",
   "temp_bans": [],
   "lockdown": null,
   "channel_locks": [],
   "temp_bot_access": [],
   "pending_breach_alerts": [],
   "reaction_role_panel": null,
-  "temp_roles": [
-    {
-      "id": "tr_845496",
-      "discord_id": "1058495565899505763",
-      "guild_id": "1263334150018961559",
-      "role_id": "1403129501768089730",
-      "reason": "test 1",
-      "granted_at": "2026-08-10T00:51:57Z",
-      "expires_at": "2026-08-10T00:52:57Z",
-      "granted_by_id": "999776749070078004",
-      "granted_by_tag": "corradeknight"
-    }
-  ],
+  "temp_roles": [],
   "ghostping_mode": "nothing",
   "autorole": {
     "enabled": false,
