@@ -521,8 +521,10 @@ def validate_stored_script(script_text: str) -> Optional[str]:
 # buttons, the reaction-role panel message pointer, temp role auto-removal
 # timers, ghost ping detection mode, the autorole toggle+role, the
 # /togglealerts whitelist/moderation mute switches, and the /toggledms
-# switch. Same "fetch -> get sha -> mutate -> commit" shape as Users.json
-# above, with one addition:
+# switch. Also home to /warnings' warning records -- those carry no timer,
+# but live here anyway rather than in Users.json since they're bot-side
+# moderation history, not whitelist data. Same "fetch -> get sha -> mutate
+# -> commit" shape as Users.json above, with one addition:
 # BotState.json is written to from many independent places that can
 # legitimately race each other (a ban timer firing at the same moment as a
 # moderator running /togglelock, for instance) rather than Users.json's
@@ -551,6 +553,19 @@ DEFAULT_BOTSTATE: Dict[str, Any] = {
     "autorole": {"enabled": False, "role_id": None},
     "alerts_enabled": {"whitelist": True, "moderation": True},
     "dms_enabled": True,
+    "warnings": [],
+    # /warnings config's auto-action preferences -- see commands/warnings.py's
+    # DEFAULT_WARNING_CONFIG for the authoritative copy of these defaults and
+    # what each key means. Kept in sync manually (like autorole/alerts_enabled
+    # above) since importing commands.warnings from here would be circular.
+    "warning_config": {
+        "enabled": False,
+        "threshold": 3,
+        "action": "timeout",
+        "timeout_minutes": 60,
+        "reset_after_action": True,
+        "notify_target": True,
+    },
 }
 
 

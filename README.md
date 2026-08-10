@@ -55,6 +55,7 @@ Discord-Bot/
 │       ├── reaction_roles.py    # /reactionrole
 │       ├── afk.py               # /afk (set/clear/mod clear/mod check subcommands) -- AFK status with ping/reply notifications
 │       ├── qrcode.py            # /qrcode (generate/decode/help subcommands) -- QR code generator + scanner
+│       ├── warnings.py          # /warnings (add/inspect/clear/delete subcommands) -- durable member warning history
 │       └── context_menus.py     # the 15 right-click "user" context menu commands
 ├── storage/                      # permittedKeys.txt, storedscript.lua, test scripts for createpanel
 ├── .env.example

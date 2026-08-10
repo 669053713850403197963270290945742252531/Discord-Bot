@@ -347,6 +347,8 @@ async def notify_user(user, action: str, moderator, reason: str, guild_name: str
         "banned": (f"You have been banned from {guild_name}", discord.Color.red()),
         "unmuted": (f"You have been unmuted in {guild_name}", discord.Color.green()),
         "kicked": (f"You have been kicked from {guild_name}", discord.Color.red()),
+        "warned": (f"You have been warned in {guild_name}", discord.Color.orange()),
+        "timed_out": (f"You have been timed out in {guild_name}", discord.Color.red()),
     }
     title, color = titles.get(action, (f"Notification from {guild_name}", discord.Color.blue()))
 
