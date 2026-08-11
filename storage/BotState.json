@@ -1,12 +1,17 @@
 {
   "schema_version": 1,
-  "last_updated": "2026-08-11T08:21:32Z",
+  "last_updated": "2026-08-11T08:21:34Z",
   "temp_bans": [],
   "banned_users": [
     {
       "discord_id": "1161658957513895946",
       "tag": "wemmbu.",
       "reason": "HWID breach -- HWID shared/leaked, actioned by corradeknight"
+    },
+    {
+      "discord_id": "1058495565899505763",
+      "tag": "mystic_0148",
+      "reason": "Reached 10 warning(s) -- /warnings config auto-action threshold is 10."
     }
   ],
   "lockdown": null,
