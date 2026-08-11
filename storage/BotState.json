@@ -1,6 +1,6 @@
 {
   "schema_version": 1,
-  "last_updated": "2026-08-11T08:21:21Z",
+  "last_updated": "2026-08-11T08:21:24Z",
   "temp_bans": [],
   "banned_users": [
     {
@@ -82,6 +82,15 @@
       "moderator_id": "999776749070078004",
       "moderator_tag": "corradeknight",
       "created_at": "2026-08-11T08:21:21Z"
+    },
+    {
+      "id": "warn_27118e",
+      "guild_id": "1263334150018961559",
+      "discord_id": "1058495565899505763",
+      "reason": "7",
+      "moderator_id": "999776749070078004",
+      "moderator_tag": "corradeknight",
+      "created_at": "2026-08-11T08:21:23Z"
     }
   ],
   "warning_config": {
