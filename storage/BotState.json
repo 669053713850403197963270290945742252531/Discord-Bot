@@ -1,6 +1,6 @@
 {
   "schema_version": 1,
-  "last_updated": "2026-08-11T00:11:25Z",
+  "last_updated": "2026-08-11T07:13:33Z",
   "temp_bans": [],
   "lockdown": null,
   "channel_locks": [],
@@ -24,10 +24,10 @@
   "warnings": [],
   "warning_config": {
     "enabled": true,
-    "threshold": 1,
+    "threshold": 3,
     "action": "timeout",
-    "timeout_minutes": 40320,
+    "timeout_minutes": 5,
     "reset_after_action": true,
-    "notify_target": false
+    "notify_target": true
   }
 }
