@@ -1,6 +1,6 @@
 {
   "schema_version": 1,
-  "last_updated": "2026-08-11T08:15:48Z",
+  "last_updated": "2026-08-11T08:21:00Z",
   "temp_bans": [],
   "banned_users": [
     {
@@ -31,7 +31,7 @@
   "warnings": [],
   "warning_config": {
     "enabled": true,
-    "threshold": 3,
+    "threshold": 10,
     "action": "ban",
     "timeout_minutes": 60,
     "reset_after_action": true,
