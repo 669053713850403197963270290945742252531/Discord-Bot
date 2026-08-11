@@ -1,6 +1,6 @@
 {
   "schema_version": 1,
-  "last_updated": "2026-08-11T07:48:35Z",
+  "last_updated": "2026-08-11T07:48:38Z",
   "temp_bans": [],
   "banned_users": [
     {
@@ -28,35 +28,7 @@
     "moderation": true
   },
   "dms_enabled": true,
-  "warnings": [
-    {
-      "id": "warn_bf5500",
-      "guild_id": "1263334150018961559",
-      "discord_id": "1058495565899505763",
-      "reason": "invites",
-      "moderator_id": "999776749070078004",
-      "moderator_tag": "corradeknight",
-      "created_at": "2026-08-11T07:15:34Z"
-    },
-    {
-      "id": "warn_6102fe",
-      "guild_id": "1263334150018961559",
-      "discord_id": "1058495565899505763",
-      "reason": "peak",
-      "moderator_id": "999776749070078004",
-      "moderator_tag": "corradeknight",
-      "created_at": "2026-08-11T07:48:14Z"
-    },
-    {
-      "id": "warn_cc8bcd",
-      "guild_id": "1263334150018961559",
-      "discord_id": "1058495565899505763",
-      "reason": "promotion",
-      "moderator_id": "999776749070078004",
-      "moderator_tag": "corradeknight",
-      "created_at": "2026-08-11T07:48:35Z"
-    }
-  ],
+  "warnings": [],
   "warning_config": {
     "enabled": true,
     "threshold": 3,
