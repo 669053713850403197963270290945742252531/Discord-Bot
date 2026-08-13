@@ -1,6 +1,6 @@
 {
   "schema_version": 1,
-  "last_updated": "2026-08-13T08:12:33Z",
+  "last_updated": "2026-08-13T08:12:57Z",
   "ez_host": {
     "shorten": {
       "ijyh3i": {
@@ -29,6 +29,15 @@
         "deletion_url": "https://api.e-z.host/files/delete?key=9sqcae7sl8ocn4bbvouacxxwls3by4ok52p73zat",
         "creator_id": "999776749070078004",
         "created_at": "2026-08-13T08:12:33Z"
+      },
+      "zywbvs2w.mp3": {
+        "original_filename": "audio.mp3",
+        "content_type": "audio/mpeg3",
+        "size": 5135085,
+        "file_url": "https://i.e-z.host/zywbvs2w.mp3",
+        "deletion_url": "https://api.e-z.host/files/delete?key=u9wf6aljl069nj9tjbsjy36snd9o6qvvck0jaj61",
+        "creator_id": "999776749070078004",
+        "created_at": "2026-08-13T08:12:57Z"
       }
     },
     "paste": {
