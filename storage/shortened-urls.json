@@ -1,6 +1,6 @@
 {
   "schema_version": 1,
-  "last_updated": "2026-08-13T08:24:40Z",
+  "last_updated": "2026-08-13T08:58:27Z",
   "ez_host": {
     "shorten": {
       "ijyh3i": {
@@ -18,53 +18,7 @@
         "created_at": "2026-08-13T08:24:40Z"
       }
     },
-    "file": {
-      "dgm5j2wz.png": {
-        "original_filename": "image.png",
-        "content_type": "image/png",
-        "size": 4821,
-        "file_url": "https://i.e-z.host/dgm5j2wz.png",
-        "deletion_url": "https://api.e-z.host/files/delete?key=4ko6k1gm7pbphspfl7yugpyjejrdkgvwhydgethb",
-        "creator_id": "999776749070078004",
-        "created_at": "2026-08-13T07:57:13Z"
-      },
-      "nljg9h5q.png": {
-        "original_filename": "troll.png",
-        "content_type": "image/png",
-        "size": 71338,
-        "file_url": "https://i.e-z.host/nljg9h5q.png",
-        "deletion_url": "https://api.e-z.host/files/delete?key=9sqcae7sl8ocn4bbvouacxxwls3by4ok52p73zat",
-        "creator_id": "999776749070078004",
-        "created_at": "2026-08-13T08:12:33Z"
-      },
-      "zywbvs2w.mp3": {
-        "original_filename": "audio.mp3",
-        "content_type": "audio/mpeg3",
-        "size": 5135085,
-        "file_url": "https://i.e-z.host/zywbvs2w.mp3",
-        "deletion_url": "https://api.e-z.host/files/delete?key=u9wf6aljl069nj9tjbsjy36snd9o6qvvck0jaj61",
-        "creator_id": "999776749070078004",
-        "created_at": "2026-08-13T08:12:57Z"
-      },
-      "lttdely2.zip": {
-        "original_filename": "Discord-Bot-updated.zip",
-        "content_type": "application/zip",
-        "size": 2281495,
-        "file_url": "https://i.e-z.host/lttdely2.zip",
-        "deletion_url": "https://api.e-z.host/files/delete?key=rz2nfkfkz95rw8h8s0xgeshc68vaj7hvh85cwy18",
-        "creator_id": "999776749070078004",
-        "created_at": "2026-08-13T08:13:30Z"
-      },
-      "e90alqv1.exe": {
-        "original_filename": "application.exe",
-        "content_type": "application/x-msdos-program",
-        "size": 10365156,
-        "file_url": "https://i.e-z.host/e90alqv1.exe",
-        "deletion_url": "https://api.e-z.host/files/delete?key=mkvl3hiuuei9gv4h4qkk19bkd8zz9sft6sia053n",
-        "creator_id": "999776749070078004",
-        "created_at": "2026-08-13T08:14:00Z"
-      }
-    },
+    "file": {},
     "paste": {
       "2ehpcxbb": {
         "title": "E-Z api test paste",
