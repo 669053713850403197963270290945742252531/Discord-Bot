@@ -1,6 +1,6 @@
 {
   "schema_version": 1,
-  "last_updated": "2026-08-13T07:08:04Z",
+  "last_updated": "2026-08-13T07:52:06Z",
   "ez_host": {
     "jtochg": {
       "original_url": "https://google.com/",
@@ -29,6 +29,17 @@
       "deletion_url": "https://api.e-z.host/shortener/delete?key=mf7b9m9j06hdp7j83r85tlz62tnm1mclp4qg39pl",
       "creator_id": "999776749070078004",
       "created_at": "2026-08-13T07:08:03Z"
+    },
+    "file": {
+      "qmehml3c.png": {
+        "original_filename": "image.png",
+        "content_type": "image/png",
+        "size": 4821,
+        "file_url": "https://i.e-z.host/qmehml3c.png",
+        "deletion_url": "https://api.e-z.host/files/delete?key=615p0v01xkiea7kg9mmlpqa7nbcdm9ggs7a5qix6",
+        "creator_id": "999776749070078004",
+        "created_at": "2026-08-13T07:52:05Z"
+      }
     }
   }
 }
