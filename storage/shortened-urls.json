@@ -1,6 +1,6 @@
 {
   "schema_version": 1,
-  "last_updated": "2026-08-13T08:13:30Z",
+  "last_updated": "2026-08-13T08:14:01Z",
   "ez_host": {
     "shorten": {
       "ijyh3i": {
@@ -47,6 +47,15 @@
         "deletion_url": "https://api.e-z.host/files/delete?key=rz2nfkfkz95rw8h8s0xgeshc68vaj7hvh85cwy18",
         "creator_id": "999776749070078004",
         "created_at": "2026-08-13T08:13:30Z"
+      },
+      "e90alqv1.exe": {
+        "original_filename": "application.exe",
+        "content_type": "application/x-msdos-program",
+        "size": 10365156,
+        "file_url": "https://i.e-z.host/e90alqv1.exe",
+        "deletion_url": "https://api.e-z.host/files/delete?key=mkvl3hiuuei9gv4h4qkk19bkd8zz9sft6sia053n",
+        "creator_id": "999776749070078004",
+        "created_at": "2026-08-13T08:14:00Z"
       }
     },
     "paste": {
