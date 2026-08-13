@@ -54,7 +54,7 @@ from api.alerts import reconcile_alerts_enabled
 from commands.panel import ControlPanelView, HWIDBreachButton
 from commands.moderation import (
     reconcile_temp_bans, reconcile_channel_locks, reconcile_lockdown,
-    reconcile_temp_roles, reconcile_ghostping_mode,
+    reconcile_temp_roles, reconcile_ghostping_mode, reconcile_banned_users_cache,
 )
 from commands.keys_hwid import reconcile_temp_whitelists
 from commands.access import reconcile_temp_access
@@ -395,6 +395,7 @@ class Client(commands.Bot):
                 botstate = None
 
             await reconcile_temp_bans(self, botstate)
+            await reconcile_banned_users_cache(self, botstate)
             await reconcile_lockdown(self, botstate)
             await reconcile_channel_locks(self, botstate)
             await reconcile_temp_whitelists(self)

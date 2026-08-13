@@ -27,7 +27,7 @@ from discord.ext import commands
 from discord.ui import Modal, TextInput, Label, Checkbox
 
 from api import config
-from api.discord_helpers import has_role, is_in_guild, send_error
+from api.discord_helpers import has_role, is_in_guild, send_error, default_ui_error
 from commands.moderation import _ban_impl, _kick_impl, _mute_impl, _unmute_impl
 from commands.whitelist import (
     WhitelistModal, _edituser_impl, _unwhitelist_impl, _fetchuser_impl, _clearnotes_impl,
@@ -68,6 +68,9 @@ class BanContextModal(Modal):
         super().__init__(title=f"Ban {target.display_name}"[:45])
         self.target = target
 
+    async def on_error(self, interaction: discord.Interaction, error: Exception) -> None:
+        await default_ui_error(interaction, error, label="BanContextModal")
+
     async def on_submit(self, interaction: discord.Interaction):
         reason = (self.reason.component.value or "").strip() or "None"
         duration_raw = (self.duration.component.value or "").strip()
@@ -97,6 +100,9 @@ class KickContextModal(Modal):
         self.reason = TextInput(label="Reason", required=False, max_length=200, placeholder="Unspecified")
         self.add_item(self.reason)
 
+    async def on_error(self, interaction: discord.Interaction, error: Exception) -> None:
+        await default_ui_error(interaction, error, label="KickContextModal")
+
     async def on_submit(self, interaction: discord.Interaction):
         reason = (self.reason.value or "").strip() or "Unspecified"
         await _kick_impl(interaction, self.target, reason)
@@ -118,6 +124,9 @@ class MuteContextModal(Modal):
         self.target = target
         self.reason = TextInput(label="Reason", required=False, max_length=200, placeholder="Unspecified")
         self.add_item(self.reason)
+
+    async def on_error(self, interaction: discord.Interaction, error: Exception) -> None:
+        await default_ui_error(interaction, error, label="MuteContextModal")
 
     async def on_submit(self, interaction: discord.Interaction):
         reason = (self.reason.value or "").strip() or "Unspecified"
@@ -160,8 +169,9 @@ async def ctx_whitelist_user(interaction: discord.Interaction, target: discord.M
 @is_in_guild(config.GUILD_ID)
 async def ctx_edit_user(interaction: discord.Interaction, target: discord.Member):
     # _edituser_impl already just fetches the entry and opens a modal itself,
-    # so there's no extra input to collect here first.
-    await _edituser_impl(interaction, target)
+    # so there's no extra input to collect here first. target is already a
+    # resolved discord.Member (no fetch needed) -- just pass its ID through.
+    await _edituser_impl(interaction, str(target.id))
 
 
 # // Unwhitelist User //
@@ -213,6 +223,9 @@ class ForceResetHwidContextModal(Modal):
         self.hwid = TextInput(label="New HWID (SHA-256, 64 hex chars)", max_length=100, placeholder="64-character hex string")
         self.add_item(self.hwid)
 
+    async def on_error(self, interaction: discord.Interaction, error: Exception) -> None:
+        await default_ui_error(interaction, error, label="ForceResetHwidContextModal")
+
     async def on_submit(self, interaction: discord.Interaction):
         # _forceresethwid_impl already validates the HWID format and reports
         # a clear error itself, so it's passed straight through.
@@ -256,6 +269,9 @@ class TempAccessContextModal(Modal):
         self.minutes = TextInput(label="Duration in minutes", max_length=10, placeholder="e.g. 30")
         self.add_item(self.minutes)
 
+    async def on_error(self, interaction: discord.Interaction, error: Exception) -> None:
+        await default_ui_error(interaction, error, label="TempAccessContextModal")
+
     async def on_submit(self, interaction: discord.Interaction):
         raw = self.minutes.value.strip()
         if not raw.isdigit() or int(raw) <= 0:
@@ -281,6 +297,9 @@ class TempWhitelistContextModal(Modal):
         self.minutes = TextInput(label="Duration in minutes", max_length=10, placeholder="e.g. 60")
         self.add_item(self.hwid)
         self.add_item(self.minutes)
+
+    async def on_error(self, interaction: discord.Interaction, error: Exception) -> None:
+        await default_ui_error(interaction, error, label="TempWhitelistContextModal")
 
     async def on_submit(self, interaction: discord.Interaction):
         raw = self.minutes.value.strip()

@@ -32,6 +32,10 @@ def _require_int(name: str) -> int:
 # Secrets
 DISCORD_TOKEN = _require("DISCORD_TOKEN")
 GITHUB_TOKEN = _require("GITHUB_TOKEN")
+# e-z.host API key (url shortening / file upload / paste) -- see
+# api/providers/ez_host.py. Sent as a bare `key` header, not
+# `Authorization: Bearer ...` like GITHUB_TOKEN above.
+EZ_HOST_API_KEY = _require("EZ_HOST_API_KEY")
 
 # Discord IDs
 GUILD_ID = _require_int("GUILD_ID")
@@ -106,6 +110,19 @@ STORED_SCRIPT_API_URL = f"https://api.github.com/repos/{OWNER}/{STORAGE_REPO}/co
 BOTSTATE_FILE_PATH = "storage/BotState.json"
 BOTSTATE_RAW_URL = f"https://raw.githubusercontent.com/{OWNER}/{STORAGE_REPO}/refs/heads/{STORAGE_BRANCH}/{BOTSTATE_FILE_PATH}"
 BOTSTATE_API_URL = f"https://api.github.com/repos/{OWNER}/{STORAGE_REPO}/contents/{BOTSTATE_FILE_PATH}?ref={STORAGE_BRANCH}"
+
+# storage/shortened-urls.json -- persistent record of every link (and,
+# later, every uploaded file) this bot has created through /url and
+# /upload, across every provider (e-z.host today, more later). Keyed by
+# provider name at the top level -- see api/github.py's
+# DEFAULT_SHORTENED_URLS -- so it survives a restart and a moderator can
+# trace who created a given link, instead of it living only in memory.
+# Same fetch-sha/mutate/commit-with-retry shape as BotState.json above.
+# Lives in this bot's own storage repo, same as BotState.json/
+# permittedKeys.txt/storedscript.lua above.
+SHORTENED_URLS_FILE_PATH = "storage/shortened-urls.json"
+SHORTENED_URLS_RAW_URL = f"https://raw.githubusercontent.com/{OWNER}/{STORAGE_REPO}/refs/heads/{STORAGE_BRANCH}/{SHORTENED_URLS_FILE_PATH}"
+SHORTENED_URLS_API_URL = f"https://api.github.com/repos/{OWNER}/{STORAGE_REPO}/contents/{SHORTENED_URLS_FILE_PATH}?ref={STORAGE_BRANCH}"
 
 HEADERS = {
     "Authorization": f"Bearer {GITHUB_TOKEN}",

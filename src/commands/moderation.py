@@ -70,12 +70,18 @@ async def _run_temp_ban_unban(bot: commands.Bot, entry: dict):
         if guild is None:
             print(f"Could not find guild {entry['guild_id']} to auto-unban temp ban {entry_id}.")
         else:
+            still_banned = True
             try:
                 await guild.unban(discord.Object(id=int(entry["discord_id"])), reason="Temporary ban expired")
+                still_banned = False
             except discord.NotFound:
-                pass  # Already unbanned (manually, or by a duplicate timer) -- nothing left to do.
+                still_banned = False  # Already unbanned (manually, or by a duplicate timer) -- nothing left to do.
             except Exception as e:
                 print(f"Failed to auto-unban {entry['discord_id']} in guild {entry['guild_id']} (temp ban {entry_id}): {e}")
+
+            if not still_banned:
+                _remove_banned_user_from_cache(entry["discord_id"])
+                await _unpersist_banned_user(entry["discord_id"])
     except asyncio.CancelledError:
         raise
     finally:
@@ -119,6 +125,173 @@ async def _cancel_temp_ban_for(discord_id, guild_id) -> bool:
         task.cancel()
     await _clear_temp_ban_state(match["id"])
     return True
+
+
+# =========================================================================
+# In-memory banned-users cache -- mirrors BotState.json's "banned_users"
+# list purely so /checkban and /unban's autocomplete (like every Discord
+# autocomplete callback, answered well inside a ~3s window) has something
+# fast to search instead of a live guild.bans() call -- same reasoning as
+# Users.json's get_cached_users()/set_users_cache() in api/github.py and
+# warnings.py's _warnings_cache.
+#
+# Unlike Users.json/warnings though, a guild's actual ban list can change
+# *outside* the bot entirely -- a moderator right-click-bans or unbans
+# someone straight from Discord's own UI. So this cache is only ever a
+# convenience for autocomplete *suggestions*; it's never trusted as the
+# source of truth for an actual check/unban decision -- both commands
+# below still verify against a live guild.bans() lookup before acting, the
+# same as they always did. reconcile_banned_users_cache() does a real
+# guild.bans() sync once at startup to catch drift from bans/unbans made
+# while the bot was offline.
+# =========================================================================
+
+_banned_users_cache: List[Dict[str, Any]] = []
+
+
+def _set_banned_users_cache(banned: List[Dict[str, Any]]) -> None:
+    global _banned_users_cache
+    _banned_users_cache = banned
+
+
+def _add_banned_user_to_cache(entry: Dict[str, Any]) -> None:
+    """Adds/replaces `entry` in the in-memory cache (replacing any existing
+    entry for the same discord_id first, as belt-and-suspenders against a
+    double-ban)."""
+    global _banned_users_cache
+    discord_id = entry.get("discord_id")
+    _banned_users_cache = [e for e in _banned_users_cache if e.get("discord_id") != discord_id]
+    _banned_users_cache.append(entry)
+
+
+def _remove_banned_user_from_cache(discord_id) -> None:
+    global _banned_users_cache
+    discord_id = str(discord_id)
+    _banned_users_cache = [e for e in _banned_users_cache if e.get("discord_id") != discord_id]
+
+
+async def _persist_banned_user(entry: Dict[str, Any]):
+    """Best-effort BotState.json append for a fresh ban -- same
+    log-don't-raise handling as _clear_temp_ban_state() above, since the
+    actual Discord-side ban has already happened by the time this runs and
+    shouldn't be rolled back over a bookkeeping failure."""
+    def _mutate(state, entry=entry):
+        state["banned_users"] = [e for e in state.get("banned_users", []) if e.get("discord_id") != entry["discord_id"]]
+        state["banned_users"].append(entry)
+        return state
+    try:
+        await update_botstate(_mutate, f"Ban recorded: {entry.get('tag')} ({entry['discord_id']})")
+    except GitHubAPIError as e:
+        print(f"Failed to persist ban record for {entry.get('tag')} to BotState.json: {e}")
+
+
+async def _unpersist_banned_user(discord_id):
+    """Best-effort BotState.json removal once someone's no longer banned
+    (manual /unban, a temp ban expiring, or a stale cache entry /unban
+    discovered was already cleared outside the bot)."""
+    def _mutate(state, discord_id=str(discord_id)):
+        state["banned_users"] = [e for e in state.get("banned_users", []) if e.get("discord_id") != discord_id]
+        return state
+    try:
+        await update_botstate(_mutate, f"Ban record cleared: {discord_id}")
+    except GitHubAPIError as e:
+        print(f"Failed to remove ban record for {discord_id} from BotState.json: {e}")
+
+
+async def reconcile_banned_users_cache(bot: commands.Bot, state: Optional[Dict[str, Any]] = None):
+    """Called once from on_ready: rebuilds the banned-users autocomplete
+    cache from a live guild.bans() sync rather than trusting BotState.json's
+    "banned_users" list alone -- unlike temp_bans, the guild's real ban list
+    can change outside the bot entirely (a native Discord-UI ban/unban)
+    while it was offline, so only a fresh guild.bans() call can actually
+    catch that drift. The resynced list is written straight back to
+    BotState.json too, so autocomplete stays warm across the *next* restart
+    even if guild.bans() itself is unreachable at that point.
+
+    Falls back to whatever `state` already has recorded if the guild can't
+    be found or guild.bans() fails (missing permission, API hiccup, etc.),
+    so autocomplete still has *something* rather than sitting empty --
+    `state` lets a caller that's already fetched BotState.json (e.g.
+    start.py's on_ready) hand it over directly rather than this making a
+    redundant fetch, same as every other reconcile_*() here."""
+    guild = bot.get_guild(config.GUILD_ID)
+    if guild is not None:
+        try:
+            entries = [
+                {
+                    "discord_id": str(ban.user.id),
+                    "tag": str(ban.user),
+                    "reason": ban.reason or "No reason provided",
+                }
+                async for ban in guild.bans(limit=None)
+            ]
+        except discord.Forbidden:
+            print("Missing permission to view bans -- banned-users autocomplete cache left as BotState.json's last snapshot.")
+        except Exception as e:
+            print(f"Failed to sync banned-users cache from guild.bans(): {e}")
+        else:
+            _set_banned_users_cache(entries)
+            print(f"Reconciled {len(entries)} banned user(s) from a live guild.bans() sync.")
+            try:
+                def _mutate(state, entries=entries):
+                    state["banned_users"] = entries
+                    return state
+                await update_botstate(_mutate, "Banned-users cache resynced from guild.bans()")
+            except GitHubAPIError as e:
+                print(f"Failed to persist resynced banned-users list to BotState.json: {e}")
+            return
+
+    if state is None:
+        try:
+            state, _sha = await fetch_botstate_with_sha()
+        except GitHubAPIError as e:
+            print(f"Failed to fetch BotState.json for banned-users cache reconciliation: {e}")
+            return
+    _set_banned_users_cache(state.get("banned_users", []))
+
+
+async def banned_user_autocomplete(interaction: discord.Interaction, current: str) -> List[app_commands.Choice[str]]:
+    """Populates /checkban and /unban's `user` option from the in-memory
+    banned-users cache above -- no guild.bans() call in the callback
+    itself, since that's an unbounded iteration with no business running
+    inside Discord's ~3s autocomplete window (see reconcile_banned_users_
+    cache()'s docstring for why the cache exists and how it stays close to
+    accurate). Labeled the same way as whitelisted_user_autocomplete() in
+    whitelist.py -- id + tag -- since a banned user isn't a guild member
+    and won't resolve through Discord's native user picker."""
+    query = current.lower().strip()
+    choices = []
+    for entry in _banned_users_cache:
+        discord_id = entry.get("discord_id")
+        if not discord_id:
+            continue
+        tag = entry.get("tag") or "Unknown"
+        label = f"{discord_id} ({tag})"
+        if query and query not in label.lower():
+            continue
+        choices.append(app_commands.Choice(name=label[:100], value=str(discord_id)))
+        if len(choices) >= 25:
+            break
+    return choices
+
+
+async def _resolve_user(client: commands.Bot, raw: str) -> discord.User:
+    """Resolves /checkban and /unban's `user` argument -- an autocomplete-
+    picked discord ID, or a raw ID typed/pasted by hand (Discord doesn't
+    enforce that a submitted value actually came from its own autocomplete
+    suggestions) -- into a discord.User. Tries the bot's own cache first
+    (get_user(), instant, no API call), falling back to a live fetch_user()
+    for a banned user the bot has never otherwise seen. Raises ValueError
+    for non-numeric input, or discord.NotFound if no such Discord account
+    exists at all."""
+    raw = raw.strip().lstrip("<@!").rstrip(">")
+    if not raw.isdigit():
+        raise ValueError(raw)
+    user_id = int(raw)
+    user = client.get_user(user_id)
+    if user is not None:
+        return user
+    return await client.fetch_user(user_id)
 
 
 async def reconcile_temp_bans(bot: commands.Bot, state: Optional[Dict[str, Any]] = None):
@@ -200,6 +373,10 @@ async def _ban_impl(interaction: discord.Interaction, target: discord.User, reas
             print(f"{target} was not found in server. Moderation checks and message deletion have been skipped.")
 
         await interaction.guild.ban(target, reason=reason, delete_message_seconds=0 if preserve_messages else 86400)
+
+        ban_entry = {"discord_id": str(target.id), "tag": str(target), "reason": reason}
+        _add_banned_user_to_cache(ban_entry)
+        await _persist_banned_user(ban_entry)
 
         summary_fields = [
             ("User", f"{target} ({target.id})", False),
@@ -1511,6 +1688,26 @@ class Moderation(commands.Cog):
     def __init__(self, bot: commands.Bot):
         self.bot = bot
 
+    async def cog_load(self):
+        """Warms _banned_users_cache from BotState.json's last snapshot the
+        moment this Cog loads -- i.e. during setup_hook, before the bot has
+        even connected to the gateway. Without this there's a real window
+        (confirmed via diagnostic: cache_size=0 at query time despite a
+        successful reconcile earlier that same run) between the gateway
+        connecting -- at which point slash command autocomplete becomes
+        reachable -- and reconcile_banned_users_cache()'s guild.bans() +
+        GitHub round trip finishing inside on_ready, where autocomplete was
+        answering from an empty cache.
+
+        Calls reconcile_banned_users_cache() with no live guild available
+        yet (bot.guilds is always empty pre-connect), so it deterministically
+        takes the BotState.json fallback path -- same file, so this is
+        exactly what on_ready's real reconcile would show if you queried it
+        right this second. on_ready's later call still runs as before and
+        does the authoritative guild.bans() live sync, overwriting this
+        with the current, drift-corrected list."""
+        await reconcile_banned_users_cache(self.bot)
+
     @app_commands.command(name="ban", description="Bans a user from the server, delete their recent messages?, specify a temporary ban duration?")
     @app_commands.guilds(GUILD)
     @app_commands.describe(target="User to ban", reason="Ban reason", duration="Ban duration in minutes", preserve_messages="Keep the user's messages?")
@@ -1521,23 +1718,37 @@ class Moderation(commands.Cog):
 
     @app_commands.command(name="checkban", description="Returns if the user is banned from the server.")
     @app_commands.guilds(GUILD)
-    @app_commands.describe(user="User to check the ban status of")
+    @app_commands.describe(user="User to check the ban status of -- start typing an ID or name to search currently-banned users.")
+    @app_commands.autocomplete(user=banned_user_autocomplete)
     @has_role(config.REQUIRED_ROLE_ID)
     @is_in_guild(config.GUILD_ID)
-    async def checkban(self, interaction: discord.Interaction, user: discord.User):
-        try:
-            await interaction.response.defer(ephemeral=True)
+    async def checkban(self, interaction: discord.Interaction, user: str):
+        await interaction.response.defer(ephemeral=True)
 
+        try:
+            target = await _resolve_user(interaction.client, user)
+        except ValueError:
+            return await send_error(interaction, f"`{user}` isn't a valid user ID or mention.")
+        except discord.NotFound:
+            return await send_error(interaction, f"Couldn't find a Discord user with ID `{user}`.")
+
+        try:
             async for ban_entry in interaction.guild.bans(limit=None):
-                if ban_entry.user.id == user.id:
+                if ban_entry.user.id == target.id:
                     reason = ban_entry.reason or "No reason provided"
                     embed = error_embed(
                         title="User is Banned",
-                        fields=[("User", f"{user} (`{user.id}`)", False), ("Reason", reason, False)],
+                        fields=[("User", f"{target} (`{target.id}`)", False), ("Reason", reason, False)],
                     )
                     return await interaction.followup.send(embed=embed, ephemeral=True)
 
-            await send_success(interaction, f"{user.mention} is not currently banned from this server.")
+            # Not actually banned -- either the cache suggested someone who
+            # was already unbanned outside the bot, or staff typed an id
+            # by hand. Either way, make sure a stale cache entry doesn't
+            # keep suggesting them going forward.
+            _remove_banned_user_from_cache(target.id)
+            await _unpersist_banned_user(target.id)
+            await send_success(interaction, f"{target.mention} is not currently banned from this server.")
 
         except discord.Forbidden:
             await send_error(interaction, "I don't have permission to view bans.")
@@ -1546,10 +1757,11 @@ class Moderation(commands.Cog):
 
     @app_commands.command(name="unban", description="Unbans a user from the server.")
     @app_commands.guilds(GUILD)
-    @app_commands.describe(user="The user to unban")
+    @app_commands.describe(user="The user to unban -- start typing an ID or name to search currently-banned users.")
+    @app_commands.autocomplete(user=banned_user_autocomplete)
     @has_role(config.REQUIRED_ROLE_ID)
     @is_in_guild(config.GUILD_ID)
-    async def unban(self, interaction: discord.Interaction, user: discord.User):
+    async def unban(self, interaction: discord.Interaction, user: str):
         # Deferred up front, same as /checkban's identical bans() call --
         # this iterates the guild's *entire* ban list with no limit, which
         # can easily blow past Discord's 3 second initial-response window
@@ -1558,12 +1770,25 @@ class Moderation(commands.Cog):
         # interaction token has already gone stale, surfacing to the user
         # as a silent "Unknown interaction" failure with no error shown.
         await interaction.response.defer(ephemeral=True)
+
+        try:
+            target = await _resolve_user(interaction.client, user)
+        except ValueError:
+            return await send_error(interaction, f"`{user}` isn't a valid user ID or mention.")
+        except discord.NotFound:
+            return await send_error(interaction, f"Couldn't find a Discord user with ID `{user}`.")
+
         try:
             bans = [ban async for ban in interaction.guild.bans()]
-            banned_entry = discord.utils.find(lambda b: b.user.id == user.id, bans)
+            banned_entry = discord.utils.find(lambda b: b.user.id == target.id, bans)
 
             if not banned_entry:
                 await send_error(interaction, "User is not banned.")
+                # Stale cache entry pointing at someone who's already not
+                # banned (unbanned outside the bot, most likely) -- clean
+                # it up so it stops suggesting them going forward.
+                _remove_banned_user_from_cache(target.id)
+                await _unpersist_banned_user(target.id)
                 return
 
             await interaction.guild.unban(banned_entry.user, reason=f"Unbanned by {interaction.user}")
@@ -1573,14 +1798,17 @@ class Moderation(commands.Cog):
             # (the scheduled unban() would just hit a NotFound and no-op)
             # but leaves a confusing stray entry sitting in BotState.json
             # until its original timer eventually fires.
-            await _cancel_temp_ban_for(user.id, interaction.guild.id)
+            await _cancel_temp_ban_for(target.id, interaction.guild.id)
+
+            _remove_banned_user_from_cache(target.id)
+            await _unpersist_banned_user(target.id)
 
             await send_moderation_alert(interaction.client, alert_embed(
                 "🔓 Member Unbanned",
-                f"{interaction.user.mention} unbanned {user.mention} via `/unban`.",
+                f"{interaction.user.mention} unbanned {target.mention} via `/unban`.",
                 color=ALERT_COLOR_ADD,
             ))
-            await send_success(interaction, f"Successfully unbanned {user.mention}.")
+            await send_success(interaction, f"Successfully unbanned {target.mention}.")
 
         except discord.Forbidden:
             await send_error(interaction, "Missing permissions to unban.")

@@ -328,6 +328,16 @@ async def resolve_user_option(interaction: discord.Interaction, raw_user: str) -
     if user is not None:
         return user
 
+    # Cache miss (e.g. the target shares no mutual guild/cache entry with
+    # the bot) -- fetch_user() is a live Discord API call, which can
+    # occasionally take long enough to blow Discord's ~3 second ack window.
+    # Defer first (if a caller hasn't already) so that risk lands here
+    # instead of on whatever response the caller makes afterward. Callers
+    # that then call interaction.response.defer() themselves guard it with
+    # an is_done() check for exactly this reason.
+    if not interaction.response.is_done():
+        await interaction.response.defer(ephemeral=True)
+
     try:
         return await interaction.client.fetch_user(discord_id)
     except discord.NotFound:

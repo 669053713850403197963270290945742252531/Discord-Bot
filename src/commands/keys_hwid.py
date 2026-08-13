@@ -269,7 +269,11 @@ async def _extend_impl(interaction: discord.Interaction, user: discord.User, min
     if minutes <= 0:
         return await send_error(interaction, "`minutes` must be a positive number.")
 
-    await interaction.response.defer(ephemeral=True)
+    # resolve_user_option() (see /extend below) may have already deferred
+    # this interaction itself if its fetch_user() fallback ran -- calling
+    # defer() again would raise InteractionResponded.
+    if not interaction.response.is_done():
+        await interaction.response.defer(ephemeral=True)
     discord_id = str(user.id)
 
     try:
@@ -355,7 +359,11 @@ async def _extend_impl(interaction: discord.Interaction, user: discord.User, min
 
 
 async def _checktemp_impl(interaction: discord.Interaction, user: discord.User):
-    await interaction.response.defer(ephemeral=True)
+    # resolve_user_option() (see /checktemp below) may have already
+    # deferred this interaction itself if its fetch_user() fallback ran --
+    # calling defer() again would raise InteractionResponded.
+    if not interaction.response.is_done():
+        await interaction.response.defer(ephemeral=True)
 
     try:
         whitelist_users, _ = await fetch_users_with_sha()
@@ -512,7 +520,11 @@ async def _forceresethwid_impl(interaction: discord.Interaction, user: discord.U
     if not is_valid_hwid(hwid):
         return await send_error(interaction, "Invalid HWID format. Must be 64 hex characters (SHA-256).")
 
-    await interaction.response.defer(ephemeral=True)
+    # resolve_user_option() (see /forceresethwid below) may have already
+    # deferred this interaction itself if its fetch_user() fallback ran --
+    # calling defer() again would raise InteractionResponded.
+    if not interaction.response.is_done():
+        await interaction.response.defer(ephemeral=True)
 
     try:
         users, sha = await fetch_users_with_sha()
@@ -566,7 +578,11 @@ async def _forceresethwid_impl(interaction: discord.Interaction, user: discord.U
 
 
 async def _resethwidcooldown_impl(interaction: discord.Interaction, user: discord.User):
-    await interaction.response.defer(ephemeral=True)
+    # resolve_user_option() (see /resethwidcooldown below) may have
+    # already deferred this interaction itself if its fetch_user()
+    # fallback ran -- calling defer() again would raise InteractionResponded.
+    if not interaction.response.is_done():
+        await interaction.response.defer(ephemeral=True)
 
     try:
         users, sha = await fetch_users_with_sha()
