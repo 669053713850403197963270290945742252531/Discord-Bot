@@ -1,6 +1,6 @@
 {
   "schema_version": 1,
-  "last_updated": "2026-08-13T08:14:01Z",
+  "last_updated": "2026-08-13T08:24:40Z",
   "ez_host": {
     "shorten": {
       "ijyh3i": {
@@ -9,6 +9,13 @@
         "deletion_url": "https://api.e-z.host/shortener/delete?key=irw3rwfn7d9adu0zg9m1f5mw93rgdckds449aomj",
         "creator_id": "999776749070078004",
         "created_at": "2026-08-13T07:56:57Z"
+      },
+      "khh104": {
+        "original_url": "https://fbi.pet/",
+        "shortened_url": "https://i.e-z.host/s/khh104",
+        "deletion_url": "https://api.e-z.host/shortener/delete?key=bdwnuzocyinxe77vodv205am5g8ojgk9ui4ntm1p",
+        "creator_id": "999776749070078004",
+        "created_at": "2026-08-13T08:24:40Z"
       }
     },
     "file": {
