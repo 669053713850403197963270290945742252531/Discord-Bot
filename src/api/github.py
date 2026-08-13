@@ -543,6 +543,12 @@ DEFAULT_BOTSTATE: Dict[str, Any] = {
     "schema_version": BOTSTATE_SCHEMA_VERSION,
     "last_updated": None,
     "temp_bans": [],
+    # Snapshot of the guild's ban list -- [{"discord_id", "tag", "reason"}, ...]
+    # -- kept purely so /checkban and /unban's autocomplete has something
+    # fast to search. Not authoritative: a real guild.bans() lookup still
+    # backs the actual check/unban decision. See moderation.py's
+    # reconcile_banned_users_cache() for the full reasoning.
+    "banned_users": [],
     "lockdown": None,
     "channel_locks": [],
     "temp_bot_access": [],
@@ -682,3 +688,189 @@ async def update_botstate(
     finally:
         if should_close:
             await sess.close()
+
+
+# =========================================================================
+# storage/shortened-urls.json
+# =========================================================================
+# Every link created via /url shorten -- and, later, every file uploaded
+# via /upload -- across every provider (e-z.host today; the schema leaves
+# room for more), so a shortened link (and the deletion_url needed to take
+# it back down) survives a bot restart instead of living only in memory.
+# Same "fetch -> get sha -> mutate -> commit" shape as BotState.json above,
+# with the same retry-on-stale-sha loop: /url shorten can plausibly be run
+# by more than one person around the same moment, which is exactly the
+# race BotState.json's update_botstate() above exists to handle, so
+# update_shortened_urls() below deliberately reuses that pattern rather
+# than a fresh asyncio.Lock -- a Lock only protects against races *within
+# this one process*, where retry-on-409 also survives two racing bot
+# processes (e.g. a redeploy briefly running old and new side by side).
+
+SHORTENED_URLS_SCHEMA_VERSION = 1
+
+# Nested one level deeper than BotState.json's top-level keys: every
+# provider gets its own key (e.g. "ez_host") holding a {short_code: entry}
+# dict, from day one -- even with only one provider today, so a second
+# provider's links can move in later without a migration for the first
+# provider's data. fetch_shortened_urls_with_sha() shallow-merges this
+# under whatever's actually in the file (one level, then one level again
+# per known provider), same reasoning as DEFAULT_BOTSTATE above.
+DEFAULT_SHORTENED_URLS: Dict[str, Any] = {
+    "schema_version": SHORTENED_URLS_SCHEMA_VERSION,
+    "last_updated": None,
+    "ez_host": {},
+}
+
+
+async def fetch_shortened_urls_with_sha(session: Optional[aiohttp.ClientSession] = None) -> Tuple[Dict[str, Any], str]:
+    """Fetches storage/shortened-urls.json + its sha via the Contents API.
+    Use this before any write (see update_shortened_urls() below for the
+    usual way to do that), or read-only on its own (e.g. autocomplete)."""
+    sess, should_close = await _get_session(session)
+    try:
+        async with sess.get(config.SHORTENED_URLS_API_URL, headers=config.HEADERS) as resp:
+            if resp.status != 200:
+                raise GitHubAPIError(f"Failed to fetch shortened-urls.json metadata (HTTP {resp.status})", resp.status)
+            data = await resp.json()
+    finally:
+        if should_close:
+            await sess.close()
+
+    sha = data["sha"]
+    try:
+        state = json.loads(base64.b64decode(data["content"]).decode("utf-8"))
+    except (json.JSONDecodeError, UnicodeDecodeError, ValueError) as e:
+        raise GitHubAPIError(f"shortened-urls.json is not valid JSON: {e}")
+
+    if not isinstance(state, dict):
+        raise GitHubAPIError("shortened-urls.json's contents aren't a JSON object.")
+
+    merged = {**DEFAULT_SHORTENED_URLS, **state}
+    for provider in DEFAULT_SHORTENED_URLS:
+        if provider in ("schema_version", "last_updated"):
+            continue
+        # Guard against a hand-edited/older file where the provider key
+        # exists but isn't a dict -- fall back to empty rather than let a
+        # bad merge poison every read of this provider's links.
+        provider_value = state.get(provider)
+        merged[provider] = {**DEFAULT_SHORTENED_URLS[provider], **(provider_value if isinstance(provider_value, dict) else {})}
+
+    return merged, sha
+
+
+async def commit_shortened_urls(state: Dict[str, Any], sha: str, message: str, session: Optional[aiohttp.ClientSession] = None) -> Dict[str, Any]:
+    """Serializes `state` to indented JSON (stamping schema_version and
+    last_updated) and commits it as the new storage/shortened-urls.json.
+
+    Most callers should go through update_shortened_urls() instead, which
+    wraps this together with fetch_shortened_urls_with_sha() and retries on
+    a stale sha -- call this directly only when you already hold a
+    freshly-fetched sha and know nothing else could have written in
+    between."""
+    to_write = {
+        **state,
+        "schema_version": SHORTENED_URLS_SCHEMA_VERSION,
+        "last_updated": datetime.now(timezone.utc).strftime("%Y-%m-%dT%H:%M:%SZ"),
+    }
+    content_str = json.dumps(to_write, indent=2) + "\n"
+
+    sess, should_close = await _get_session(session)
+    try:
+        payload = {
+            "message": message,
+            "content": base64.b64encode(content_str.encode()).decode("utf-8"),
+            "branch": config.STORAGE_BRANCH,
+            "sha": sha,
+        }
+        async with sess.put(config.SHORTENED_URLS_API_URL, headers=config.HEADERS, json=payload) as resp:
+            if resp.status != 200:
+                err = await resp.text()
+                raise GitHubAPIError(f"Failed to commit shortened-urls.json changes (HTTP {resp.status}): {err}", resp.status)
+            return await resp.json()
+    finally:
+        if should_close:
+            await sess.close()
+
+
+async def update_shortened_urls(
+    mutate: Callable[[Dict[str, Any]], Dict[str, Any]],
+    message: str,
+    session: Optional[aiohttp.ClientSession] = None,
+    max_retries: int = 3,
+) -> Dict[str, Any]:
+    """
+    Read-modify-write helper for shortened-urls.json -- identical shape to
+    update_botstate() above: fetches the current state + sha, calls
+    `mutate(state)` (may mutate the dict in place and return it, or return
+    a fresh one), and commits the result. If another write landed in
+    between (stale sha -- HTTP 409), re-fetches the now-current state,
+    re-applies `mutate`, and retries, up to `max_retries` attempts total.
+
+    Raises GitHubAPIError if every attempt fails -- callers should catch
+    this and log it rather than let it bubble up as a command error, same
+    reasoning as update_botstate() (the actual short link/upload has
+    almost always already succeeded with the provider by this point;
+    losing the bookkeeping write shouldn't undo that).
+    """
+    sess, should_close = await _get_session(session)
+    try:
+        last_error: Optional[GitHubAPIError] = None
+        for attempt in range(max_retries):
+            state, sha = await fetch_shortened_urls_with_sha(sess)
+            new_state = mutate(state)
+            try:
+                await commit_shortened_urls(new_state, sha, message, sess)
+                return new_state
+            except GitHubAPIError as e:
+                last_error = e
+                if e.status == 409 and attempt < max_retries - 1:
+                    await asyncio.sleep(0.5 * (attempt + 1))
+                    continue
+                raise
+        raise last_error  # pragma: no cover -- loop always returns or raises
+    finally:
+        if should_close:
+            await sess.close()
+
+
+async def get_shortened_urls(provider: str = "ez_host", session: Optional[aiohttp.ClientSession] = None) -> Dict[str, Dict[str, Any]]:
+    """Convenience read: just this provider's {short_code: entry} dict --
+    for autocomplete/listing/lookup call sites that don't need the sha or
+    every other provider's data alongside it."""
+    state, _ = await fetch_shortened_urls_with_sha(session)
+    return state.get(provider, {})
+
+
+async def save_shortened_url(
+    short_code: str,
+    original_url: str,
+    shortened_url: str,
+    deletion_url: Optional[str],
+    creator_id: int,
+    provider: str = "ez_host",
+    session: Optional[aiohttp.ClientSession] = None,
+) -> Dict[str, Any]:
+    """Records one newly-created shortened link under
+    state[provider][short_code] and commits it via update_shortened_urls(),
+    so a concurrent /url shorten from someone else can't silently clobber
+    this write (or vice versa). Returns the entry that was saved.
+
+    `short_code` should be whatever uniquely identifies the link for this
+    provider -- for e-z.host that's the path segment of shortened_url (e.g.
+    "abc123" out of "https://i.e-z.host/abc123"), since e-z.host's API
+    itself returns no separate id to key on.
+    """
+    entry = {
+        "original_url": original_url,
+        "shortened_url": shortened_url,
+        "deletion_url": deletion_url,
+        "creator_id": creator_id,
+        "created_at": datetime.now(timezone.utc).strftime("%Y-%m-%dT%H:%M:%SZ"),
+    }
+
+    def _mutate(state: Dict[str, Any]) -> Dict[str, Any]:
+        state.setdefault(provider, {})[short_code] = entry
+        return state
+
+    await update_shortened_urls(_mutate, f"Add {provider} shortened URL {short_code}", session)
+    return entry

@@ -5,6 +5,7 @@ import re
 import string
 from datetime import datetime
 from typing import List, Set, Tuple
+from urllib.parse import urlparse
 
 
 def generate_key(min_length: int = 25, max_length: int = 40) -> str:
@@ -82,6 +83,23 @@ def is_valid_discord_id(discord_id: str) -> bool:
         return False
     snowflake = int(discord_id)
     return 1 << 17 < snowflake < 2**64
+
+
+def is_valid_url(url: str) -> bool:
+    """True if `url` is a well-formed http(s) URL.
+
+    Just a sanity check before making a network call at all (a bare word,
+    a Discord ID, a missing scheme) -- not a substitute for the provider's
+    own validation. e-z.host's /shortener still does its own, stricter
+    check server-side and returns 400 on anything it doesn't like, same as
+    every other malformed-input case api/providers/ez_host.py already
+    handles.
+    """
+    try:
+        parsed = urlparse(url.strip())
+    except ValueError:
+        return False
+    return parsed.scheme in ("http", "https") and bool(parsed.netloc)
 
 
 def is_valid_date(d: str) -> bool:

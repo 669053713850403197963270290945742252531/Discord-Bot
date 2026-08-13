@@ -742,15 +742,33 @@ class EditUserCommandModal(Modal):
         )
 
 
-async def _edituser_impl(interaction: discord.Interaction, user: discord.User):
-    try:
-        users, _sha = await fetch_users_with_sha()
-    except GitHubAPIError as e:
-        return await send_error(interaction, str(e))
+async def _edituser_impl(interaction: discord.Interaction, discord_id: str):
+    # send_modal (like send_message) must be the interaction's first
+    # response, within Discord's ~3 second ack window, so this can't do a
+    # live GitHub fetch first -- same reasoning as ControlPanelView's
+    # redeem_key/reset_hwid in panel.py. Reads from the in-memory
+    # Users.json cache instead, which never touches the network.
+    # EditUserCommandModal.on_submit() re-fetches fresh and fully
+    # re-validates before committing anything, so this is only what
+    # pre-fills the modal / gives an early "not found" error, not a
+    # security boundary. Callers pass a raw Discord ID (rather than a
+    # resolved discord.User) for the same reason -- resolving one can
+    # itself require a live fetch_user() call when the target isn't in the
+    # bot's cache, which would blow the same ack window.
+    mention = f"<@{discord_id}>"
+    users = get_cached_users()
+    if users is None:
+        # Cache not populated yet (e.g. right after a bot restart) -- fall
+        # back to a live fetch rather than failing outright. Narrow,
+        # restart-only race window; every other path stays cache-only.
+        try:
+            users, _sha = await fetch_users_with_sha()
+        except GitHubAPIError as e:
+            return await send_error(interaction, str(e))
 
-    user_entry = find_user_by_discord_id(users, user.id)
+    user_entry = find_user_by_discord_id(users, discord_id)
     if not user_entry:
-        return await send_error(interaction, f"User {user.mention} not found in whitelist.")
+        return await send_error(interaction, f"User {mention} not found in whitelist.")
 
     await interaction.response.send_modal(EditUserCommandModal(user_entry))
 
@@ -760,7 +778,11 @@ async def _edituser_impl(interaction: discord.Interaction, user: discord.User):
 # =========================================================================
 
 async def _fetchuser_impl(interaction: discord.Interaction, user: discord.User):
-    await interaction.response.defer(ephemeral=True)
+    # resolve_user_option() (see /fetchuser below) may have already
+    # deferred this interaction itself if its fetch_user() fallback ran --
+    # calling defer() again would raise InteractionResponded.
+    if not interaction.response.is_done():
+        await interaction.response.defer(ephemeral=True)
 
     try:
         users, _ = await fetch_users_with_sha()
@@ -1064,13 +1086,20 @@ class WhitelistView(LayoutView):
 
     async def on_prev(self, interaction: discord.Interaction):
         self.current_index = max(0, self.current_index - 1)
+        # build() fetches the entry's avatar thumbnail over the network
+        # (see _thumbnail_url), which can occasionally take long enough to
+        # blow Discord's ~3 second ack window -- defer as a message update
+        # (not a "thinking" state) first, so that risk lands on this fast
+        # call instead of on the edit itself.
+        await interaction.response.defer()
         await self.build()
-        await interaction.response.edit_message(view=self)
+        await interaction.edit_original_response(view=self)
 
     async def on_next(self, interaction: discord.Interaction):
         self.current_index = min(len(self.users) - 1, self.current_index + 1)
+        await interaction.response.defer()
         await self.build()
-        await interaction.response.edit_message(view=self)
+        await interaction.edit_original_response(view=self)
 
     async def on_edit(self, interaction: discord.Interaction):
         user_data = self.users[self.current_index]
@@ -1080,6 +1109,12 @@ class WhitelistView(LayoutView):
         await interaction.response.edit_message(view=DeleteUserConfirmView(self))
 
     async def on_refresh(self, interaction: discord.Interaction):
+        # Defer first (as a message update, not a "thinking" state) --
+        # this does a live GitHub fetch plus build()'s avatar thumbnail
+        # fetch, either of which can occasionally take long enough to blow
+        # Discord's ~3 second ack window.
+        await interaction.response.defer()
+
         try:
             users, _sha = await fetch_users_with_sha()
         except GitHubAPIError as e:
@@ -1091,7 +1126,7 @@ class WhitelistView(LayoutView):
 
         self.pending_notice = "🔄 Whitelist refreshed."
         await self.build()
-        await interaction.response.edit_message(view=self)
+        await interaction.edit_original_response(view=self)
 
 
 # =========================================================================
@@ -1205,10 +1240,26 @@ class Whitelist(commands.Cog):
     @has_role(config.REQUIRED_ROLE_ID)
     @is_in_guild(config.GUILD_ID)
     async def editwhitelist(self, interaction: discord.Interaction):
-        try:
-            decoded, _sha = await fetch_api_text_and_sha()
-        except GitHubAPIError as e:
-            return await send_error(interaction, str(e))
+        # send_modal must be the interaction's first response, within
+        # Discord's ~3 second ack window, so this can't do a live GitHub
+        # fetch first (see _edituser_impl above for the same reasoning).
+        # Re-serializing the in-memory cache reproduces the exact text
+        # Users.json actually holds, since every write path (commit_users/
+        # commit_content) serializes with this same json.dumps(indent=4)
+        # and updates this same cache. EditWhitelistModal.on_submit() still
+        # re-fetches fresh before committing anything, so a cache that's a
+        # few seconds stale here is just a stale pre-fill, not a
+        # correctness issue.
+        users = get_cached_users()
+        if users is not None:
+            decoded = json.dumps(users, indent=4)
+        else:
+            # Cache not populated yet (e.g. right after a bot restart) --
+            # fall back to a live fetch rather than failing outright.
+            try:
+                decoded, _sha = await fetch_api_text_and_sha()
+            except GitHubAPIError as e:
+                return await send_error(interaction, str(e))
 
         # A modal's TextInput can't pre-fill more characters than its own
         # max_length allows -- if `decoded` is longer than that, Discord
@@ -1232,10 +1283,19 @@ class Whitelist(commands.Cog):
     @has_role(config.REQUIRED_ROLE_ID)
     @is_in_guild(config.GUILD_ID)
     async def edituser(self, interaction: discord.Interaction, user: str):
-        resolved = await resolve_user_option(interaction, user)
-        if resolved is None:
-            return
-        await _edituser_impl(interaction, resolved)
+        user = user.strip()
+        if not is_valid_discord_id(user):
+            # Deliberately not routed through resolve_user_option here --
+            # this leads straight into _edituser_impl's send_modal(), and
+            # resolve_user_option's fetch_user() fallback is a live network
+            # call that can't happen before a modal-send (see
+            # _edituser_impl's docstring). Format validation alone is
+            # enough to hand off a raw ID.
+            return await send_error(
+                interaction,
+                f"`{user}` doesn't look like a valid Discord ID -- start typing to pick a whitelisted user from the list.",
+            )
+        await _edituser_impl(interaction, user)
 
     @app_commands.command(name="fetchuser", description="Fetches all stored info about a user.")
     @app_commands.guilds(GUILD)
@@ -1411,7 +1471,11 @@ class Whitelist(commands.Cog):
         if resolved is None:
             return
         user = resolved
-        await interaction.response.defer(ephemeral=True)
+        # resolve_user_option() may have already deferred this interaction
+        # itself if its fetch_user() fallback ran -- calling defer() again
+        # would raise InteractionResponded.
+        if not interaction.response.is_done():
+            await interaction.response.defer(ephemeral=True)
         discord_id_str = str(user.id)
 
         try:
@@ -1519,7 +1583,11 @@ class Whitelist(commands.Cog):
 
 
 async def _clearnotes_impl(interaction: discord.Interaction, user: discord.User):
-    await interaction.response.defer(ephemeral=True)
+    # resolve_user_option() (see /clearnotes below) may have already
+    # deferred this interaction itself if its fetch_user() fallback ran --
+    # calling defer() again would raise InteractionResponded.
+    if not interaction.response.is_done():
+        await interaction.response.defer(ephemeral=True)
 
     try:
         users, sha = await fetch_users_with_sha()

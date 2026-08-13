@@ -18,6 +18,7 @@ stays a manageable size:
     qrcode_gen.py       /qrcode generate's encoding + Pillow rendering (solid/rainbow, styles)
     discord_helpers.py embeds, interaction responders, permission checks
     alerts.py           staff Alerts channel logging (send_alert/alert_embed)
+    providers/          third-party file-hosting/URL-shortening API clients (ez_host.py)
 
 Everything below is re-exported here too, so cogs can do either
 `from api import github` or `from api.github import fetch_users_with_sha`.
@@ -25,7 +26,7 @@ Everything below is re-exported here too, so cogs can do either
 
 from . import config
 from .config import (
-    DISCORD_TOKEN, GITHUB_TOKEN,
+    DISCORD_TOKEN, GITHUB_TOKEN, EZ_HOST_API_KEY,
     GUILD_ID, REQUIRED_ROLE_ID, REGISTRATION_CHANNEL_ID, REACTION_ROLE_CHANNEL_ID,
     PANEL_CHANNEL_ID, BUYER_ROLE_ID, ALERTS_CHANNEL_ID,
     LOCAL_TZ, RESET_HWID_COOLDOWN,
@@ -49,7 +50,11 @@ from .github import (
     remove_permitted_key, remove_permitted_keys, remove_first_n_permitted_keys,
     fetch_stored_script, fetch_stored_script_with_sha, commit_stored_script,
     inject_script_key, validate_stored_script,
+    fetch_shortened_urls_with_sha, commit_shortened_urls, update_shortened_urls,
+    get_shortened_urls, save_shortened_url,
 )
+
+from .providers.ez_host import EZHostAPIError
 
 from .users import (
     find_user_by_discord_id, find_user_by_hwid, find_user_by_key,
@@ -59,7 +64,7 @@ from .users import (
 
 from .keys import (
     generate_key, generate_unique_key, generate_unique_keys,
-    parse_key_length_range, is_valid_hwid, is_valid_discord_id, is_valid_date,
+    parse_key_length_range, is_valid_hwid, is_valid_discord_id, is_valid_url, is_valid_date,
 )
 
 from .time_utils import (

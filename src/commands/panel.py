@@ -189,46 +189,57 @@ class HWIDBreachButton(discord.ui.DynamicItem[Button], template=r"breach_unwhite
 
         await interaction.response.defer(ephemeral=True)
 
-        results = []
-
-        # Unwhitelist the owner's entry -- the attempting user never had
-        # one to begin with, since the duplicate-HWID check blocks the
-        # redemption/reset before it's committed.
+        # discord.py's dynamic-item dispatch (schedule_dynamic_item_call in
+        # discord/ui/view.py) does NOT route an exception raised here to
+        # View.on_error the way normal item dispatch does -- it only logs
+        # internally and returns, unlike every other View/Modal in this
+        # codebase. Left unguarded, an unexpected error partway through
+        # would leave this deferred "thinking..." response stuck with zero
+        # feedback to the moderator who clicked it. There's no on_error
+        # hook to lean on for a DynamicItem, so report failures ourselves.
         try:
-            users, sha = await fetch_users_with_sha()
-            filtered, removed = remove_user_by_discord_id(users, self.owner_discord_id)
-            if removed:
-                await commit_users(filtered, sha, f"Unwhitelisted (HWID breach): {self.owner_identifier} ({self.owner_discord_id})")
-                await revoke_buyer_role(interaction.guild, self.owner_discord_id)
-                results.append(f"✅ Unwhitelisted **{self.owner_identifier}**")
-            else:
-                results.append(f"⚠️ No whitelist entry found for **{self.owner_identifier}** (may already be removed)")
-        except GitHubAPIError as e:
-            results.append(f"❌ Failed to unwhitelist **{self.owner_identifier}**: {e}")
+            results = []
 
-        owner_reason = f"HWID breach -- HWID shared/leaked, actioned by {interaction.user}"
-        attempting_reason = f"HWID breach -- attempted redemption using another user's HWID, actioned by {interaction.user}"
+            # Unwhitelist the owner's entry -- the attempting user never had
+            # one to begin with, since the duplicate-HWID check blocks the
+            # redemption/reset before it's committed.
+            try:
+                users, sha = await fetch_users_with_sha()
+                filtered, removed = remove_user_by_discord_id(users, self.owner_discord_id)
+                if removed:
+                    await commit_users(filtered, sha, f"Unwhitelisted (HWID breach): {self.owner_identifier} ({self.owner_discord_id})")
+                    await revoke_buyer_role(interaction.guild, self.owner_discord_id)
+                    results.append(f"✅ Unwhitelisted **{self.owner_identifier}**")
+                else:
+                    results.append(f"⚠️ No whitelist entry found for **{self.owner_identifier}** (may already be removed)")
+            except GitHubAPIError as e:
+                results.append(f"❌ Failed to unwhitelist **{self.owner_identifier}**: {e}")
 
-        results.append(await _breach_ban_one(interaction, self.owner_discord_id, owner_reason))
-        if self.attempting_discord_id != self.owner_discord_id:
-            results.append(await _breach_ban_one(interaction, self.attempting_discord_id, attempting_reason))
+            owner_reason = f"HWID breach -- HWID shared/leaked, actioned by {interaction.user}"
+            attempting_reason = f"HWID breach -- attempted redemption using another user's HWID, actioned by {interaction.user}"
 
-        # Mark the alert as handled so it can't be actioned twice, and
-        # record who resolved it directly on the original embed.
-        self.item.disabled = True
-        self.item.label = "Resolved"
+            results.append(await _breach_ban_one(interaction, self.owner_discord_id, owner_reason))
+            if self.attempting_discord_id != self.owner_discord_id:
+                results.append(await _breach_ban_one(interaction, self.attempting_discord_id, attempting_reason))
 
-        try:
-            resolved_embed = interaction.message.embeds[0]
-            resolved_embed.color = discord.Color.dark_grey()
-            resolved_embed.add_field(name="Resolved By", value=f"{interaction.user.mention} (`{interaction.user.id}`)", inline=False)
-            await interaction.message.edit(embed=resolved_embed, view=self.view)
+            # Mark the alert as handled so it can't be actioned twice, and
+            # record who resolved it directly on the original embed.
+            self.item.disabled = True
+            self.item.label = "Resolved"
+
+            try:
+                resolved_embed = interaction.message.embeds[0]
+                resolved_embed.color = discord.Color.dark_grey()
+                resolved_embed.add_field(name="Resolved By", value=f"{interaction.user.mention} (`{interaction.user.id}`)", inline=False)
+                await interaction.message.edit(embed=resolved_embed, view=self.view)
+            except Exception as e:
+                print(f"Failed to update breach alert message: {e}")
+
+            await _clear_breach_alert_state(self.alert_id)
+
+            await send_success(interaction, "\n".join(results), title="Breach Action Complete")
         except Exception as e:
-            print(f"Failed to update breach alert message: {e}")
-
-        await _clear_breach_alert_state(self.alert_id)
-
-        await send_success(interaction, "\n".join(results), title="Breach Action Complete")
+            await default_ui_error(interaction, e, label="HWIDBreachButton")
 
 
 class HWIDBreachAlertView(View):

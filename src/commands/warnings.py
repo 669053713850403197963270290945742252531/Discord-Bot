@@ -41,6 +41,7 @@ from api.alerts import (
 )
 from api.github import GitHubAPIError, fetch_botstate_with_sha, update_botstate, new_state_id
 from api.time_utils import format_iso, parse_iso
+from commands.moderation import _add_banned_user_to_cache, _persist_banned_user
 
 GUILD = discord.Object(id=config.GUILD_ID)
 
@@ -225,11 +226,11 @@ async def reconcile_warning_config(bot: commands.Bot, state: Optional[Dict[str, 
     merged["notify_target"] = bool(merged["notify_target"])
 
     _warning_config = merged
-    if _warning_config["enabled"]:
-        print(
-            "Reconciled warning auto-action config from BotState.json "
-            f"(threshold={_warning_config['threshold']}, action={_warning_config['action']})."
-        )
+    print(
+        "Reconciled warning auto-action config from BotState.json "
+        f"(enabled={_warning_config['enabled']}, threshold={_warning_config['threshold']}, "
+        f"action={_warning_config['action']})."
+    )
 
 
 async def _apply_warning_threshold_action(
@@ -262,6 +263,17 @@ async def _apply_warning_threshold_action(
     except app_commands.CheckFailure as e:
         return f"⚠️ Reached the auto-action threshold, but they couldn't be {meta['verb']}: {e}"
 
+    # DM'd *before* the action, not after -- kick/ban both remove `user`
+    # from every mutual guild the bot shares with them, and a DM attempted
+    # afterward fails outright ("no mutual guilds", 403/50278) since Discord
+    # requires one to open that channel. Same reason moderation.py's
+    # _kick_impl()/_ban_impl() notify before kicking/banning rather than
+    # after. Timeout doesn't strictly need the ordering (the member stays
+    # put either way), but keeping all three consistent beats special-
+    # casing one of them.
+    if meta["notify_key"] and cfg["notify_target"]:
+        await notify_user(user, meta["notify_key"], interaction.user, reason, interaction.guild.name)
+
     try:
         if cfg["action"] == WARNING_ACTION_TIMEOUT:
             until = datetime.now(timezone.utc) + timedelta(minutes=cfg["timeout_minutes"])
@@ -275,6 +287,14 @@ async def _apply_warning_threshold_action(
             summary = f"{meta['emoji']} Kicked for reaching **{total}** warnings."
         elif cfg["action"] == WARNING_ACTION_BAN:
             await interaction.guild.ban(user, reason=reason, delete_message_seconds=0)
+            # Mirrors moderation.py's _ban_impl() -- without this, /unban's
+            # autocomplete (and /checkban) never learn about this ban until
+            # some future restart's reconcile_banned_users_cache() happens
+            # to pick it up via a live guild.bans() resync, which could be
+            # a long way off on a bot that stays up for days at a time.
+            ban_entry = {"discord_id": str(user.id), "tag": str(user), "reason": reason}
+            _add_banned_user_to_cache(ban_entry)
+            await _persist_banned_user(ban_entry)
             summary = f"{meta['emoji']} Banned for reaching **{total}** warnings."
         else:
             return None
@@ -282,9 +302,6 @@ async def _apply_warning_threshold_action(
         return f"⚠️ Reached the auto-action threshold, but I'm missing permissions to do that (configured action: {meta['label']})."
     except discord.HTTPException as e:
         return f"⚠️ Reached the auto-action threshold, but the auto-action failed: {e}"
-
-    if meta["notify_key"] and cfg["notify_target"]:
-        await notify_user(user, meta["notify_key"], interaction.user, reason, interaction.guild.name)
 
     if cfg["reset_after_action"]:
         result: Dict[str, int] = {"removed": 0}
@@ -700,23 +717,51 @@ async def _warn_clear_impl(interaction: discord.Interaction, user: discord.User)
 
 async def warning_autocomplete(interaction: discord.Interaction, current: str) -> List[app_commands.Choice[str]]:
     """Suggests this command's own already-picked `user` option's existing
-    warnings, read from the in-memory cache above so this stays well inside
-    Discord's ~3s autocomplete window -- no live GitHub fetch here, same as
+    warnings, read from the in-memory cache above so the common case stays
+    well inside Discord's ~3s autocomplete window -- same as
     whitelisted_user_autocomplete() in whitelist.py leaning on
-    get_cached_users() instead of a fresh fetch.
+    get_cached_users() instead of a fresh fetch. Unlike that cache though,
+    an empty result here falls back to one live BotState.json fetch before
+    concluding "no warnings" -- see the cache-miss handling below for why.
 
     Reads `user` off interaction.namespace since Discord fills a command's
     options in the order they were typed, so by the time someone's typing
     into `warning`, whatever they already picked for `user` is already
-    resolved there. Returns nothing if `user` hasn't been filled in yet --
-    there's nothing to suggest without knowing whose warnings to show."""
+    sitting there. Returns nothing if `user` hasn't been filled in yet --
+    there's nothing to suggest without knowing whose warnings to show.
+
+    Deliberately NOT `isinstance(target, (discord.Member, discord.User))`
+    here -- Discord doesn't send resolved data on autocomplete requests
+    (unlike a real invocation), so discord.py's Namespace can only ever
+    hand back a bare discord.Object for a still-being-typed `user` option,
+    never an actual Member/User. An isinstance check against those two
+    would reject it every single time regardless of cache state -- a
+    discord.Object's .id is all this needs anyway."""
     target = interaction.namespace.user
-    if not isinstance(target, (discord.Member, discord.User)):
+    if target is None:
         return []
+
+    matches = _user_warnings(target.id)
+
+    # Self-heal against a stale/cold cache -- most commonly right after a
+    # restart, if this fires before reconcile_warnings_cache() has finished
+    # warming it back up -- rather than confidently telling staff someone
+    # has zero warnings when BotState.json actually still has some. Only
+    # pays the extra network round trip when the cache comes up *empty*
+    # for this specific user, not on every keystroke, so the normal
+    # (already-warm cache) case stays exactly as fast as before. Mirrors
+    # _warn_inspect_impl()'s "live fetch is authoritative" refresh above.
+    if not matches:
+        try:
+            state, _sha = await fetch_botstate_with_sha()
+        except GitHubAPIError:
+            return []  # Still nothing to suggest -- fail quiet, same as any other empty result.
+        _set_warnings_cache(state.get("warnings", []))
+        matches = _user_warnings(target.id)
 
     query = current.lower().strip()
     choices = []
-    for w in _user_warnings(target.id):
+    for w in matches:
         reason = (w.get("reason") or "").strip()
         label = f"{w['id']} -- {reason}" if reason else w["id"]
         if len(label) > 100:
@@ -839,9 +884,23 @@ class Warnings(commands.Cog):
     @has_role(config.REQUIRED_ROLE_ID)
     @is_in_guild(config.GUILD_ID)
     async def warnings_config(self, interaction: discord.Interaction):
+        # Re-syncs the in-memory config from BotState.json before building
+        # the view, rather than trusting this process's copy blind -- same
+        # "in-memory cache came up looking wrong -> one live fetch before
+        # trusting it" convention as warning_autocomplete()'s cache-miss
+        # fallback above. _warning_config is normally kept correct by
+        # reconcile_warning_config() at startup and on_save()'s own write,
+        # but this is the one place a staff member can actually notice if
+        # those two ever drift apart (e.g. another bot process saved a
+        # change this process's memory never saw), so it's worth the one
+        # extra GitHub round trip -- this command isn't run often enough
+        # for that to matter, and it's exactly the guarantee "config" in
+        # its name implies.
+        await interaction.response.defer(ephemeral=True)
+        await reconcile_warning_config(interaction.client)
         view = WarningConfigView(interaction.user.id)
         view.build()
-        await interaction.response.send_message(view=view, ephemeral=True)
+        await interaction.followup.send(view=view, ephemeral=True)
 
 
 async def setup(bot: commands.Bot):
