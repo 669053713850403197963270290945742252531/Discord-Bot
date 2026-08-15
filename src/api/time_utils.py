@@ -210,3 +210,104 @@ def hwid_reset_cooldown_remaining(entry: Dict[str, Any]) -> Optional[timedelta]:
 
     remaining = config.RESET_HWID_COOLDOWN - (datetime.now(timezone.utc) - last_reset)
     return remaining if remaining.total_seconds() > 0 else None
+
+
+# =========================================================================
+# Time-range filter parsing (shared by /url clear's `before` option)
+# =========================================================================
+
+# Matches a relative duration like "20 minutes", "2 hours ago", "3 days" --
+# an optional trailing "ago" is accepted but not required, since both read
+# naturally for a cutoff ("clear everything from 20 minutes ago" and
+# "clear everything from the last 20 minutes" mean the same cutoff here).
+_RELATIVE_TIME_RE = re.compile(
+    r"^(\d+)\s*(seconds?|secs?|minutes?|mins?|hours?|hrs?|days?|weeks?|wks?|months?|years?|yrs?)\s*(?:ago)?$",
+    re.IGNORECASE,
+)
+
+# Seconds-per-unit for every unit _RELATIVE_TIME_RE can match, keyed by the
+# singular form (the regex's plural "s"/alternate spelling is stripped
+# before lookup -- see parse_time_filter()). Month/year are approximate
+# (30/365 days), same convention as humanize_timeleft() above -- a cutoff a
+# few hours off a calendar month doesn't meaningfully change what /url
+# clear catches.
+_RELATIVE_TIME_UNIT_SECONDS = {
+    "second": 1, "sec": 1,
+    "minute": 60, "min": 60,
+    "hour": 3600, "hr": 3600,
+    "day": 86400,
+    "week": 604800, "wk": 604800,
+    "month": 2592000,
+    "year": 31536000, "yr": 31536000,
+}
+
+# Absolute date/time formats parse_time_filter() falls back to once the
+# relative-duration shape doesn't match. Interpreted in LOCAL_TZ (like
+# parse_join_date()'s JoinDate format above) since that's how every other
+# date staff sees in this bot (JoinDate, Notes expiration markers, Discord
+# <t:...> timestamps rendered in their own client) already reads -- typing
+# a wall-clock time here should mean *their* wall clock, not UTC. Ordered
+# most-specific first purely so the first match found is also the most
+# precise one, though strptime rejects non-matches outright regardless of
+# order.
+_ABSOLUTE_LOCAL_TIME_FORMATS = (
+    "%m/%d/%Y, %I:%M:%S %p",  # JoinDate's own format, e.g. "6/19/2026, 3:24:53 AM"
+    "%m/%d/%Y, %I:%M %p",     # same, no seconds -- e.g. "8/13/2026, 2:50 AM"
+    "%m/%d/%Y %I:%M:%S %p",   # same, no comma
+    "%m/%d/%Y %I:%M %p",
+    "%m/%d/%Y",                # date only -- midnight local time
+    "%Y-%m-%d %H:%M:%S",
+    "%Y-%m-%d %H:%M",
+    "%Y-%m-%d",
+)
+
+
+def parse_time_filter(text: Optional[str]) -> Optional[datetime]:
+    """
+    Parses /url clear's `before` option into a tz-aware UTC cutoff
+    datetime, for filtering storage/shortened-urls.json entries by their
+    created_at (itself always UTC ISO -- see parse_iso() above). Accepts
+    two shapes, tried in this order:
+
+      1. A relative duration -- "20 minutes", "2 hours ago", "3 days" --
+         resolved against the current moment, so "20 minutes" always means
+         20 minutes before *now*, not 20 minutes before some other
+         reference point.
+      2. An absolute date/time, matched against
+         _ABSOLUTE_LOCAL_TIME_FORMATS (JoinDate's own "m/d/yyyy,
+         h:mm:ss AM/PM" plus a handful of looser variants -- no comma, no
+         seconds, date-only) and interpreted in LOCAL_TZ, or a plain UTC
+         ISO-8601 string (format_iso()'s own output), interpreted as UTC
+         directly.
+
+    Returns None if `text` matches neither shape, or is empty -- callers
+    should treat that as "couldn't understand this", not as "no filter".
+    """
+    if not text:
+        return None
+    text = text.strip()
+    if not text:
+        return None
+
+    relative = _RELATIVE_TIME_RE.match(text)
+    if relative:
+        amount = int(relative.group(1))
+        unit = relative.group(2).lower().rstrip("s")
+        seconds_per_unit = _RELATIVE_TIME_UNIT_SECONDS.get(unit)
+        if seconds_per_unit is not None:
+            return datetime.now(timezone.utc) - timedelta(seconds=amount * seconds_per_unit)
+
+    # ISO-8601 UTC (format_iso()'s own shape) -- checked before the local-
+    # time formats since its trailing "Z" makes it unambiguous.
+    try:
+        return datetime.strptime(text, "%Y-%m-%dT%H:%M:%SZ").replace(tzinfo=timezone.utc)
+    except ValueError:
+        pass
+
+    for fmt in _ABSOLUTE_LOCAL_TIME_FORMATS:
+        try:
+            return datetime.strptime(text, fmt).replace(tzinfo=config.LOCAL_TZ)
+        except ValueError:
+            continue
+
+    return None

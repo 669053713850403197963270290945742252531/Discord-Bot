@@ -86,15 +86,11 @@ def is_valid_discord_id(discord_id: str) -> bool:
 
 
 def is_valid_url(url: str) -> bool:
-    """True if `url` is a well-formed http(s) URL.
-
-    Just a sanity check before making a network call at all (a bare word,
-    a Discord ID, a missing scheme) -- not a substitute for the provider's
-    own validation. e-z.host's /shortener still does its own, stricter
-    check server-side and returns 400 on anything it doesn't like, same as
-    every other malformed-input case api/providers/ez_host.py already
-    handles.
-    """
+    """Loose http(s) URL validity check for /url shorten's `url` option --
+    just enough structure (an http/https scheme plus a non-empty host) to
+    reject obvious garbage before spending an e-z.host API call on it.
+    Not a full RFC 3986 validator -- e-z.host's own 400 response is still
+    the final word on anything that slips past this."""
     try:
         parsed = urlparse(url.strip())
     except ValueError:

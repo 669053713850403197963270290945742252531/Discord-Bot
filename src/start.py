@@ -87,6 +87,7 @@ EXTENSIONS = (
     "commands.context_menus",
     "commands.qrcode",
     "commands.warnings",
+    "commands.url",
 )
 
 # Guards the BotState.json reconciliation block in on_ready() so it only

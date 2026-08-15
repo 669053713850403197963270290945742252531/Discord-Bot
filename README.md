@@ -39,6 +39,9 @@ Discord-Bot/
 │   │   │   └── eff_large_wordlist.txt  # EFF Long Wordlist (7,776 entries) for Diceware-style passphrases
 │   │   ├── qrcode_gen.py        # /qrcode generate's encoding + Pillow rendering (solid/rainbow, styles) & /qrcode decode's OpenCV scanning
 │   │   └── discord_helpers.py   # embeds, interaction responders, permission checks, shared Components V2 layouts
+│   │   ├── qrcode_gen.py        # /qrcode generate's encoding + Pillow rendering (solid/rainbow, styles) & /qrcode decode's OpenCV scanning
+│   │   └── providers/
+│   │       └── ez_host.py       # e-z.host API wrapper (POST /shortener) for /url shorten
 │   └── commands/                # one cog per file -- each is a discord.py extension
 │       ├── __init__.py          # empty -- just makes this a package
 │       ├── info.py              # /botstatus, /myinfo, /avatar, /ratelimits
