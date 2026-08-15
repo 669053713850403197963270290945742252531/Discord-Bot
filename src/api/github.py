@@ -691,41 +691,80 @@ async def update_botstate(
 
 
 # =========================================================================
-# storage/shortened-urls.json
+# Shortened URLs (storage/shortened-urls.json)
 # =========================================================================
-# Every link created via /url shorten -- and, later, every file uploaded
-# via /upload -- across every provider (e-z.host today; the schema leaves
-# room for more), so a shortened link (and the deletion_url needed to take
-# it back down) survives a bot restart instead of living only in memory.
-# Same "fetch -> get sha -> mutate -> commit" shape as BotState.json above,
-# with the same retry-on-stale-sha loop: /url shorten can plausibly be run
-# by more than one person around the same moment, which is exactly the
-# race BotState.json's update_botstate() above exists to handle, so
-# update_shortened_urls() below deliberately reuses that pattern rather
-# than a fresh asyncio.Lock -- a Lock only protects against races *within
-# this one process*, where retry-on-409 also survives two racing bot
-# processes (e.g. a redeploy briefly running old and new side by side).
+#
+# Backs /url shorten, /paste, and /file (and any future /url list|delete,
+# or a second provider entirely). One file shared across every provider
+# this bot ever wires up, rather than one file per provider -- each
+# provider gets its own top-level key (e.g. "ez_host") inside it, so
+# adding a second provider later is a new key here, not a new file plus a
+# new set of fetch/commit/update helpers. Same "fetch -> get sha -> mutate
+# -> commit" shape as BotState.json above, including the same
+# fetch/mutate/commit retry-on-409 loop via update_shortened_urls() -- two
+# people running /url shorten close together is exactly the kind of race
+# BotState.json's update_botstate() already exists to handle, so this
+# reuses that shape rather than reaching for an asyncio.Lock, which would
+# only ever protect writes within a single process.
+#
+# Each provider's namespace is further split by *kind* -- "shorten",
+# "paste", "file" -- each a dict keyed by that kind's own short code, e.g.
+# under "ez_host":
+#     "shorten": {
+#         "abc123": {
+#             "original_url": "https://example.com/some/long/path",
+#             "shortened_url": "https://i.e-z.host/abc123",
+#             "deletion_url": "https://api.e-z.host/shortener/delete/...",
+#             "creator_id": "123456789012345678",
+#             "created_at": "2026-08-13T12:00:00Z",
+#         }
+#     },
+#     "paste": {
+#         "xyz789": {
+#             "title": "My paste",
+#             "language": "lua",
+#             "paste_url": "https://e-z.host/paste/xyz789",
+#             "raw_url": "https://e-z.host/paste/raw/xyz789",
+#             "deletion_url": "https://api.e-z.host/paste/delete/...",
+#             "creator_id": "123456789012345678",
+#             "created_at": "2026-08-13T12:00:00Z",
+#         }
+#     },
+#     "file": {
+#         "img456": {
+#             "original_filename": "logo.png",
+#             "content_type": "image/png",
+#             "size": 20481,
+#             "file_url": "https://i.e-z.host/img456.png",
+#             "deletion_url": "https://api.e-z.host/files/delete/...",
+#             "creator_id": "123456789012345678",
+#             "created_at": "2026-08-13T12:00:00Z",
+#         }
+#     }
+#
+# Split by kind (not just by provider) so a short code minted for one kind
+# can never silently collide with -- and overwrite -- an entry of a
+# different kind in the same provider's namespace, even if e-z.host's
+# shortener/paste/file features turn out to draw their codes from a
+# shared space. Doing this now costs nothing (storage/shortened-urls.json
+# has no real entries in it yet) -- flattening a provider's kinds into one
+# dict the way /url shorten's first cut did would have needed a real data
+# migration the moment /paste or /file actually collided with a /url
+# shorten entry.
 
 SHORTENED_URLS_SCHEMA_VERSION = 1
 
-# Nested one level deeper than BotState.json's top-level keys: every
-# provider gets its own key (e.g. "ez_host") holding a {short_code: entry}
-# dict, from day one -- even with only one provider today, so a second
-# provider's links can move in later without a migration for the first
-# provider's data. fetch_shortened_urls_with_sha() shallow-merges this
-# under whatever's actually in the file (one level, then one level again
-# per known provider), same reasoning as DEFAULT_BOTSTATE above.
 DEFAULT_SHORTENED_URLS: Dict[str, Any] = {
     "schema_version": SHORTENED_URLS_SCHEMA_VERSION,
     "last_updated": None,
-    "ez_host": {},
+    "ez_host": {"shorten": {}, "paste": {}, "file": {}},
 }
 
 
 async def fetch_shortened_urls_with_sha(session: Optional[aiohttp.ClientSession] = None) -> Tuple[Dict[str, Any], str]:
     """Fetches storage/shortened-urls.json + its sha via the Contents API.
     Use this before any write (see update_shortened_urls() below for the
-    usual way to do that), or read-only on its own (e.g. autocomplete)."""
+    usual way to do that), or on its own for a read-only lookup."""
     sess, should_close = await _get_session(session)
     try:
         async with sess.get(config.SHORTENED_URLS_API_URL, headers=config.HEADERS) as resp:
@@ -745,17 +784,7 @@ async def fetch_shortened_urls_with_sha(session: Optional[aiohttp.ClientSession]
     if not isinstance(state, dict):
         raise GitHubAPIError("shortened-urls.json's contents aren't a JSON object.")
 
-    merged = {**DEFAULT_SHORTENED_URLS, **state}
-    for provider in DEFAULT_SHORTENED_URLS:
-        if provider in ("schema_version", "last_updated"):
-            continue
-        # Guard against a hand-edited/older file where the provider key
-        # exists but isn't a dict -- fall back to empty rather than let a
-        # bad merge poison every read of this provider's links.
-        provider_value = state.get(provider)
-        merged[provider] = {**DEFAULT_SHORTENED_URLS[provider], **(provider_value if isinstance(provider_value, dict) else {})}
-
-    return merged, sha
+    return {**DEFAULT_SHORTENED_URLS, **state}, sha
 
 
 async def commit_shortened_urls(state: Dict[str, Any], sha: str, message: str, session: Optional[aiohttp.ClientSession] = None) -> Dict[str, Any]:
@@ -763,8 +792,8 @@ async def commit_shortened_urls(state: Dict[str, Any], sha: str, message: str, s
     last_updated) and commits it as the new storage/shortened-urls.json.
 
     Most callers should go through update_shortened_urls() instead, which
-    wraps this together with fetch_shortened_urls_with_sha() and retries on
-    a stale sha -- call this directly only when you already hold a
+    wraps this together with fetch_shortened_urls_with_sha() and retries
+    on a stale sha -- call this directly only when you already hold a
     freshly-fetched sha and know nothing else could have written in
     between."""
     to_write = {
@@ -799,18 +828,23 @@ async def update_shortened_urls(
     max_retries: int = 3,
 ) -> Dict[str, Any]:
     """
-    Read-modify-write helper for shortened-urls.json -- identical shape to
-    update_botstate() above: fetches the current state + sha, calls
-    `mutate(state)` (may mutate the dict in place and return it, or return
-    a fresh one), and commits the result. If another write landed in
-    between (stale sha -- HTTP 409), re-fetches the now-current state,
-    re-applies `mutate`, and retries, up to `max_retries` attempts total.
+    Read-modify-write helper for shortened-urls.json: fetches the current
+    state + sha, calls `mutate(state)` (may mutate the dict in place and
+    return it, or return a fresh one), and commits the result.
 
-    Raises GitHubAPIError if every attempt fails -- callers should catch
-    this and log it rather than let it bubble up as a command error, same
-    reasoning as update_botstate() (the actual short link/upload has
-    almost always already succeeded with the provider by this point;
-    losing the bookkeeping write shouldn't undo that).
+    If another write landed in between (the sha this attempt started with
+    is now stale -- GitHub returns HTTP 409), this re-fetches the now-
+    current state, re-applies `mutate`, and retries, up to `max_retries`
+    attempts total -- same retry shape as update_botstate() above, for the
+    same reason: this file can legitimately be written from more than one
+    place close together (two people running /url shorten at once, a
+    future /url delete racing a /url shorten, etc).
+
+    Raises GitHubAPIError if every attempt fails. Callers whose provider
+    call has already succeeded (e.g. /url shorten, after e-z.host has
+    already created the link) should catch this and log it rather than
+    let it look like the whole command failed -- the link itself already
+    exists at that point, only the local bookkeeping record didn't save.
     """
     sess, should_close = await _get_session(session)
     try:
@@ -833,44 +867,163 @@ async def update_shortened_urls(
             await sess.close()
 
 
-async def get_shortened_urls(provider: str = "ez_host", session: Optional[aiohttp.ClientSession] = None) -> Dict[str, Dict[str, Any]]:
-    """Convenience read: just this provider's {short_code: entry} dict --
-    for autocomplete/listing/lookup call sites that don't need the sha or
-    every other provider's data alongside it."""
-    state, _ = await fetch_shortened_urls_with_sha(session)
-    return state.get(provider, {})
+async def get_shortened_urls(provider: str, kind: str, session: Optional[aiohttp.ClientSession] = None) -> Dict[str, Any]:
+    """Returns {short_code: entry, ...} for the given provider+kind
+    sub-namespace (e.g. "ez_host" / "paste") in storage/shortened-urls.json.
+    Always a live GitHub fetch -- no in-memory cache yet, since nothing
+    here needs a ~3s-budget lookup. That changes the moment a /url list or
+    /url delete autocomplete shows up (same reasoning as /warnings'
+    _warnings_cache in commands/warnings.py), at which point this is the
+    natural place to add one."""
+    state, _sha = await fetch_shortened_urls_with_sha(session)
+    return state.get(provider, {}).get(kind, {})
+
+
+# Kinds checked (in this order) by find_shortened_url_entry() below --
+# module-level so it's defined once rather than re-literaled at every
+# call site, same convention as DEFAULT_SHORTENED_URLS above.
+_SHORTENED_URL_KINDS = ("shorten", "paste", "file")
+
+
+async def find_shortened_url_entry(
+    short_code: str,
+    provider: str = "ez_host",
+    session: Optional[aiohttp.ClientSession] = None,
+) -> Optional[Tuple[str, Dict[str, Any]]]:
+    """Looks up `short_code` across every kind under `provider`'s
+    namespace in storage/shortened-urls.json, via a single fetch --
+    looping get_shortened_urls() across all three kinds would mean three
+    redundant fetch_shortened_urls_with_sha() round trips for the exact
+    same file, since that function always does a fresh full-file fetch.
+
+    Built for /url unshorten: the fast, authoritative path for anything
+    this bot itself created (e-z.host links, pastes, or file uploads) --
+    creator_id/created_at came from this bot at creation time, so there's
+    no need to fetch the destination URL at all, unlike the live-
+    redirect-following fallback for short codes that aren't in here.
+
+    Checked in _SHORTENED_URL_KINDS order; not meaningful beyond matching
+    DEFAULT_SHORTENED_URLS's own key order, since short codes are
+    namespaced separately per kind and (barring an e-z.host-side
+    collision across its own shortener/paste/file code spaces) should
+    only ever match one.
+
+    Returns (kind, entry) for the first kind whose sub-namespace has
+    `short_code` as a key, or None if it isn't found under any kind.
+    """
+    state, _sha = await fetch_shortened_urls_with_sha(session)
+    provider_state = state.get(provider, {})
+    for kind in _SHORTENED_URL_KINDS:
+        entry = provider_state.get(kind, {}).get(short_code)
+        if entry is not None:
+            return kind, entry
+    return None
 
 
 async def save_shortened_url(
+    provider: str,
+    kind: str,
     short_code: str,
-    original_url: str,
-    shortened_url: str,
-    deletion_url: Optional[str],
-    creator_id: int,
-    provider: str = "ez_host",
+    entry: Dict[str, Any],
+    message: str,
     session: Optional[aiohttp.ClientSession] = None,
 ) -> Dict[str, Any]:
-    """Records one newly-created shortened link under
-    state[provider][short_code] and commits it via update_shortened_urls(),
-    so a concurrent /url shorten from someone else can't silently clobber
-    this write (or vice versa). Returns the entry that was saved.
+    """Adds (or overwrites) one entry under `provider`'s `kind` sub-
+    namespace (e.g. "ez_host" / "shorten") in storage/shortened-urls.json
+    and commits it, via update_shortened_urls()'s fetch/mutate/commit
+    retry loop. Returns the newly committed full state (every provider's
+    namespace, not just `provider`'s).
 
-    `short_code` should be whatever uniquely identifies the link for this
-    provider -- for e-z.host that's the path segment of shortened_url (e.g.
-    "abc123" out of "https://i.e-z.host/abc123"), since e-z.host's API
-    itself returns no separate id to key on.
-    """
-    entry = {
-        "original_url": original_url,
-        "shortened_url": shortened_url,
-        "deletion_url": deletion_url,
-        "creator_id": creator_id,
-        "created_at": datetime.now(timezone.utc).strftime("%Y-%m-%dT%H:%M:%SZ"),
-    }
+    setdefault()s both levels rather than assuming they already exist, so
+    this self-heals against an older, pre-kind-split shortened-urls.json
+    (e.g. a bare "ez_host": {}) instead of raising."""
+    def _mutate(state: Dict[str, Any]) -> Dict[str, Any]:
+        state.setdefault(provider, {})
+        state[provider].setdefault(kind, {})
+        state[provider][kind][short_code] = entry
+        return state
+    return await update_shortened_urls(_mutate, message, session)
+
+
+def _iter_shortened_url_entries(state: Dict[str, Any]):
+    """Yields (provider, kind, short_code, entry) for every entry across
+    every provider and kind currently in a fetched shortened-urls.json
+    state dict. Skips the top-level \"schema_version\"/\"last_updated\"
+    bookkeeping keys (and anything else that isn't shaped like a
+    provider's kind-namespace dict) automatically rather than hardcoding
+    the provider list -- so this (and everything built on it, like /url
+    clear below) picks up a future second provider with no changes
+    needed."""
+    for provider, provider_state in state.items():
+        if not isinstance(provider_state, dict):
+            continue
+        for kind, entries in provider_state.items():
+            if not isinstance(entries, dict):
+                continue
+            for short_code, entry in entries.items():
+                yield provider, kind, short_code, entry
+
+
+async def find_matching_shortened_urls(
+    predicate: Callable[[Dict[str, Any], str, str], bool],
+    session: Optional[aiohttp.ClientSession] = None,
+) -> List[Tuple[str, str, str, Dict[str, Any]]]:
+    """Read-only preview for /url clear's confirmation step: fetches
+    storage/shortened-urls.json once and returns every
+    (provider, kind, short_code, entry) tuple for which
+    predicate(entry, kind, provider) is True, without modifying anything.
+    `predicate` is called with the entry first so the common \"filter by a
+    field on the entry itself\" case (creator_id, created_at) doesn't need
+    to unpack a differently-ordered tuple.
+
+    A caller that goes on to actually delete these should re-run
+    clear_shortened_urls() below with the same predicate rather than reuse
+    this result directly -- the file may have changed between this preview
+    and that write, same reasoning as every other fetch-then-maybe-write
+    pair in this module."""
+    state, _sha = await fetch_shortened_urls_with_sha(session)
+    return [
+        (provider, kind, short_code, entry)
+        for provider, kind, short_code, entry in _iter_shortened_url_entries(state)
+        if predicate(entry, kind, provider)
+    ]
+
+
+async def clear_shortened_urls(
+    predicate: Callable[[Dict[str, Any], str, str], bool],
+    message: str,
+    session: Optional[aiohttp.ClientSession] = None,
+) -> List[Tuple[str, str, str, Dict[str, Any]]]:
+    """Removes every entry (across every provider and kind) in
+    storage/shortened-urls.json for which predicate(entry, kind, provider)
+    is True, via update_shortened_urls()'s fetch/mutate/commit retry loop
+    -- same reasoning as save_shortened_url() for going through that
+    instead of a plain fetch+commit: a /url clear racing a /url shorten
+    (or a second /url clear) is exactly the kind of conflict that retry
+    loop exists to absorb.
+
+    Returns what was actually removed, as
+    [(provider, kind, short_code, entry), ...]. Rebuilt fresh on every
+    retry attempt (`removed.clear()` at the top of `_mutate`), so on a
+    409-triggered retry this always reflects what actually got committed
+    rather than a stale first-attempt preview -- important since a second
+    write landing in between could mean a short code this predicate
+    matched on attempt 1 no longer exists (or no longer matches) by the
+    time attempt 2 re-fetches and re-applies it."""
+    removed: List[Tuple[str, str, str, Dict[str, Any]]] = []
 
     def _mutate(state: Dict[str, Any]) -> Dict[str, Any]:
-        state.setdefault(provider, {})[short_code] = entry
+        removed.clear()
+        for provider, provider_state in state.items():
+            if not isinstance(provider_state, dict):
+                continue
+            for kind, entries in provider_state.items():
+                if not isinstance(entries, dict):
+                    continue
+                to_delete = [code for code, entry in entries.items() if predicate(entry, kind, provider)]
+                for code in to_delete:
+                    removed.append((provider, kind, code, entries.pop(code)))
         return state
 
-    await update_shortened_urls(_mutate, f"Add {provider} shortened URL {short_code}", session)
-    return entry
+    await update_shortened_urls(_mutate, message, session)
+    return removed

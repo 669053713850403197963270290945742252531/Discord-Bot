@@ -14,7 +14,7 @@ from typing import Any, Dict, List, Optional, Tuple
 import discord
 from discord import app_commands
 from discord.ext import commands
-from discord.ui import Container, File, LayoutView, TextDisplay
+from discord.ui import ActionRow, Button, Container, File, LayoutView, TextDisplay
 
 from api.github import GitHubAPIError, fetch_botstate_with_sha, update_botstate
 from api.keys import is_valid_discord_id
@@ -471,6 +471,129 @@ def status_layout(title: str, description: str, color: discord.Color) -> LayoutV
         accent_color=color,
     ))
     return layout
+
+
+# =========================================================================
+# Paginated list view (any line-based listing that can outgrow one message)
+# =========================================================================
+#
+# A single Components V2 TextDisplay -- like a plain embed description --
+# stops being usable well before Discord's hard character ceiling actually
+# bites; a long enough listing (e.g. /url clear reporting hundreds of
+# removed entries) needs to be split across multiple pages rather than
+# truncated or dumped as a file. PAGINATED_LIST_MAX_CHARS is the per-page
+# budget this splits at -- comfortably under that ceiling with headroom
+# left for the header/page-count line above it, matching the conservative
+# margin /key fetch's own inline-vs-file threshold (1800) and
+# send_diff_result()'s inline_char_limit already use elsewhere in this
+# module, rather than trying to hug the exact limit.
+
+PAGINATED_LIST_MAX_CHARS = 3500
+
+
+def paginate_lines(lines: List[str], *, max_chars: int = PAGINATED_LIST_MAX_CHARS) -> List[str]:
+    """Greedily packs `lines` into page-sized chunks (each joined with
+    "\\n") kept under `max_chars`, for use with PaginatedListView below.
+
+    Packs as many lines as fit per page rather than one line/item per
+    page -- a listing like /url clear's removed-entries report can run to
+    hundreds of short, similar-looking lines, so this reads far better
+    than forcing a page turn per entry.
+
+    A single line longer than `max_chars` on its own still gets a page to
+    itself rather than being split mid-line -- this is a packing
+    algorithm, not a line-wrapping one, and none of this codebase's own
+    callers (one short summary line per entry) are expected to hit that
+    case; it exists purely as a safety valve against a caller that does.
+
+    Returns `[""]` for an empty `lines` list, so PaginatedListView always
+    has at least one (empty) page to render rather than needing a special
+    case for \"nothing to show\"."""
+    if not lines:
+        return [""]
+
+    pages: List[str] = []
+    current: List[str] = []
+    current_len = 0
+    for line in lines:
+        added_len = len(line) + (1 if current else 0)  # +1 for the joining "\n"
+        if current and current_len + added_len > max_chars:
+            pages.append("\n".join(current))
+            current = [line]
+            current_len = len(line)
+        else:
+            current.append(line)
+            current_len += added_len
+    if current:
+        pages.append("\n".join(current))
+    return pages
+
+
+class PaginatedListView(LayoutView):
+    """Generic Components V2 paginated 'embed' for any pre-formatted,
+    line-based listing that might not fit in a single message -- e.g.
+    /url clear's list of removed entries. Splits `lines` into page-sized
+    chunks up front via paginate_lines() and shows one page at a time
+    with Previous/Next buttons, continuing until the data ends -- unlike
+    DbSearchView/WhitelistView elsewhere in this codebase, which page one
+    *record* at a time, this pages one *screenful of text* at a time,
+    since the content here is a flat list rather than one detailed record
+    per page.
+
+    Previous/Next buttons are only added once there's more than one page
+    -- a listing that fits on one page renders as a plain, buttonless
+    Container, same convention as DbSearchView's own single-match case."""
+
+    def __init__(
+        self,
+        title: str,
+        lines: List[str],
+        *,
+        color: discord.Color = discord.Color.blurple(),
+        timeout: Optional[float] = 300,
+    ):
+        super().__init__(timeout=timeout)
+        self.title = title
+        self.pages = paginate_lines(lines)
+        self.current_page = 0
+
+        self.header = TextDisplay("")
+        self.body = TextDisplay("")
+
+        self.prev_button = Button(label="⏮️ Previous", style=discord.ButtonStyle.secondary)
+        self.next_button = Button(label="⏭️ Next", style=discord.ButtonStyle.secondary)
+        self.prev_button.callback = self.on_prev
+        self.next_button.callback = self.on_next
+
+        self.container = Container(self.header, self.body, accent_color=color)
+        if len(self.pages) > 1:
+            self.container.add_item(ActionRow(self.prev_button, self.next_button))
+
+        self.add_item(self.container)
+        self.refresh_content()
+
+    async def on_error(self, interaction: discord.Interaction, error: Exception, item) -> None:
+        await default_ui_error(interaction, error, item, label="PaginatedListView")
+
+    def update_button_states(self):
+        self.prev_button.disabled = self.current_page == 0
+        self.next_button.disabled = self.current_page >= len(self.pages) - 1
+
+    def refresh_content(self):
+        page_suffix = f" (page {self.current_page + 1}/{len(self.pages)})" if len(self.pages) > 1 else ""
+        self.header.content = f"### {self.title}{page_suffix}"
+        self.body.content = self.pages[self.current_page] or "*Nothing to show.*"
+        self.update_button_states()
+
+    async def on_prev(self, interaction: discord.Interaction):
+        self.current_page = max(0, self.current_page - 1)
+        self.refresh_content()
+        await interaction.response.edit_message(view=self)
+
+    async def on_next(self, interaction: discord.Interaction):
+        self.current_page = min(len(self.pages) - 1, self.current_page + 1)
+        self.refresh_content()
+        await interaction.response.edit_message(view=self)
 
 
 # =========================================================================
