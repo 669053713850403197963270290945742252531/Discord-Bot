@@ -1,5 +1,34 @@
 {
   "schema_version": 1,
-  "last_updated": "2026-08-13T07:54:22Z",
-  "ez_host": {}
+  "last_updated": "2026-08-13T08:58:27Z",
+  "ez_host": {
+    "shorten": {
+      "ijyh3i": {
+        "original_url": "https://mail.google.com/",
+        "shortened_url": "https://i.e-z.host/s/ijyh3i",
+        "deletion_url": "https://api.e-z.host/shortener/delete?key=irw3rwfn7d9adu0zg9m1f5mw93rgdckds449aomj",
+        "creator_id": "999776749070078004",
+        "created_at": "2026-08-13T07:56:57Z"
+      },
+      "khh104": {
+        "original_url": "https://fbi.pet/",
+        "shortened_url": "https://i.e-z.host/s/khh104",
+        "deletion_url": "https://api.e-z.host/shortener/delete?key=bdwnuzocyinxe77vodv205am5g8ojgk9ui4ntm1p",
+        "creator_id": "999776749070078004",
+        "created_at": "2026-08-13T08:24:40Z"
+      }
+    },
+    "file": {},
+    "paste": {
+      "2ehpcxbb": {
+        "title": "E-Z api test paste",
+        "language": "markdown",
+        "paste_url": "https://i.e-z.host/p/2ehpcxbb",
+        "raw_url": "https://i.e-z.host/p/raw/2ehpcxbb",
+        "deletion_url": "https://api.e-z.host/paste/delete?key=r1xyr9qc7eisedscsjwnabi9sppp1qih76c98zpp",
+        "creator_id": "999776749070078004",
+        "created_at": "2026-08-13T07:57:26Z"
+      }
+    }
+  }
 }
