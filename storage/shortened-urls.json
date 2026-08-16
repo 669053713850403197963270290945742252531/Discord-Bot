@@ -1,6 +1,6 @@
 {
   "schema_version": 1,
-  "last_updated": "2026-08-16T09:45:27Z",
+  "last_updated": "2026-08-16T09:46:11Z",
   "ez_host": {
     "shorten": {
       "foeao9": {
@@ -433,6 +433,15 @@
         "deletion_url": "WxCYSf160hpz1vBfbjY9CrqXNMhiVdcE",
         "creator_id": "999776749070078004",
         "created_at": "2026-08-16T09:45:27Z"
+      },
+      "ysqf4pT3": {
+        "title": "title",
+        "language": "Lua",
+        "paste_url": "https://pastey.gg/ysqf4pT3",
+        "raw_url": "https://api.pastey.gg/pastes/ysqf4pT3/raw",
+        "deletion_url": "e5Ex7OPoDHvFDMISxTVL8p8m7DLU5QOb",
+        "creator_id": "999776749070078004",
+        "created_at": "2026-08-16T09:46:11Z"
       }
     }
   }
