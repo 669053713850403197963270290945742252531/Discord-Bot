@@ -1,6 +1,6 @@
 {
   "schema_version": 1,
-  "last_updated": "2026-08-16T09:42:02Z",
+  "last_updated": "2026-08-16T09:42:22Z",
   "ez_host": {
     "shorten": {
       "foeao9": {
@@ -415,6 +415,15 @@
         "deletion_url": "aZEmz36OhF8hwssmw8UXgXhFrtxm3S5n",
         "creator_id": "999776749070078004",
         "created_at": "2026-08-16T09:42:02Z"
+      },
+      "BeiEZ75Z": {
+        "title": null,
+        "language": "plaintext",
+        "paste_url": "https://pastey.gg/BeiEZ75Z",
+        "raw_url": "https://api.pastey.gg/pastes/BeiEZ75Z/raw",
+        "deletion_url": "myiqmkSA6YNvPSlMtdN4FR0DYF41i9AC",
+        "creator_id": "999776749070078004",
+        "created_at": "2026-08-16T09:42:22Z"
       }
     }
   }
