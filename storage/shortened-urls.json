@@ -1,6 +1,6 @@
 {
   "schema_version": 1,
-  "last_updated": "2026-08-13T08:58:27Z",
+  "last_updated": "2026-08-16T01:09:47Z",
   "ez_host": {
     "shorten": {
       "ijyh3i": {
@@ -28,6 +28,17 @@
         "deletion_url": "https://api.e-z.host/paste/delete?key=r1xyr9qc7eisedscsjwnabi9sppp1qih76c98zpp",
         "creator_id": "999776749070078004",
         "created_at": "2026-08-13T07:57:26Z"
+      }
+    }
+  },
+  "tinyurl": {
+    "shorten": {
+      "my-project-presentation": {
+        "original_url": "https://google.com/",
+        "shortened_url": "https://tinyurl.com/my-project-presentation",
+        "deletion_url": null,
+        "creator_id": "999776749070078004",
+        "created_at": "2026-08-16T01:09:47Z"
       }
     }
   }
