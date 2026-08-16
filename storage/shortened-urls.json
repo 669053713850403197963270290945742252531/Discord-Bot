@@ -1,6 +1,6 @@
 {
   "schema_version": 1,
-  "last_updated": "2026-08-16T03:04:36Z",
+  "last_updated": "2026-08-16T03:05:37Z",
   "ez_host": {
     "shorten": {
       "foeao9": {
@@ -154,6 +154,15 @@
         "deletion_url": null,
         "creator_id": "999776749070078004",
         "created_at": "2026-08-16T03:04:36Z"
+      },
+      "RaNyRVM9": {
+        "title": null,
+        "language": "plaintext",
+        "paste_url": "https://pastee.dev/p/RaNyRVM9",
+        "raw_url": "https://pastee.dev/r/RaNyRVM9",
+        "deletion_url": null,
+        "creator_id": "999776749070078004",
+        "created_at": "2026-08-16T03:05:37Z"
       }
     }
   }
