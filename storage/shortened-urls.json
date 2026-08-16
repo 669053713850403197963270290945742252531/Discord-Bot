@@ -1,6 +1,6 @@
 {
   "schema_version": 1,
-  "last_updated": "2026-08-16T01:41:04Z",
+  "last_updated": "2026-08-16T01:41:25Z",
   "ez_host": {
     "shorten": {
       "foeao9": {
@@ -79,6 +79,19 @@
         "deletion_url": null,
         "creator_id": "999776749070078004",
         "created_at": "2026-08-16T01:41:04Z"
+      }
+    }
+  },
+  "catbox": {
+    "file": {
+      "6qnyvo.mp3": {
+        "original_filename": "audio.mp3",
+        "content_type": "audio/mpeg3",
+        "size": 5135085,
+        "file_url": "https://files.catbox.moe/6qnyvo.mp3",
+        "deletion_url": null,
+        "creator_id": "999776749070078004",
+        "created_at": "2026-08-16T01:41:25Z"
       }
     }
   }
