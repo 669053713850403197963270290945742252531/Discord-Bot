@@ -1,6 +1,6 @@
 {
   "schema_version": 1,
-  "last_updated": "2026-08-16T01:11:51Z",
+  "last_updated": "2026-08-16T01:16:08Z",
   "ez_host": {
     "shorten": {
       "foeao9": {
@@ -36,6 +36,17 @@
         "deletion_url": null,
         "creator_id": "999776749070078004",
         "created_at": "2026-08-16T01:11:06Z"
+      }
+    }
+  },
+  "is_gd": {
+    "shorten": {
+      "AG3Hwv": {
+        "original_url": "https://example.com/",
+        "shortened_url": "https://is.gd/AG3Hwv",
+        "deletion_url": null,
+        "creator_id": "999776749070078004",
+        "created_at": "2026-08-16T01:16:08Z"
       }
     }
   }
