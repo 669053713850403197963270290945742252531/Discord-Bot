@@ -1,6 +1,6 @@
 {
   "schema_version": 1,
-  "last_updated": "2026-08-16T03:10:12Z",
+  "last_updated": "2026-08-16T03:10:37Z",
   "ez_host": {
     "shorten": {
       "foeao9": {
@@ -181,6 +181,15 @@
         "deletion_url": null,
         "creator_id": "999776749070078004",
         "created_at": "2026-08-16T03:10:11Z"
+      },
+      "ttO3IgXx": {
+        "title": null,
+        "language": "lua",
+        "paste_url": "https://pastee.dev/p/ttO3IgXx",
+        "raw_url": "https://pastee.dev/r/ttO3IgXx",
+        "deletion_url": null,
+        "creator_id": "999776749070078004",
+        "created_at": "2026-08-16T03:10:37Z"
       }
     }
   }
