@@ -1,6 +1,6 @@
 {
   "schema_version": 1,
-  "last_updated": "2026-08-16T10:11:09Z",
+  "last_updated": "2026-08-16T10:11:43Z",
   "ez_host": {
     "shorten": {
       "foeao9": {
@@ -479,6 +479,15 @@
         "deletion_url": "yhGKjmnKhB16b0G8SB06KZCXBSGULnRp",
         "creator_id": "999776749070078004",
         "created_at": "2026-08-16T10:11:09Z"
+      },
+      "GU4L8KLX": {
+        "title": "Celestial /paste command progress",
+        "language": "plaintext",
+        "paste_url": "https://pastey.gg/GU4L8KLX",
+        "raw_url": "https://api.pastey.gg/pastes/GU4L8KLX/raw",
+        "deletion_url": "NXDmJM5uUoWhRuXoAH7AwZMwHkoQ2aca",
+        "creator_id": "999776749070078004",
+        "created_at": "2026-08-16T10:11:43Z"
       }
     }
   }
