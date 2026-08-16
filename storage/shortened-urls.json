@@ -1,6 +1,6 @@
 {
   "schema_version": 1,
-  "last_updated": "2026-08-16T01:39:23Z",
+  "last_updated": "2026-08-16T01:41:04Z",
   "ez_host": {
     "shorten": {
       "foeao9": {
@@ -70,6 +70,15 @@
         "deletion_url": null,
         "creator_id": "999776749070078004",
         "created_at": "2026-08-16T01:39:23Z"
+      },
+      "bvnqed.png": {
+        "original_filename": "image.png",
+        "content_type": "image/png",
+        "size": 4821,
+        "file_url": "https://litter.catbox.moe/bvnqed.png",
+        "deletion_url": null,
+        "creator_id": "999776749070078004",
+        "created_at": "2026-08-16T01:41:04Z"
       }
     }
   }
