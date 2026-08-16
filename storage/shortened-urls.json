@@ -1,6 +1,6 @@
 {
   "schema_version": 1,
-  "last_updated": "2026-08-16T01:31:08Z",
+  "last_updated": "2026-08-16T01:38:38Z",
   "ez_host": {
     "shorten": {
       "foeao9": {
@@ -12,7 +12,17 @@
       }
     },
     "paste": {},
-    "file": {}
+    "file": {
+      "wof5q4ju.png": {
+        "original_filename": "image.png",
+        "content_type": "image/png",
+        "size": 4821,
+        "file_url": "https://i.e-z.host/wof5q4ju.png",
+        "deletion_url": "https://api.e-z.host/files/delete?key=vyqtm2ll50n92m1tldoyhayehf3qhsfy60sytj1j",
+        "creator_id": "999776749070078004",
+        "created_at": "2026-08-16T01:38:38Z"
+      }
+    }
   },
   "tinyurl": {
     "shorten": {
