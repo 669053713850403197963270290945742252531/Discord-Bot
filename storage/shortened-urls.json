@@ -1,6 +1,6 @@
 {
   "schema_version": 1,
-  "last_updated": "2026-08-17T20:40:12Z",
+  "last_updated": "2026-08-17T20:41:23Z",
   "ez_host": {
     "shorten": {
       "foeao9": {
@@ -600,6 +600,15 @@
         "deletion_url": "e4lcEWUrcR9lsbP4tc3FqNJhwDUPOWda",
         "creator_id": "999776749070078004",
         "created_at": "2026-08-17T10:20:43Z"
+      },
+      "RS9JrqUG": {
+        "title": "Instance_Inspector.lua",
+        "language": "plaintext",
+        "paste_url": "https://pastey.gg/RS9JrqUG",
+        "raw_url": "https://api.pastey.gg/pastes/RS9JrqUG/raw",
+        "deletion_url": "hWBLJWNmLKm87ZfuJ7nxDjfTBECWGSbF",
+        "creator_id": "999776749070078004",
+        "created_at": "2026-08-17T20:41:23Z"
       }
     }
   }
