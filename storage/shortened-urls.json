@@ -1,6 +1,6 @@
 {
   "schema_version": 1,
-  "last_updated": "2026-08-17T10:09:33Z",
+  "last_updated": "2026-08-17T10:15:14Z",
   "ez_host": {
     "shorten": {
       "foeao9": {
@@ -11,7 +11,17 @@
         "created_at": "2026-08-16T01:11:51Z"
       }
     },
-    "paste": {},
+    "paste": {
+      "nyncg3th": {
+        "title": "test",
+        "language": "plaintext",
+        "paste_url": "https://i.e-z.host/p/nyncg3th",
+        "raw_url": "https://i.e-z.host/p/raw/nyncg3th",
+        "deletion_url": "https://api.e-z.host/paste/delete?key=3xxdggvwpmzwjp44s0u5aai2tpnzct3wjc6zwso6",
+        "creator_id": "999776749070078004",
+        "created_at": "2026-08-17T10:15:14Z"
+      }
+    },
     "file": {
       "wof5q4ju.png": {
         "original_filename": "image.png",
