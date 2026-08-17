@@ -1,6 +1,6 @@
 {
   "schema_version": 1,
-  "last_updated": "2026-08-17T20:42:17Z",
+  "last_updated": "2026-08-17T20:43:06Z",
   "ez_host": {
     "shorten": {
       "foeao9": {
@@ -126,13 +126,13 @@
   "rubis": {
     "paste": {
       "view": {
-        "title": "title",
-        "language": "Code",
-        "paste_url": "https://rubis.app/view/?scrap=Cz1SYzNNRy3aUY1O",
-        "raw_url": "https://api.rubis.app/v2/scrap/Cz1SYzNNRy3aUY1O/raw",
-        "deletion_url": "BMyWlWkWrNDKewMZI777wKxgQ7gLETGH",
+        "title": "Embed_Library.lua",
+        "language": "plaintext",
+        "paste_url": "https://rubis.app/view/?scrap=i0JIc5kvHhMC1YKY",
+        "raw_url": "https://api.rubis.app/v2/scrap/i0JIc5kvHhMC1YKY/raw",
+        "deletion_url": "V34ECpTTGYTNXNMjugMAEYhI22GGO5Gj",
         "creator_id": "999776749070078004",
-        "created_at": "2026-08-17T10:23:51Z"
+        "created_at": "2026-08-17T20:43:06Z"
       }
     }
   },
