@@ -1,6 +1,6 @@
 {
   "schema_version": 1,
-  "last_updated": "2026-08-17T20:36:45Z",
+  "last_updated": "2026-08-17T20:37:46Z",
   "ez_host": {
     "shorten": {
       "foeao9": {
@@ -313,6 +313,16 @@
         "deletion_url": null,
         "creator_id": "999776749070078004",
         "created_at": "2026-08-17T20:36:44Z"
+      },
+      "Cufx4X6F": {
+        "title": "Asset_Library.lua",
+        "language": "plaintext",
+        "paste_url": "https://pastee.dev/p/Cufx4X6F",
+        "raw_url": "https://pastee.dev/r/Cufx4X6F",
+        "deletion_url": null,
+        "creator_id": "999776749070078004",
+        "created_at": "2026-08-17T20:37:46Z",
+        "file_count": 2
       }
     }
   },
