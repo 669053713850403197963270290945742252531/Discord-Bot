@@ -1,6 +1,6 @@
 {
   "schema_version": 1,
-  "last_updated": "2026-08-17T10:20:44Z",
+  "last_updated": "2026-08-17T10:21:06Z",
   "ez_host": {
     "shorten": {
       "foeao9": {
@@ -126,13 +126,13 @@
   "rubis": {
     "paste": {
       "view": {
-        "title": null,
-        "language": "markdown",
-        "paste_url": "https://rubis.app/view/?scrap=DOFOcmRUTKqhjZ86",
-        "raw_url": "https://api.rubis.app/v2/scrap/DOFOcmRUTKqhjZ86/raw",
-        "deletion_url": "nv8cHbafnUipJ5dFgQyuXODo5wqGt2wP",
+        "title": "title",
+        "language": "Lua",
+        "paste_url": "https://rubis.app/view/?scrap=1aPqY4y2NC8uZ95q&accessKey=ynzsvooyJFafoahIM2LhifypBBYxfX5k",
+        "raw_url": "https://api.rubis.app/v2/scrap/1aPqY4y2NC8uZ95q/raw?accessKey=ynzsvooyJFafoahIM2LhifypBBYxfX5k",
+        "deletion_url": "QVp1sTCTrT0xprwK0SPF13ANwxW0EzKx",
         "creator_id": "999776749070078004",
-        "created_at": "2026-08-17T07:20:15Z"
+        "created_at": "2026-08-17T10:21:06Z"
       }
     }
   },
