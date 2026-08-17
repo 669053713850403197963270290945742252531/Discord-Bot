@@ -1,6 +1,6 @@
 {
   "schema_version": 1,
-  "last_updated": "2026-08-17T10:19:56Z",
+  "last_updated": "2026-08-17T10:20:18Z",
   "ez_host": {
     "shorten": {
       "foeao9": {
@@ -29,6 +29,15 @@
         "deletion_url": "https://api.e-z.host/paste/delete?key=wh30m4iyc7a5r9bf32psp58tavjy8gla5dpms26x",
         "creator_id": "999776749070078004",
         "created_at": "2026-08-17T10:19:56Z"
+      },
+      "dwndvdxx": {
+        "title": "title",
+        "language": "lua",
+        "paste_url": "https://i.e-z.host/p/dwndvdxx",
+        "raw_url": "https://i.e-z.host/p/raw/dwndvdxx",
+        "deletion_url": "https://api.e-z.host/paste/delete?key=zyfzk2bnho5p088rvoppkzp7nushfczd0s4lpq66",
+        "creator_id": "999776749070078004",
+        "created_at": "2026-08-17T10:20:17Z"
       }
     },
     "file": {
