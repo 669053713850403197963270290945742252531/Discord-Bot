@@ -1,6 +1,6 @@
 {
   "schema_version": 1,
-  "last_updated": "2026-08-18T09:25:59Z",
+  "last_updated": "2026-08-18T09:26:25Z",
   "ez_host": {
     "shorten": {
       "foeao9": {
@@ -658,6 +658,15 @@
         "deletion_url": null,
         "creator_id": "999776749070078004",
         "created_at": "2026-08-18T09:25:59Z"
+      },
+      "qB8KLcsV": {
+        "title": "Celestial /paste command progress",
+        "language": "lua",
+        "paste_url": "https://pastebin.com/qB8KLcsV",
+        "raw_url": "https://pastebin.com/raw/qB8KLcsV",
+        "deletion_url": null,
+        "creator_id": "999776749070078004",
+        "created_at": "2026-08-18T09:26:24Z"
       }
     }
   }
