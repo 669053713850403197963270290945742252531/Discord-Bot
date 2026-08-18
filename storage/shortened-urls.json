@@ -1,6 +1,6 @@
 {
   "schema_version": 1,
-  "last_updated": "2026-08-17T20:44:14Z",
+  "last_updated": "2026-08-18T09:09:15Z",
   "ez_host": {
     "shorten": {
       "foeao9": {
@@ -618,6 +618,19 @@
         "deletion_url": "eFfDK8cyr6kx7dTF2mJdSFYTQ5mtkYmn",
         "creator_id": "999776749070078004",
         "created_at": "2026-08-17T20:42:17Z"
+      }
+    }
+  },
+  "pastebin": {
+    "paste": {
+      "UdMEAnbU": {
+        "title": null,
+        "language": "plaintext",
+        "paste_url": "https://pastebin.com/UdMEAnbU",
+        "raw_url": "https://pastebin.com/raw/UdMEAnbU",
+        "deletion_url": null,
+        "creator_id": "999776749070078004",
+        "created_at": "2026-08-18T09:09:14Z"
       }
     }
   }
