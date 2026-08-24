@@ -1,6 +1,6 @@
 {
   "schema_version": 1,
-  "last_updated": "2026-08-18T09:31:56Z",
+  "last_updated": "2026-08-24T10:02:56Z",
   "ez_host": {
     "shorten": {
       "foeao9": {
@@ -705,6 +705,19 @@
         "creator_id": "999776749070078004",
         "created_at": "2026-08-18T09:31:56Z",
         "folder_key": "YnwnNa58"
+      }
+    }
+  },
+  "uguu": {
+    "file": {
+      "opalDSJf.py": {
+        "original_filename": "uguu.py",
+        "content_type": "text/x-python; charset=utf-8",
+        "size": 7316,
+        "file_url": "https://d.uguu.se/opalDSJf.py",
+        "deletion_url": null,
+        "creator_id": "999776749070078004",
+        "created_at": "2026-08-24T10:02:56Z"
       }
     }
   }
