@@ -1,6 +1,6 @@
 {
   "schema_version": 1,
-  "last_updated": "2026-08-24T10:41:59Z",
+  "last_updated": "2026-08-24T10:58:51Z",
   "ez_host": {
     "shorten": {
       "foeao9": {
@@ -763,6 +763,15 @@
         "deletion_url": null,
         "creator_id": "999776749070078004",
         "created_at": "2026-08-24T10:41:59Z"
+      },
+      "YZoRnkAx.py": {
+        "original_filename": "Registration.py",
+        "content_type": "text/x-python; charset=utf-8",
+        "size": 6571,
+        "file_url": "https://n.uguu.se/YZoRnkAx.py",
+        "deletion_url": null,
+        "creator_id": "999776749070078004",
+        "created_at": "2026-08-24T10:58:51Z"
       }
     }
   }
