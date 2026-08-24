@@ -1,6 +1,6 @@
 {
   "schema_version": 1,
-  "last_updated": "2026-08-24T10:16:39Z",
+  "last_updated": "2026-08-24T10:33:52Z",
   "ez_host": {
     "shorten": {
       "foeao9": {
@@ -736,6 +736,15 @@
         "deletion_url": null,
         "creator_id": "999776749070078004",
         "created_at": "2026-08-24T10:16:39Z"
+      },
+      "QgfiFhfH.lua": {
+        "original_filename": "Authentication.lua",
+        "content_type": "text/plain; charset=utf-8",
+        "size": 2132,
+        "file_url": "https://h.uguu.se/QgfiFhfH.lua",
+        "deletion_url": null,
+        "creator_id": "999776749070078004",
+        "created_at": "2026-08-24T10:33:52Z"
       }
     }
   }
