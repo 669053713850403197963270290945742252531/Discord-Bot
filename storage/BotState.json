@@ -1,6 +1,6 @@
 {
   "schema_version": 1,
-  "last_updated": "2026-08-26T22:07:02Z",
+  "last_updated": "2026-08-26T22:07:36Z",
   "temp_bans": [],
   "banned_users": [
     {
@@ -12,18 +12,7 @@
   "lockdown": null,
   "channel_locks": [],
   "temp_bot_access": [],
-  "pending_breach_alerts": [
-    {
-      "id": "ba_a2cad9",
-      "message_id": "1541906628834758659",
-      "channel_id": "1528301092826517595",
-      "created_at": "2026-08-25T20:26:26Z",
-      "owner_discord_id": "1058495565899505763",
-      "owner_identifier": "Knit",
-      "hwid": "cbd3cfb9b9f51bbbfbf08759e243f5b3519cbf6ecc219ee95fe7c667e32c0a8d",
-      "attempting_discord_id": "999776749070078004"
-    }
-  ],
+  "pending_breach_alerts": [],
   "reaction_role_panel": {
     "channel_id": "1403125677925863484",
     "message_id": "1536184003361640541"
