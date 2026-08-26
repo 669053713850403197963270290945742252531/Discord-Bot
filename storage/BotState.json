@@ -1,14 +1,8 @@
 {
   "schema_version": 1,
-  "last_updated": "2026-08-26T22:13:38Z",
+  "last_updated": "2026-08-26T22:14:13Z",
   "temp_bans": [],
-  "banned_users": [
-    {
-      "discord_id": "1161658957513895946",
-      "tag": "wemmbu.",
-      "reason": "HWID breach -- HWID shared/leaked, actioned by corradeknight"
-    }
-  ],
+  "banned_users": [],
   "lockdown": null,
   "channel_locks": [],
   "temp_bot_access": [],
