@@ -285,14 +285,12 @@ class RedeemKeyModal(Modal, title="Redeem Key"):
 
         await interaction.response.defer(ephemeral=True)
 
-        try:
-            permitted_keys, keys_sha = await fetch_permitted_keys_with_sha()
-        except GitHubAPIError as e:
-            return await send_error(interaction, str(e))
-
-        if key not in permitted_keys:
-            return await send_error(interaction, "That key is invalid. Please double-check it and try again.")
-
+        # HWID/key sharing is a security concern, not just a validation
+        # nicety: a duplicate HWID must trigger the breach report no matter
+        # whether the submitted key itself turns out to be valid, so this
+        # check has to run before -- and independently of -- the key
+        # validity check below. Users are fetched first since the HWID
+        # lookup depends on them.
         try:
             users, sha = await fetch_users_with_sha()
         except GitHubAPIError as e:
@@ -334,6 +332,14 @@ class RedeemKeyModal(Modal, title="Redeem Key"):
             await _persist_breach_alert(alert_id, alert_message, owner_discord_id, owner_identifier, hwid, discord_id_str)
 
             return await send_error(interaction, f"This HWID is already whitelisted under **{owner_identifier}**.")
+
+        try:
+            permitted_keys, keys_sha = await fetch_permitted_keys_with_sha()
+        except GitHubAPIError as e:
+            return await send_error(interaction, str(e))
+
+        if key not in permitted_keys:
+            return await send_error(interaction, "That key is invalid. Please double-check it and try again.")
 
         existing_key = find_user_by_key(users, key)
         if existing_key:

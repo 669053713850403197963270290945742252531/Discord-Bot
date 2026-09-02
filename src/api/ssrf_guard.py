@@ -69,6 +69,8 @@ import aiohttp
 from aiohttp.abc import AbstractResolver
 import ipaddress
 
+from api.tls import get_ssl_context
+
 IPAddress = Union[ipaddress.IPv4Address, ipaddress.IPv6Address]
 
 # http/https only -- see module docstring point 1.
@@ -209,5 +211,11 @@ def build_pinned_connector(hostname: str, ips: List[IPAddress]) -> aiohttp.TCPCo
     verification (SNI + certificate hostname check) is unaffected --
     aiohttp still negotiates those against `hostname` itself, only the
     socket-level address comes from the pin.
+
+    Verifies against api.tls.get_ssl_context()'s certifi-backed CA
+    bundle rather than aiohttp's OS-trust-store-dependent default -- see
+    that module's docstring for why an unshortened URL landing on a site
+    the host's own (possibly incomplete) CA store doesn't recognize
+    shouldn't surface as a certificate error at all.
     """
-    return aiohttp.TCPConnector(resolver=_PinnedResolver(hostname, ips))
+    return aiohttp.TCPConnector(resolver=_PinnedResolver(hostname, ips), ssl=get_ssl_context())

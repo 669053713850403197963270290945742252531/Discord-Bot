@@ -262,23 +262,33 @@ _ABSOLUTE_LOCAL_TIME_FORMATS = (
 )
 
 
-def parse_time_filter(text: Optional[str]) -> Optional[datetime]:
+def parse_time_filter(text: Optional[str], *, future: bool = False) -> Optional[datetime]:
     """
-    Parses /url clear's `before` option into a tz-aware UTC cutoff
-    datetime, for filtering storage/shortened-urls.json entries by their
-    created_at (itself always UTC ISO -- see parse_iso() above). Accepts
-    two shapes, tried in this order:
+    Parses a relative-or-absolute time string into a tz-aware UTC
+    datetime. Originally built only for /url clear's `before` option (a
+    *cutoff* -- "everything created before this point"), and now reused by
+    /paste's `expires` option for pastey_gg (an *expiry* -- "this point,
+    which is ahead of now"), which is the opposite direction for the
+    relative-duration shape below -- see `future`. Accepts two shapes,
+    tried in this order:
 
       1. A relative duration -- "20 minutes", "2 hours ago", "3 days" --
-         resolved against the current moment, so "20 minutes" always means
-         20 minutes before *now*, not 20 minutes before some other
-         reference point.
+         resolved against the current moment. With the default
+         `future=False` (/url clear's own behavior, unchanged), "20
+         minutes" means 20 minutes *before* now, matching the optional
+         trailing "ago" some callers already type. With `future=True`
+         (/paste's `expires`), the same "20 minutes" instead means 20
+         minutes *from* now -- "ago" is still accepted syntactically but
+         reads oddly for an expiry, so callers passing `future=True`
+         shouldn't advertise it as a supported shape even though it still
+         parses.
       2. An absolute date/time, matched against
          _ABSOLUTE_LOCAL_TIME_FORMATS (JoinDate's own "m/d/yyyy,
          h:mm:ss AM/PM" plus a handful of looser variants -- no comma, no
          seconds, date-only) and interpreted in LOCAL_TZ, or a plain UTC
          ISO-8601 string (format_iso()'s own output), interpreted as UTC
-         directly.
+         directly. `future` has no effect here -- an absolute date/time
+         already says which direction it means.
 
     Returns None if `text` matches neither shape, or is empty -- callers
     should treat that as "couldn't understand this", not as "no filter".
@@ -295,7 +305,9 @@ def parse_time_filter(text: Optional[str]) -> Optional[datetime]:
         unit = relative.group(2).lower().rstrip("s")
         seconds_per_unit = _RELATIVE_TIME_UNIT_SECONDS.get(unit)
         if seconds_per_unit is not None:
-            return datetime.now(timezone.utc) - timedelta(seconds=amount * seconds_per_unit)
+            delta = timedelta(seconds=amount * seconds_per_unit)
+            now = datetime.now(timezone.utc)
+            return now + delta if future else now - delta
 
     # ISO-8601 UTC (format_iso()'s own shape) -- checked before the local-
     # time formats since its trailing "Z" makes it unambiguous.

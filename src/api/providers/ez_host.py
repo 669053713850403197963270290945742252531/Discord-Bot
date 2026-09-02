@@ -25,14 +25,32 @@ validation failure), while a real PNG succeeds cleanly. upload_file()
 below doesn't second-guess what it's handed -- see commands/url.py's
 /file for the pre-flight content-type check that keeps non-image
 attachments from ever reaching this function in the first place.
+
+Confirmed quirk (paste endpoint, 2026-08-17): the same broken-error-
+handler crash above isn't files-only -- POST /paste can hit it too, and
+its actual trigger is now confirmed: **`title` and `description` are
+both required**, unlike every other /paste provider in this package,
+where both are optional. Live evidence: a paste with neither set came
+back HTTP 422 with e-z.host's own error handler crashed (see the raw
+JavaScriptCore/WebKit TypeError body below), while storage/
+test_ez_host_api.py's confirmed-working /paste call has always included
+both. create_paste() below now enforces this locally -- raising
+EZHostAPIError before the request is even sent when either is missing --
+rather than letting a doomed request reach e-z.host and come back as
+that same cryptic crash. See _describe_http_error() below for how a
+request that still somehow reaches that crash (some other, still-
+unconfirmed trigger) is now made legible instead of relayed as raw JS.
 """
 
 from typing import Dict, Optional
-from urllib.parse import urlparse
 
 import aiohttp
 
 from api import config
+from api.providers.errors import ProviderAPIError
+from api.providers.util import describe_network_error as _describe_network_error
+from api.providers.util import extract_short_code as _extract_short_code
+from api.providers.util import get_session as _get_session_shared
 
 BASE_URL = "https://api.e-z.host"
 
@@ -42,7 +60,7 @@ BASE_URL = "https://api.e-z.host"
 _TIMEOUT = aiohttp.ClientTimeout(total=15)
 
 
-class EZHostAPIError(Exception):
+class EZHostAPIError(ProviderAPIError):
     """Raised whenever an e-z.host API call doesn't succeed -- either a
     non-200 HTTP status, or a 200 response body with `"success": false`
     (e-z.host uses that instead of a 4xx for some validation failures).
@@ -52,6 +70,11 @@ class EZHostAPIError(Exception):
 
         except EZHostAPIError as e:
             return await send_error(interaction, str(e))
+
+    Subclasses api.providers.errors.ProviderAPIError so commands/url.py's
+    impl functions -- which now dispatch across every provider in
+    api/providers/registry.py, not just this one -- can also catch that
+    shared base instead of needing an except per provider.
     """
 
     def __init__(self, message: str, status: Optional[int] = None):
@@ -59,15 +82,40 @@ class EZHostAPIError(Exception):
         self.status = status
 
 
+# The telltale wording of e-z.host's own broken-error-handler crash (see
+# this module's docstring's "files endpoint" and "paste endpoint" notes)
+# -- a JavaScriptCore/WebKit TypeError's own message shape ("X is not an
+# object (evaluating 'Y')"), not anything e-z.host's API is documented to
+# return on purpose. Matched on this specific substring rather than
+# "isn't JSON" broadly, since a non-JSON body could in principle be
+# something else (a proxy's plain-text error page, for instance) that
+# genuinely does need the raw text surfaced as-is.
+_JS_CRASH_SIGNATURE = "is not an object (evaluating"
+
+
+def _describe_http_error(status: int, body: str) -> str:
+    """Builds the message every non-200 response across this module's
+    three endpoints (shorten_url/create_paste/upload_file) raises --
+    centralized so a body matching e-z.host's own known crash (see
+    _JS_CRASH_SIGNATURE above) gets the same honest, non-cryptic wording
+    everywhere, instead of dumping a raw JavaScript TypeError at whoever
+    hit it as if it were e-z.host's real validation message. The raw body
+    is still included (repr'd, since it's not real prose) so it's still
+    there to compare against for whoever debugs this next."""
+    if _JS_CRASH_SIGNATURE in body:
+        return (
+            f"e-z.host returned HTTP {status}, but its own error handler crashed instead of saying why "
+            f"(raw: {body!r}). This is a known e-z.host-side bug, not something wrong with what was sent -- "
+            "try again, try a different title/text, or pick a different provider if it keeps happening."
+        )
+    return f"e-z.host returned HTTP {status}: {body}"
+
+
 async def _get_session(session: Optional[aiohttp.ClientSession]):
-    """Reuses a passed-in session, or opens (and flags for closing) a new
-    one -- same convention as api.github._get_session, so a caller that
-    already holds an open session (e.g. a command that talks to both
-    GitHub and e-z.host in one interaction) can share it instead of
-    opening a second."""
-    if session is not None:
-        return session, False
-    return aiohttp.ClientSession(timeout=_TIMEOUT), True
+    """Thin wrapper around api.providers.util.get_session with this
+    module's own timeout -- kept as a module-local name since every
+    function below already calls it as `_get_session(session)`."""
+    return await _get_session_shared(session, _TIMEOUT)
 
 
 async def shorten_url(url: str, session: Optional[aiohttp.ClientSession] = None) -> Dict[str, str]:
@@ -88,13 +136,13 @@ async def shorten_url(url: str, session: Optional[aiohttp.ClientSession] = None)
             async with sess.post(f"{BASE_URL}/shortener", headers=headers, json={"url": url}) as resp:
                 if resp.status != 200:
                     err = await resp.text()
-                    raise EZHostAPIError(f"e-z.host returned HTTP {resp.status}: {err}", resp.status)
+                    raise EZHostAPIError(_describe_http_error(resp.status, err), resp.status)
                 try:
                     data = await resp.json()
                 except aiohttp.ContentTypeError:
                     raise EZHostAPIError("e-z.host returned a non-JSON response.", resp.status)
-        except aiohttp.ClientError as e:
-            raise EZHostAPIError(f"Couldn't reach e-z.host: {e}")
+        except (aiohttp.ClientError, TimeoutError) as e:
+            raise EZHostAPIError(f"Couldn't reach e-z.host: {_describe_network_error(e, _TIMEOUT)}")
     finally:
         if should_close:
             await sess.close()
@@ -131,15 +179,26 @@ async def create_paste(
     final word on an invalid value, same as is_valid_url()'s approach to
     the shortener's `url`.
 
-    Raises EZHostAPIError on a non-200 response, a "success": false body,
-    a non-JSON response, or a 200 response missing any of the three
-    expected fields.
+    `title` and `description` are both required by e-z.host itself (see
+    this module's docstring's "paste endpoint" note, confirmed
+    2026-08-17) -- unlike every other /paste provider in this package,
+    where both are optional. Checked locally, before the request is even
+    sent: a missing one raises EZHostAPIError immediately with a plain
+    explanation, rather than letting e-z.host's own broken error handler
+    crash on it (see _JS_CRASH_SIGNATURE above) the way it did before
+    this was confirmed.
+
+    Raises EZHostAPIError on a missing `title`/`description`, a non-200
+    response, a "success": false body, a non-JSON response, or a 200
+    response missing any of the three expected fields.
     """
-    payload: Dict[str, str] = {"text": text, "language": language}
-    if title:
-        payload["title"] = title
-    if description:
-        payload["description"] = description
+    if not title or not description:
+        raise EZHostAPIError(
+            "e-z.host requires both `title` and `description` for a paste -- unlike this bot's other "
+            "/paste providers, neither can be left blank here. Provide both, or pick a different provider."
+        )
+
+    payload: Dict[str, str] = {"text": text, "language": language, "title": title, "description": description}
 
     sess, should_close = await _get_session(session)
     try:
@@ -148,13 +207,13 @@ async def create_paste(
             async with sess.post(f"{BASE_URL}/paste", headers=headers, json=payload) as resp:
                 if resp.status != 200:
                     err = await resp.text()
-                    raise EZHostAPIError(f"e-z.host returned HTTP {resp.status}: {err}", resp.status)
+                    raise EZHostAPIError(_describe_http_error(resp.status, err), resp.status)
                 try:
                     data = await resp.json()
                 except aiohttp.ContentTypeError:
                     raise EZHostAPIError("e-z.host returned a non-JSON response.", resp.status)
-        except aiohttp.ClientError as e:
-            raise EZHostAPIError(f"Couldn't reach e-z.host: {e}")
+        except (aiohttp.ClientError, TimeoutError) as e:
+            raise EZHostAPIError(f"Couldn't reach e-z.host: {_describe_network_error(e, _TIMEOUT)}")
     finally:
         if should_close:
             await sess.close()
@@ -208,13 +267,13 @@ async def upload_file(
             async with sess.post(f"{BASE_URL}/files", headers=headers, data=form) as resp:
                 if resp.status != 200:
                     err = await resp.text()
-                    raise EZHostAPIError(f"e-z.host returned HTTP {resp.status}: {err}", resp.status)
+                    raise EZHostAPIError(_describe_http_error(resp.status, err), resp.status)
                 try:
                     data = await resp.json()
                 except aiohttp.ContentTypeError:
                     raise EZHostAPIError("e-z.host returned a non-JSON response.", resp.status)
-        except aiohttp.ClientError as e:
-            raise EZHostAPIError(f"Couldn't reach e-z.host: {e}")
+        except (aiohttp.ClientError, TimeoutError) as e:
+            raise EZHostAPIError(f"Couldn't reach e-z.host: {_describe_network_error(e, _TIMEOUT)}")
     finally:
         if should_close:
             await sess.close()
@@ -230,15 +289,10 @@ async def upload_file(
     return {"file_url": file_url, "deletion_url": deletion_url}
 
 
-def extract_short_code(short_url: str) -> str:
-    """Pulls the short/paste/file code (e.g. "abc123") out of a URL e-z.host
-    handed back (e.g. "https://i.e-z.host/abc123", a pasteUrl, or an
-    imageUrl) -- used as that entry's key under storage/shortened-urls.json's
-    "ez_host" namespace, in whichever of "shorten"/"paste"/"file" is the
-    right sub-namespace for the call site. Despite the name, the logic
-    (grab the last path segment) isn't shortener-specific -- it's reused
-    as-is by /paste and /file. Uses the URL's path rather than a raw
-    string split so a stray query string or trailing slash can't end up
-    baked into the key."""
-    path = urlparse(short_url).path
-    return path.rstrip("/").rsplit("/", 1)[-1]
+# Re-exported for backward compatibility -- this used to be defined here
+# (back when e-z.host was the only provider) before the multi-provider
+# expansion moved the actual implementation to api.providers.util, where
+# every other provider module can reach it too. commands/url.py now imports
+# it from there directly; this alias just means anything still doing
+# `from api.providers.ez_host import extract_short_code` keeps working.
+extract_short_code = _extract_short_code

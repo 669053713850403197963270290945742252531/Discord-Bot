@@ -42,5 +42,5 @@ DiscordId: 349347610295009311
 Rank: Special
 
 Corrade: /rollback sha: a031ef81374fefd3fed2c5c8ee3453eaf24df170 
-All Users: /rollback sha: 4899b7be45a045f996f10f00fef0afbb0cc9e2a5
+All Users: /rollback sha: 327998b80fd8cce6178c14271d572ef63b80cac9
 Empty: /rollback sha: 0b43c8872231787219c87a7c40d901fc38cf2852

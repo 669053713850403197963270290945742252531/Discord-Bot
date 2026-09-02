@@ -1,6 +1,5 @@
 """
-api.redirect_resolver -- follows an HTTP redirect chain hop by hop,
-reading only response headers (a hop's body is never downloaded), for
+api.redirect_resolver -- follows an HTTP redirect chain hop by hop, for
 /url unshorten's fallback path when a URL isn't one this bot's own
 GitHub-backed store (storage/shortened-urls.json, see
 api.github.find_shortened_url_entry) already has a record of.
@@ -21,6 +20,21 @@ storage/test_ez_host_api.py did for e-z.host -- there was no equivalent
 test target for this -- so treat the fallback list as a reasonable
 guess, not a confirmed behavior, and worth re-checking against whatever
 shorteners this bot actually gets pointed at in practice.
+
+A hop's body is only ever read as a last resort, and only a capped
+prefix of it (_META_REFRESH_SCAN_LIMIT), never the whole thing: a
+genuine HTTP 3xx (the common case, headers-only, no body read at all)
+is always preferred, and a non-redirect status other than 200 is still
+treated as final immediately, same as before. What changed is 200
+specifically -- a real-world shortener (e.g. shorturl.at) was found
+(2026-08-24) serving an interstitial page at 200 whose actual redirect
+is an HTML `<meta http-equiv="refresh" content="0;url=...">` tag rather
+than any HTTP-level mechanism, which every check above this one is
+blind to since it lives in the body, not the headers. Reading a small
+capped prefix of an HTML-labeled 200 response and looking for that one
+specific tag closes that gap without turning this into a general HTML
+parser or a JS-redirect follower (out of scope -- see
+_extract_meta_refresh_target()'s own docstring).
 """
 
 import re
@@ -64,6 +78,74 @@ _REFRESH_HEADER = "Refresh"
 _REFRESH_URL_RE = re.compile(r"url\s*=\s*(.+)", re.IGNORECASE)
 
 _REDIRECT_STATUSES = (301, 302, 303, 307, 308)
+
+# Case-insensitive, tolerant of attribute order (http-equiv before or
+# after content, either quote style or none) since real-world markup
+# isn't guaranteed to match any one canonical form. Two-step rather than
+# one giant regex: find each <meta ...> tag first, then check that
+# specific tag for http-equiv="refresh" and pull its content attribute
+# -- keeps a stray http-equiv/content pair in a *different* meta tag (or
+# anywhere else in the scanned prefix) from being mismatched together.
+_META_TAG_RE = re.compile(r"<meta\b[^>]*>", re.IGNORECASE)
+_HTTP_EQUIV_REFRESH_RE = re.compile(r"""http-equiv\s*=\s*["']?refresh["']?""", re.IGNORECASE)
+_CONTENT_ATTR_RE = re.compile(r"""content\s*=\s*["']([^"']*)["']""", re.IGNORECASE)
+
+# Only a 200 (not a 3xx -- those are handled above via headers alone,
+# and never even reach this path -- and not a 4xx/5xx error page, which
+# stays "final destination" same as before this existed) gets its body
+# scanned at all, and only up to this many bytes of it: real-world
+# meta-refresh interstitials put the tag early in <head>, so a prefix
+# this size is already generous headroom without risking a slow read of
+# a large/streaming response that was never going anywhere near a
+# redirect tag in the first place.
+_META_REFRESH_SCAN_LIMIT = 65536
+
+
+def _extract_meta_refresh_target(html: str, current_url: str) -> Optional[str]:
+    """Best-effort scan of an already-capped HTML prefix for a
+    `<meta http-equiv="refresh" content="<seconds>;url=<target>">` tag
+    (same content-attribute syntax as the `Refresh` response header --
+    reuses _REFRESH_URL_RE below to parse it), returning the resolved
+    target or None if no such tag is present in what was scanned.
+
+    Deliberately narrow: this is the one client-side redirect mechanism
+    common enough among real shorteners/interstitials (confirmed against
+    shorturl.at, 2026-08-24) to be worth this module reaching into a
+    body at all. A JavaScript-only redirect (`location.href = ...`, a
+    `<script>`-driven "click to continue" page, etc.) is NOT handled --
+    doing that safely would mean either running untrusted JS or writing
+    a much broader, much less reliable heuristic, neither of which is
+    worth it for what's meant to stay a lightweight fallback."""
+    for tag in _META_TAG_RE.findall(html):
+        if not _HTTP_EQUIV_REFRESH_RE.search(tag):
+            continue
+        content_match = _CONTENT_ATTR_RE.search(tag)
+        if not content_match:
+            continue
+        url_match = _REFRESH_URL_RE.search(content_match.group(1))
+        if not url_match:
+            continue
+        target = url_match.group(1).strip().strip("\"'")
+        if target:
+            return urljoin(current_url, target)
+    return None
+
+
+def _looks_like_html(resp: aiohttp.ClientResponse) -> bool:
+    """True if `resp`'s Content-Type gives a real signal it's HTML (or
+    is missing/generic enough that it plausibly could be) -- False for
+    anything with a Content-Type clearly naming something else (an
+    image, a PDF, JSON, etc.), so the meta-refresh scan below never
+    bothers reading into a response that was never going to contain an
+    HTML tag in the first place. aiohttp normalizes a missing
+    Content-Type to "application/octet-stream" -- treated here the same
+    as truly absent, since plenty of misconfigured servers send that
+    for an HTML body too."""
+    content_type = (resp.content_type or "").lower()
+    if content_type in ("", "application/octet-stream"):
+        return True
+    return "html" in content_type or content_type.startswith("text/")
+
 
 # Sanity caps, not confirmed limits from any spec -- same "generous
 # enough for real use, tight enough to stop a runaway chain" convention
@@ -129,10 +211,17 @@ async def follow_redirects(
     max_hops: int = DEFAULT_MAX_HOPS,
     overall_timeout: float = DEFAULT_OVERALL_TIMEOUT,
 ) -> RedirectResult:
-    """Follows `start_url` through up to `max_hops` redirect responses
-    (301/302/303/307/308), reading only each hop's headers -- never a
-    hop's body, since /url unshorten only ever needs to report the
-    chain's final destination, not fetch its content.
+    """Follows `start_url` through up to `max_hops` redirect hops --
+    either a real HTTP 301/302/303/307/308 (read from headers alone, no
+    body ever touched) or, for a 200 OK specifically, an HTML
+    `<meta http-equiv="refresh">` tag found in a small capped prefix of
+    the body (see _extract_meta_refresh_target()'s docstring for why
+    just this one client-side mechanism, and _META_REFRESH_SCAN_LIMIT
+    for the cap) -- since /url unshorten only ever needs to report the
+    chain's final destination, not fetch its content, every other status
+    (a 4xx/5xx error page, or a 200 with no such tag found) is still
+    treated as that hop being the final destination, same as before this
+    existed.
 
     Every hop -- including start_url itself -- is validated by
     api.ssrf_guard.validate_url() before it's requested, and the exact
@@ -141,7 +230,10 @@ async def follow_redirects(
     module's docstring for why). A hop that fails validation stops the
     chain immediately by letting SSRFBlockedError propagate -- an
     unsafe hop is a reason to stop, not a reason to keep guessing at
-    the destination past it.
+    the destination past it. A meta-refresh target discovered in a
+    body gets exactly the same per-hop validation as any other target
+    before it's ever requested -- it becomes `current` for the next
+    loop iteration same as a Location-header target would.
 
     Raises:
       - SSRFBlockedError (from api.ssrf_guard), left to propagate as-is,
@@ -173,9 +265,16 @@ async def follow_redirects(
             try:
                 async with session.get(current, allow_redirects=False) as resp:
                     status = resp.status
-                    if status not in _REDIRECT_STATUSES:
+                    if status in _REDIRECT_STATUSES:
+                        target = _extract_redirect_target(resp.headers, current)
+                    elif status == 200 and _looks_like_html(resp):
+                        prefix = await resp.content.read(_META_REFRESH_SCAN_LIMIT)
+                        html = prefix.decode("utf-8", errors="replace")
+                        target = _extract_meta_refresh_target(html, current)
+                        if not target:
+                            return RedirectResult(start_url=start_url, final_url=current, hop_count=hop_number, chain=chain)
+                    else:
                         return RedirectResult(start_url=start_url, final_url=current, hop_count=hop_number, chain=chain)
-                    target = _extract_redirect_target(resp.headers, current)
             except aiohttp.ClientError as e:
                 raise RedirectResolutionError(f"couldn't reach {current}: {e}") from e
 

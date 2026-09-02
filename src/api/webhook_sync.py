@@ -31,6 +31,7 @@ import aiohttp
 
 from . import config
 from .github import GitHubAPIError
+from .tls import get_ssl_context
 
 WEBHOOK_ROUTE = "/github-webhook"
 
@@ -92,7 +93,7 @@ async def sync_webhook_url() -> None:
     up; never raises -- any failure is logged and left for the fallback
     poll (or a manual edit on GitHub) to cover instead."""
     try:
-        async with aiohttp.ClientSession() as session:
+        async with aiohttp.ClientSession(connector=aiohttp.TCPConnector(ssl=get_ssl_context())) as session:
             base_url = await _detect_public_base_url(session)
             if base_url is None:
                 where = "RENDER_EXTERNAL_URL" if os.environ.get("RENDER") == "true" else "ngrok (is it running?)"
