@@ -1,5 +1,6 @@
 discord.py @ git+https://github.com/Rapptz/discord.py.git@026a882
 aiohttp==3.10.5
+certifi
 Flask==3.0.3
 python-dotenv==1.0.1
 tzdata

@@ -16,6 +16,7 @@ from typing import Any, Callable, Dict, List, Optional, Tuple
 import aiohttp
 
 from . import config
+from .tls import get_ssl_context
 
 
 class GitHubAPIError(Exception):
@@ -34,10 +35,14 @@ class GitHubAPIError(Exception):
 
 
 async def _get_session(session: Optional[aiohttp.ClientSession]):
-    """Reuses a passed-in session, or opens (and flags for closing) a new one."""
+    """Reuses a passed-in session, or opens (and flags for closing) a new
+    one -- wired to api.tls.get_ssl_context()'s certifi-backed CA bundle
+    rather than aiohttp's OS-trust-store-dependent default (see that
+    module's docstring)."""
     if session is not None:
         return session, False
-    return aiohttp.ClientSession(), True
+    connector = aiohttp.TCPConnector(ssl=get_ssl_context())
+    return aiohttp.ClientSession(connector=connector), True
 
 
 # =========================================================================
@@ -694,18 +699,23 @@ async def update_botstate(
 # Shortened URLs (storage/shortened-urls.json)
 # =========================================================================
 #
-# Backs /url shorten, /paste, and /file (and any future /url list|delete,
-# or a second provider entirely). One file shared across every provider
-# this bot ever wires up, rather than one file per provider -- each
-# provider gets its own top-level key (e.g. "ez_host") inside it, so
-# adding a second provider later is a new key here, not a new file plus a
-# new set of fetch/commit/update helpers. Same "fetch -> get sha -> mutate
-# -> commit" shape as BotState.json above, including the same
-# fetch/mutate/commit retry-on-409 loop via update_shortened_urls() -- two
-# people running /url shorten close together is exactly the kind of race
-# BotState.json's update_botstate() already exists to handle, so this
-# reuses that shape rather than reaching for an asyncio.Lock, which would
-# only ever protect writes within a single process.
+# Backs /url shorten, /paste, and /file. One file shared
+# across every provider this bot ever wires up (see
+# api/providers/registry.py for the full multi-provider list -- e-z.host,
+# is.gd, TinyURL, Catbox, Litterbox, Pastebin, pastee.dev, pastey.gg,
+# Rubiš, as of the multi-provider expansion), rather than one file per
+# provider -- each provider gets its own top-level key (e.g. "ez_host",
+# "tinyurl", "catbox") inside it, so adding a new provider is a new key
+# here (added lazily by save_shortened_url()'s setdefault()s the first
+# time that provider is actually used -- nothing needs pre-seeding), not
+# a new file plus a new set of fetch/commit/update helpers. Same
+# "fetch -> get sha -> mutate -> commit" shape as BotState.json above,
+# including the same fetch/mutate/commit retry-on-409 loop via
+# update_shortened_urls() -- two people running /url shorten close
+# together is exactly the kind of race BotState.json's update_botstate()
+# already exists to handle, so this reuses that shape rather than
+# reaching for an asyncio.Lock, which would only ever protect writes
+# within a single process.
 #
 # Each provider's namespace is further split by *kind* -- "shorten",
 # "paste", "file" -- each a dict keyed by that kind's own short code, e.g.
@@ -742,9 +752,22 @@ async def update_botstate(
 #         }
 #     }
 #
+# Every other provider's namespace (e.g. "tinyurl", "catbox", "pastebin",
+# "pastee_dev") follows this exact same {kind: {short_code: entry}} shape -- only the
+# entry's own field values differ (and "deletion_url" may be null instead
+# of a string; see api/providers/registry.py's module docstring and each
+# provider module's own docstring for which providers never hand one
+# back). commands/url.py's _persist_or_degrade() and this section's own
+# helpers below (get_shortened_urls(), find_shortened_url_entry(), etc.)
+# are all written generically against "whatever provider key is there",
+# not hardcoded to "ez_host" -- that's what let the multi-provider
+# expansion add eight more providers with zero changes to this file's
+# actual read/write logic, only to this comment and DEFAULT_SHORTENED_URLS
+# below.
+#
 # Split by kind (not just by provider) so a short code minted for one kind
 # can never silently collide with -- and overwrite -- an entry of a
-# different kind in the same provider's namespace, even if e-z.host's
+# different kind in the same provider's namespace, even if a provider's
 # shortener/paste/file features turn out to draw their codes from a
 # shared space. Doing this now costs nothing (storage/shortened-urls.json
 # has no real entries in it yet) -- flattening a provider's kinds into one
@@ -887,36 +910,49 @@ _SHORTENED_URL_KINDS = ("shorten", "paste", "file")
 
 async def find_shortened_url_entry(
     short_code: str,
-    provider: str = "ez_host",
     session: Optional[aiohttp.ClientSession] = None,
-) -> Optional[Tuple[str, Dict[str, Any]]]:
-    """Looks up `short_code` across every kind under `provider`'s
-    namespace in storage/shortened-urls.json, via a single fetch --
-    looping get_shortened_urls() across all three kinds would mean three
-    redundant fetch_shortened_urls_with_sha() round trips for the exact
-    same file, since that function always does a fresh full-file fetch.
+) -> Optional[Tuple[str, str, Dict[str, Any]]]:
+    """Looks up `short_code` across every kind, across every provider
+    currently in storage/shortened-urls.json, via a single fetch --
+    looping get_shortened_urls() across every kind (let alone every
+    provider too) would mean redundant fetch_shortened_urls_with_sha()
+    round trips for the exact same file, since that function always does
+    a fresh full-file fetch.
 
     Built for /url unshorten: the fast, authoritative path for anything
-    this bot itself created (e-z.host links, pastes, or file uploads) --
-    creator_id/created_at came from this bot at creation time, so there's
-    no need to fetch the destination URL at all, unlike the live-
-    redirect-following fallback for short codes that aren't in here.
+    this bot itself created (a shortened link, paste, or file upload,
+    from any provider in api/providers/registry.py) -- creator_id/
+    created_at came from this bot at creation time, so there's no need to
+    fetch the destination URL at all, unlike the live-redirect-following
+    fallback for short codes that aren't in here.
 
-    Checked in _SHORTENED_URL_KINDS order; not meaningful beyond matching
-    DEFAULT_SHORTENED_URLS's own key order, since short codes are
-    namespaced separately per kind and (barring an e-z.host-side
-    collision across its own shortener/paste/file code spaces) should
-    only ever match one.
+    Prior to the multi-provider expansion this took a `provider` param
+    (defaulting to "ez_host", the only provider that existed yet) instead
+    of searching all of them -- removed once a second provider existed to
+    search, since a short code found under, say, "tinyurl" is exactly as
+    findable-and-relevant to /url unshorten as one under "ez_host".
 
-    Returns (kind, entry) for the first kind whose sub-namespace has
-    `short_code` as a key, or None if it isn't found under any kind.
+    Iterates state.items() in whatever order the JSON file itself stores
+    providers in (insertion order -- effectively "most recently added
+    provider last", since save_shortened_url()'s setdefault() only adds a
+    provider's key the first time that provider is actually used), then
+    _SHORTENED_URL_KINDS order within each provider; neither ordering is
+    meaningful beyond that, since short codes are namespaced separately
+    per provider+kind and should only ever match one, barring an
+    unlikely cross-provider code collision.
+
+    Returns (provider, kind, entry) for the first provider/kind whose
+    sub-namespace has `short_code` as a key, or None if it isn't found
+    anywhere.
     """
     state, _sha = await fetch_shortened_urls_with_sha(session)
-    provider_state = state.get(provider, {})
-    for kind in _SHORTENED_URL_KINDS:
-        entry = provider_state.get(kind, {}).get(short_code)
-        if entry is not None:
-            return kind, entry
+    for provider, provider_state in state.items():
+        if not isinstance(provider_state, dict):
+            continue
+        for kind in _SHORTENED_URL_KINDS:
+            entry = provider_state.get(kind, {}).get(short_code)
+            if entry is not None:
+                return provider, kind, entry
     return None
 
 
@@ -943,6 +979,7 @@ async def save_shortened_url(
         state[provider][kind][short_code] = entry
         return state
     return await update_shortened_urls(_mutate, message, session)
+
 
 
 def _iter_shortened_url_entries(state: Dict[str, Any]):

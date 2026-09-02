@@ -1,5 +1,6 @@
 import asyncio
 import io
+import random
 import re
 from datetime import datetime, timezone, timedelta
 from typing import Optional
@@ -11,7 +12,7 @@ from discord.ext import commands
 from api import config
 from api.discord_helpers import (
     has_role, is_in_guild, send_success, send_error, file_success_layout, resolve_user_option,
-    dms_enabled,
+    dms_enabled, embed_within_limits,
 )
 from commands.whitelist import whitelisted_user_autocomplete
 from api.alerts import (
@@ -717,11 +718,13 @@ class KeysHwid(commands.Cog):
         title = f"🔐 Generated {len(new_keys)} Key{'s' if len(new_keys) != 1 else ''}"
 
         # Spoiler-tagged inline text is nicer when it fits, but a large
-        # amount/length combo can blow past Discord's message/embed limits,
-        # so fall back to an attached file rather than truncating.
-        if len(keys_block) <= 1800:
-            embed = discord.Embed(title=title, description=keys_block, color=discord.Color.purple())
-            embed.set_footer(text=footer_text)
+        # amount/length combo can blow past Discord's real embed limits
+        # (4096 chars/description, 6000 combined) -- checked directly on
+        # the finalized embed rather than guessed at, so this falls back
+        # to an attached file only when it actually needs to.
+        embed = discord.Embed(title=title, description=keys_block, color=discord.Color.purple())
+        embed.set_footer(text=footer_text)
+        if embed_within_limits(embed):
             await interaction.followup.send(embed=embed, ephemeral=True)
         else:
             filename = "SPOILER_generated_keys.txt"
@@ -762,9 +765,15 @@ class KeysHwid(commands.Cog):
         await interaction.followup.send(embed=embed, ephemeral=True)
 
     @key_group.command(name="fetch", description="Displays every key currently available for redemption.")
+    @app_commands.describe(
+        amount="Only show this many keys, chosen at random, instead of every available key",
+    )
     @has_role(config.REQUIRED_ROLE_ID)
     @is_in_guild(config.GUILD_ID)
-    async def key_fetch(self, interaction: discord.Interaction):
+    async def key_fetch(self, interaction: discord.Interaction, amount: Optional[int] = None):
+        if amount is not None and amount < 1:
+            return await send_error(interaction, "`amount` must be at least 1.")
+
         await interaction.response.defer(ephemeral=True)
 
         try:
@@ -775,16 +784,42 @@ class KeysHwid(commands.Cog):
         if not permitted_keys:
             return await send_success(interaction, "No keys are currently available for redemption.")
 
-        keys_block = "\n".join(f"||`{k}`||" for k in permitted_keys)
-        title = f"🔑 {len(permitted_keys)} Available Key{'s' if len(permitted_keys) != 1 else ''}"
+        # No cap on `amount` itself -- unlike /key generate's bulk cap,
+        # fetch is read-only, so the only real ceiling is however many
+        # keys fit before Discord's embed limits kick in, and once that
+        # happens the file fallback below still shows however many were
+        # asked for. random.sample() rather than slicing off the front so
+        # a small `amount` doesn't just always return whichever keys
+        # happen to sit earliest in permittedKeys.txt.
+        if amount is not None:
+            shown_keys = random.sample(permitted_keys, min(amount, len(permitted_keys)))
+        else:
+            shown_keys = permitted_keys
+        is_random_subset = amount is not None and len(shown_keys) < len(permitted_keys)
 
-        if len(keys_block) <= 1800:
-            embed = discord.Embed(title=title, description=keys_block, color=discord.Color.purple())
+        keys_block = "\n".join(f"||`{k}`||" for k in shown_keys)
+        title = f"🔑 {len(shown_keys)} Available Key{'s' if len(shown_keys) != 1 else ''}"
+        footer_note = (
+            f"Randomly selected from {len(permitted_keys)} available key(s) total."
+            if is_random_subset else None
+        )
+
+        embed = discord.Embed(title=title, description=keys_block, color=discord.Color.purple())
+        if footer_note:
+            embed.set_footer(text=footer_note)
+
+        # Proactive check against Discord's real embed limits (4096 chars
+        # per description, 6000 combined) rather than assuming a fixed
+        # amount of keys will fit -- `amount` can be arbitrarily large, so
+        # this is what decides whether the requested keys still show
+        # inline or need to fall back to an attached file.
+        if embed_within_limits(embed):
             await interaction.followup.send(embed=embed, ephemeral=True)
         else:
             filename = "SPOILER_available_keys.txt"
-            file = discord.File(io.BytesIO(("\n".join(permitted_keys) + "\n").encode()), filename=filename)
-            layout = file_success_layout(f"**{title}**", filename)
+            file = discord.File(io.BytesIO(("\n".join(shown_keys) + "\n").encode()), filename=filename)
+            description = f"**{title}**" + (f"\n{footer_note}" if footer_note else "")
+            layout = file_success_layout(description, filename)
             await interaction.followup.send(view=layout, file=file, ephemeral=True)
 
     @key_group.command(name="clear", description="Removes keys from permittedKeys.txt -- provide a list of keys, or a number to clear, not both.")

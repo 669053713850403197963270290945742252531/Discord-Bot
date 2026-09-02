@@ -93,6 +93,56 @@ def error_embed(
 
 
 # =========================================================================
+# Embed size limits
+# =========================================================================
+#
+# Discord rejects an embed with a 50035 "Invalid Form Body" HTTPException
+# if a single description/title/field/footer exceeds its own cap, or if
+# the embed's *combined* text exceeds 6000 characters -- start.py's
+# on_app_command_error() already catches both shapes reactively so a
+# command never just silently fails, but commands building an embed from
+# variable-length data (e.g. /key fetch's keys list) want to check this
+# proactively so they can fall back to a file attachment instead of ever
+# hitting that error in the first place.
+EMBED_DESCRIPTION_CHAR_LIMIT = 4096
+EMBED_TOTAL_CHAR_LIMIT = 6000
+
+
+def embed_character_total(embed: discord.Embed) -> int:
+    """Sums embed text the same way Discord's whole-embed 6000-character
+    cap does: title + description + footer text + author name + every
+    field's name and value combined."""
+    total = 0
+    if embed.title:
+        total += len(embed.title)
+    if embed.description:
+        total += len(embed.description)
+    if embed.footer and embed.footer.text:
+        total += len(embed.footer.text)
+    if embed.author and embed.author.name:
+        total += len(embed.author.name)
+    for field in embed.fields:
+        if field.name:
+            total += len(field.name)
+        if field.value:
+            total += len(field.value)
+    return total
+
+
+def embed_within_limits(embed: discord.Embed) -> bool:
+    """True if `embed` fits under both of Discord's real limits: 4096
+    characters for a single description, and 6000 characters combined
+    across the whole embed. Meant to be checked right before sending a
+    "finalized" embed built from data whose size isn't known ahead of
+    time, so the caller can fall back to something else (a file
+    attachment, trimming the content, etc.) instead of finding out via a
+    failed API call."""
+    if embed.description and len(embed.description) > EMBED_DESCRIPTION_CHAR_LIMIT:
+        return False
+    return embed_character_total(embed) <= EMBED_TOTAL_CHAR_LIMIT
+
+
+# =========================================================================
 # /toggledms -- global switch for non-essential member-facing DMs
 # =========================================================================
 #

@@ -18,7 +18,10 @@ stays a manageable size:
     qrcode_gen.py       /qrcode generate's encoding + Pillow rendering (solid/rainbow, styles)
     discord_helpers.py embeds, interaction responders, permission checks
     alerts.py           staff Alerts channel logging (send_alert/alert_embed)
-    providers/          third-party file-hosting/URL-shortening API clients (ez_host.py)
+    providers/          third-party paste/file-hosting/URL-shortening API clients (ez_host.py,
+                        is_gd.py, tinyurl.py, catbox.py, litterbox.py, pastebin.py,
+                        pastee_dev.py, pastey_gg.py, rubis.py) plus the registry.py that maps
+                        /url shorten, /paste, and /file's `provider` choices to them
 
 Everything below is re-exported here too, so cogs can do either
 `from api import github` or `from api.github import fetch_users_with_sha`.
@@ -54,6 +57,11 @@ from .github import (
     get_shortened_urls, save_shortened_url,
 )
 
+# Every provider's own `<Provider>APIError` (EZHostAPIError, TinyURLAPIError,
+# ...) subclasses this -- see api/providers/errors.py. Re-exported alongside
+# EZHostAPIError below for backward compatibility with anything still doing
+# `from api import EZHostAPIError`.
+from .providers.errors import ProviderAPIError
 from .providers.ez_host import EZHostAPIError
 
 from .users import (
