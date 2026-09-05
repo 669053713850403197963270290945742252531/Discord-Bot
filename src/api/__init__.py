@@ -7,6 +7,7 @@ stays a manageable size:
 
     config.py          env-driven constants (Discord IDs, GitHub repo, secrets)
     github.py          GitHub Contents API + Users.json cache, permitted keys, stored script
+    supabase_storage.py private Supabase Storage access for protected game scripts
     users.py           user-record lookups/building + buyer role revocation
     keys.py            key generation + input validation
     time_utils.py       date formatting/parsing + temp-whitelist expiration
@@ -35,6 +36,7 @@ from .config import (
     LOCAL_TZ, RESET_HWID_COOLDOWN,
     OWNER, REPO, FILE_PATH, BRANCH, RAW_URL, API_URL,
     STORAGE_REPO, STORAGE_BRANCH,
+    SUPABASE_URL, SUPABASE_SECRET_KEY, SUPABASE_GAME_SCRIPTS_BUCKET,
     PERMITTED_KEYS_FILE_PATH, STORED_SCRIPT_FILE_PATH,
     HEADERS,
 )
@@ -63,6 +65,8 @@ from .github import (
 # `from api import EZHostAPIError`.
 from .providers.errors import ProviderAPIError
 from .providers.ez_host import EZHostAPIError
+
+from .supabase_storage import SupabaseStorageError, fetch_game_script
 
 from .users import (
     find_user_by_discord_id, find_user_by_hwid, find_user_by_key,

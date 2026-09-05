@@ -40,6 +40,12 @@ GITHUB_TOKEN = _require("GITHUB_TOKEN")
 # shouldn't boot into a state where its own default provider is unusable.
 EZ_HOST_API_KEY = _require("EZ_HOST_API_KEY")
 
+# Supabase private storage used for protected game scripts. The secret/service
+# key is server-only and must never be exposed to the Roblox client.
+SUPABASE_URL = _require("SUPABASE_URL")
+SUPABASE_SECRET_KEY = _require("SUPABASE_SECRET_KEY")
+SUPABASE_GAME_SCRIPTS_BUCKET = os.getenv("SUPABASE_GAME_SCRIPTS_BUCKET", "game-scripts")
+
 # Multi-provider expansion (see api/providers/registry.py) -- every key below
 # is optional, unlike EZ_HOST_API_KEY above. Each backs one non-default
 # `provider` choice on /url shorten, /paste, or /file; a deployment that
@@ -126,7 +132,8 @@ BRANCH = os.getenv("GITHUB_BRANCH", "main")
 RAW_URL = f"https://raw.githubusercontent.com/{OWNER}/{REPO}/refs/heads/{BRANCH}/{FILE_PATH}"
 API_URL = f"https://api.github.com/repos/{OWNER}/{REPO}/contents/{FILE_PATH}?ref={BRANCH}"
 
-# GitHub repo permittedKeys.txt / storedscript.lua live in (this bot's own repo)
+# GitHub repo permittedKeys.txt / storedscript.lua / BotState.json / shortened URLs live in
+# this bot's own repo. Protected game scripts are stored separately in Supabase Storage.
 STORAGE_REPO = os.getenv("GITHUB_STORAGE_REPO", "Discord-Bot")
 STORAGE_BRANCH = os.getenv("GITHUB_STORAGE_BRANCH", "main")
 
@@ -185,8 +192,8 @@ GITHUB_WEBHOOK_SECRET = os.getenv("GITHUB_WEBHOOK_SECRET")
 
 # Public license-service settings. The client only needs the public endpoint;
 # no server secret is ever shipped to users. Each PlaceId maps to a protected
-# script path in the storage repository. The mapping lives in a separate local
-# JSON file so it does not have to be stored in .env.
+# object path inside the private Supabase Storage bucket. The mapping lives in
+# a separate local JSON file so it does not have to be stored in .env.
 LICENSE_SERVER_ENABLED = os.getenv("LICENSE_SERVER_ENABLED", "true").strip().lower() not in ("false", "0", "no", "off")
 
 LICENSE_GAME_SCRIPTS_FILE = os.getenv(
@@ -208,7 +215,7 @@ def _load_license_game_scripts() -> dict:
     except OSError as exc:
         raise ValueError(f"Could not read license game-script config: {path}") from exc
     if not isinstance(value, dict):
-        raise ValueError("License game-script config must be a JSON object mapping PlaceIds to storage paths")
+        raise ValueError("License game-script config must be a JSON object mapping PlaceIds to Supabase Storage object paths")
     normalized = {str(k): str(v) for k, v in value.items()}
     for place_id, script_path in normalized.items():
         if not place_id.isdigit() or not script_path.strip():

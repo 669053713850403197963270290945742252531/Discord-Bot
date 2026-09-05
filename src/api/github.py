@@ -63,26 +63,6 @@ async def fetch_raw_text(url: str, session: Optional[aiohttp.ClientSession] = No
 
 
 
-async def fetch_storage_file(path: str, session: Optional[aiohttp.ClientSession] = None) -> str:
-    """Fetch a protected file from the configured storage repository via the
-    authenticated GitHub Contents API. The file itself is never exposed via
-    the public raw GitHub URL to the Roblox client."""
-    path = path.lstrip("/")
-    url = f"https://api.github.com/repos/{config.OWNER}/{config.STORAGE_REPO}/contents/{path}?ref={config.STORAGE_BRANCH}"
-    sess, should_close = await _get_session(session)
-    try:
-        async with sess.get(url, headers=config.HEADERS) as resp:
-            if resp.status != 200:
-                raise GitHubAPIError(f"Failed to fetch protected game script (HTTP {resp.status})", resp.status)
-            data = await resp.json()
-    finally:
-        if should_close:
-            await sess.close()
-    try:
-        return base64.b64decode(data["content"]).decode("utf-8")
-    except (KeyError, ValueError, UnicodeDecodeError) as exc:
-        raise GitHubAPIError("Protected game script returned invalid content") from exc
-
 async def fetch_api_file(session: Optional[aiohttp.ClientSession] = None) -> Dict[str, Any]:
     """
     Returns the raw GitHub Contents API response for Users.json (a dict with

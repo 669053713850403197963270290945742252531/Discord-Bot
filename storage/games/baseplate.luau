@@ -1,1 +1,0 @@
-print("baseplate script loaded")
