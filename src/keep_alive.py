@@ -1,24 +1,18 @@
-"""
-Small Flask server with two jobs:
+"""Small Flask server with four jobs:
 
-1. `/` -- a plain keep-alive endpoint for uptime-monitor / "host needs an
-   open port" setups (e.g. Replit/UptimeRobot-style keep-alive), same as
-   the original single-file bot.
+1. `/` -- plain keep-alive endpoint.
+2. `/github-webhook` -- refreshes the Users.json cache after GitHub pushes.
+3. `/client` -- serves the public Potassium license loader. It contains no
+   server secret and is safe to distribute in the normal two-line loader.
+4. `/whitelist/challenge` + `/whitelist/check` -- public license API. The
+   challenge is one-use/short-lived; the check validates key + HWID +
+   game, binds an empty HWID through the authenticated GitHub Contents API,
+   and returns the protected game payload only after authorization.
 
-2. `/github-webhook` -- lets GitHub push a notification here the instant
-   Users.json changes on the configured branch, so the bot's in-memory
-   cache (api/github.py) can refresh immediately instead of waiting on its
-   periodic poll. The actual refresh runs on the bot's asyncio loop, not
-   this thread -- see trigger_cache_refresh_threadsafe() in api/github.py
-   for that handoff; this route's job is just to verify the request is
-   really from GitHub and that it actually touched Users.json before
-   asking for a refresh.
-
-   Setup (repo Settings > Webhooks > Add webhook):
-     Payload URL:  http://<your-host>:8080/github-webhook
-     Content type: application/json
-     Secret:       must match GITHUB_WEBHOOK_SECRET in .env
-     Events:       "Just the push event"
+There is intentionally no client-shared HMAC secret. A public Roblox script
+cannot keep a secret from the user executing it. HTTPS, one-use challenges,
+rate limits, server-side GitHub access, first-claim HWID binding, per-game
+license restrictions, and payload withholding are the security boundaries.
 """
 
 import hashlib
@@ -26,7 +20,7 @@ import hmac
 import os
 from threading import Thread
 
-from flask import Flask, request, jsonify
+from flask import Flask, request, jsonify, Response
 
 app = Flask('')
 
@@ -34,6 +28,64 @@ app = Flask('')
 @app.route('/')
 def home():
     return "Bot is alive!", 200
+
+
+def _license_server_enabled() -> bool:
+    """Reads LICENSE_SERVER_ENABLED straight off os.environ rather than
+    `from api import config` -- api/__init__.py pulls in discord_helpers.py
+    (and, through it, discord itself) the moment any api.* submodule is
+    imported, which is exactly the heavier chain keep_alive() runs ahead of
+    so this port opens as early as possible (see module docstring). A plain
+    os.getenv() here costs nothing and keeps that ordering intact.
+
+    Defaults to true (route registered, matching today's always-on
+    behavior) so an existing deployment's .env needs no change; set to
+    false to skip creating the route below entirely."""
+    return os.environ.get("LICENSE_SERVER_ENABLED", "true").strip().lower() not in ("false", "0", "no", "off")
+
+
+@app.route('/client', methods=['GET'])
+def public_license_client():
+    """Serves the public loader. It contains no server secret; the API base
+    is substituted from the current Render/external URL so the same client
+    source can be distributed through `game:HttpGet(...)` without exposing
+    deployment configuration in the file itself."""
+    from pathlib import Path
+    # Preserve the scheme used to fetch /client for local HTTP development.
+    # Render can provide RENDER_EXTERNAL_URL (which is already HTTPS); locally
+    # request.host_url keeps http://127.0.0.1:8080 instead of incorrectly
+    # upgrading the API endpoints to HTTPS on Flask's plain HTTP listener.
+    forwarded_proto = request.headers.get("X-Forwarded-Proto", "").split(",", 1)[0].strip()
+    if os.environ.get("RENDER_EXTERNAL_URL"):
+        base_url = os.environ["RENDER_EXTERNAL_URL"]
+    elif forwarded_proto:
+        base_url = f"{forwarded_proto}://{request.host}"
+    else:
+        base_url = request.host_url
+    base_url = base_url.rstrip("/")
+    client_path = Path(__file__).resolve().parent.parent / "storage" / "client" / "License Client.luau"
+    try:
+        source = client_path.read_text(encoding="utf-8")
+    except OSError:
+        return "-- license client unavailable", 503, {"Content-Type": "text/plain; charset=utf-8"}
+    source = source.replace("__LICENSE_API_BASE__", base_url)
+    return Response(source, status=200, mimetype="text/plain", headers={"Cache-Control": "no-store"})
+
+
+if _license_server_enabled():
+    @app.route('/whitelist/challenge', methods=['POST'])
+    def whitelist_challenge():
+        from api.license_server import handle_challenge_request
+        status, body, headers = handle_challenge_request(request.remote_addr or 'unknown')
+        return Response(body, status=status, headers=headers)
+
+    @app.route('/whitelist/check', methods=['POST'])
+    def whitelist_check():
+        from api.license_server import handle_check_request
+        status, body, headers = handle_check_request(
+            request.get_data(), request.remote_addr or 'unknown'
+        )
+        return Response(body, status=status, headers=headers)
 
 
 @app.route('/github-webhook', methods=['POST'])

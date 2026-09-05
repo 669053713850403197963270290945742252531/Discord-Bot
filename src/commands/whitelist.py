@@ -126,7 +126,6 @@ class WhitelistModal(Modal, title="Whitelist a User"):
         hwid = self.hwid.component.value.strip()
         rank = self.rank.component.values[0]
         notes = (self.notes.component.value or "").strip() or None
-
         raw_target = self.target_user.component.value.strip()
         # A pasted mention (<@id>) is still tolerated so an accidental
         # right-click "Copy" of the wrong thing (or an @-mention pasted out
@@ -144,7 +143,7 @@ class WhitelistModal(Modal, title="Whitelist a User"):
             )
         mention = f"<@{discord_id}>"
 
-        if not is_valid_hwid(hwid):
+        if hwid and not is_valid_hwid(hwid):
             return await send_error(interaction, "Invalid HWID format. Must be 64 hex characters (SHA-256).")
 
         await interaction.response.defer(ephemeral=True)
@@ -158,14 +157,15 @@ class WhitelistModal(Modal, title="Whitelist a User"):
         if existing:
             return await send_error(interaction, f"{mention} is already whitelisted as **{existing.get('Identifier', 'Unknown')}**.")
 
-        existing = find_user_by_hwid(users, hwid)
-        if existing:
-            return await send_error(interaction, f"This HWID is already whitelisted under **{existing.get('Identifier', 'Unknown')}** (<@{existing.get('DiscordId')}>).")
+        if hwid:
+            existing = find_user_by_hwid(users, hwid)
+            if existing:
+                return await send_error(interaction, f"This HWID is already whitelisted under **{existing.get('Identifier', 'Unknown')}** (<@{existing.get('DiscordId')}>).")
 
         generated_key = generate_unique_key(users)
 
         try:
-            users.append(build_user_entry(hwid, identifier, rank, discord_id, generated_key, notes))
+            users.append(build_user_entry(hwid or None, identifier, rank, discord_id, generated_key, notes))
             await commit_users(users, sha, f"Whitelist user: {identifier} ({discord_id})")
         except GitHubAPIError as e:
             return await send_error(interaction, str(e))

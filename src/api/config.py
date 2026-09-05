@@ -6,6 +6,7 @@ python-dotenv -- so nothing here is hardcoded.
 """
 
 import os
+import json
 from datetime import timedelta
 from zoneinfo import ZoneInfo
 
@@ -181,6 +182,42 @@ HEADERS = {
 # rather than accepting unverifiable ones, and the bot falls back to the
 # periodic poll in start.py alone.
 GITHUB_WEBHOOK_SECRET = os.getenv("GITHUB_WEBHOOK_SECRET")
+
+# Public license-service settings. The client only needs the public endpoint;
+# no server secret is ever shipped to users. Each PlaceId maps to a protected
+# script path in the storage repository. The mapping lives in a separate local
+# JSON file so it does not have to be stored in .env.
+LICENSE_SERVER_ENABLED = os.getenv("LICENSE_SERVER_ENABLED", "true").strip().lower() not in ("false", "0", "no", "off")
+
+LICENSE_GAME_SCRIPTS_FILE = os.getenv(
+    "LICENSE_GAME_SCRIPTS_FILE",
+    os.path.join(os.path.dirname(os.path.dirname(os.path.dirname(os.path.abspath(__file__)))), "storage", "license_game_scripts.json"),
+)
+
+def _load_license_game_scripts() -> dict:
+    path = LICENSE_GAME_SCRIPTS_FILE
+    try:
+        with open(path, "r", encoding="utf-8") as fp:
+            value = json.load(fp)
+    except FileNotFoundError as exc:
+        raise ValueError(
+            f"License game-script config was not found: {path}. Create the JSON file before starting the bot."
+        ) from exc
+    except json.JSONDecodeError as exc:
+        raise ValueError(f"License game-script config contains invalid JSON: {path}") from exc
+    except OSError as exc:
+        raise ValueError(f"Could not read license game-script config: {path}") from exc
+    if not isinstance(value, dict):
+        raise ValueError("License game-script config must be a JSON object mapping PlaceIds to storage paths")
+    normalized = {str(k): str(v) for k, v in value.items()}
+    for place_id, script_path in normalized.items():
+        if not place_id.isdigit() or not script_path.strip():
+            raise ValueError(
+                f"Invalid license game-script mapping {place_id!r}: PlaceIds must be numeric and paths must be non-empty"
+            )
+    return normalized
+
+LICENSE_GAME_SCRIPTS = _load_license_game_scripts()
 
 # Used by api/webhook_sync.py to figure out where this process is currently
 # reachable, so it can keep the GitHub webhook's Payload URL pointed at the
