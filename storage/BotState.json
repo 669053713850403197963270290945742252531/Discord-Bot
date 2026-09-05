@@ -29,5 +29,6 @@
     "timeout_minutes": 40320,
     "reset_after_action": true,
     "notify_target": true
-  }
+  },
+  "hwid_reset_cooldowns": {}
 }

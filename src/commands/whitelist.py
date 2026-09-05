@@ -23,7 +23,7 @@ from api.alerts import (
     send_alert, alert_embed,
     ALERT_COLOR_ADD, ALERT_COLOR_REMOVE, ALERT_COLOR_EDIT, ALERT_COLOR_CAUTION,
 )
-from api.github import GitHubAPIError, fetch_users_with_sha, fetch_api_text_and_sha, commit_content, commit_users, get_cached_users
+from api.github import GitHubAPIError, fetch_users_with_sha, fetch_api_text_and_sha, commit_content, commit_users, get_cached_users, serialize_users_json
 from api.users import (
     find_user_by_discord_id, find_user_by_hwid, remove_user_by_discord_id,
     build_user_entry, revoke_buyer_role, find_removed_discord_ids,
@@ -59,15 +59,6 @@ BULK_WHITELIST_REQUIRED_COLUMNS = {"identifier", "hwid", "discord_id"}
 EDIT_WHITELIST_MAX_LENGTH = 1900  # Discord modal input limit is 4000; kept well under that with room to spare
 
 REGISTRATION_EMBED_TITLE = "Registration Successful"
-
-# TODO: replace with your actual executor/HWID-script instructions
-HWID_INSTRUCTIONS = (
-    "You need to provide your **HWID** to register.\n\n"
-    "**How to get your HWID:**\n"
-    "1. Open your executor, join any game, and attach.\n"
-    "2. Run the [HWID script](https://raw.githubusercontent.com/corradedied/Public-Scripts/refs/heads/main/get%20hwid.lua) and click `Copy HWID` to copy your hashed HWID.\n"
-    "3. Run `/register` again with both `identifier` (what you want to be named in the script) and `hwid` filled in."
-)
 
 
 # =========================================================================
@@ -415,8 +406,7 @@ async def whitelisted_user_autocomplete(interaction: discord.Interaction, curren
     """
     Populates the `user` option on any command whose target must already be
     a whitelisted user -- /unwhitelist, /edituser, /fetchuser,
-    /checkregistration, /clearnotes, /checktemp, /extend, /forceresethwid,
-    /resethwidcooldown -- straight from the in-memory Users.json cache
+    /checkregistration, /clearnotes, /checktemp, /extend, /resethwidcooldown -- straight from the in-memory Users.json cache
     (get_cached_users() -- no network call, so it's fast enough for
     Discord's autocomplete window). Since that cache is updated immediately
     on every whitelist/unwhitelist commit (and by the periodic background
@@ -1132,7 +1122,7 @@ class WhitelistView(LayoutView):
 
 
 # =========================================================================
-# /register, /hwidhelp, /checkregistration, /clearregistrations
+# /register, /checkregistration, /clearregistrations
 # =========================================================================
 
 class ConfirmClearLayout(LayoutView):
@@ -1254,7 +1244,7 @@ class Whitelist(commands.Cog):
         # correctness issue.
         users = get_cached_users()
         if users is not None:
-            decoded = json.dumps(users, indent=4)
+            decoded = serialize_users_json(users)
         else:
             # Cache not populated yet (e.g. right after a bot restart) --
             # fall back to a live fetch rather than failing outright.
@@ -1452,15 +1442,6 @@ class Whitelist(commands.Cog):
                 ("HWID", f"||`{hwid}`||", False),
             ],
         )
-
-    @app_commands.command(name="hwidhelp", description="Shows instructions for getting your HWID.")
-    @app_commands.guilds(GUILD)
-    @has_role(config.REQUIRED_ROLE_ID)
-    @is_in_guild(config.GUILD_ID)
-    async def hwidhelp(self, interaction: discord.Interaction):
-        await interaction.response.defer(ephemeral=True)
-        embed = discord.Embed(title="🔑 HWID Required", description=HWID_INSTRUCTIONS, color=discord.Color.orange())
-        await interaction.edit_original_response(embed=embed)
 
     @app_commands.command(name="checkregistration", description="Checks if a user is registered.")
     @app_commands.guilds(GUILD)

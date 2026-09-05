@@ -22,6 +22,7 @@ from api.alerts import (
 from api.github import (
     GitHubAPIError, fetch_users_with_sha, commit_users,
     fetch_permitted_keys_with_sha, commit_permitted_keys,
+    fetch_botstate_with_sha, update_botstate,
     remove_permitted_key, remove_permitted_keys, remove_first_n_permitted_keys,
 )
 from api.users import find_user_by_discord_id, find_user_by_hwid, build_user_entry, remove_user_by_discord_id, revoke_buyer_role
@@ -52,7 +53,7 @@ _temp_whitelist_tasks: dict = {}
 
 
 # =========================================================================
-# /tempwhitelist, /checktemp, /extend, /forceresethwid, /resethwidcooldown
+# /tempwhitelist, /checktemp, /extend, /resethwidcooldown
 # implementations (standalone so context_menus.py can call them directly)
 # =========================================================================
 
@@ -510,74 +511,6 @@ async def _checktemp_impl(interaction: discord.Interaction, user: discord.User):
     asyncio.create_task(update_loop())
 
 
-async def _forceresethwid_impl(interaction: discord.Interaction, user: discord.User, hwid: str):
-    # Unlike /edituser's modal (capped at 5 components, leaving no room for
-    # LastHwidReset/totalHwidResets inputs), this is a plain slash command,
-    # so it can go ahead and bump those two fields itself -- same as a
-    # self-service reset via the panel's "Reset HWID" button, just
-    # admin-triggered and with the cooldown ignored entirely rather than
-    # checked.
-    hwid = hwid.strip()
-
-    if not is_valid_hwid(hwid):
-        return await send_error(interaction, "Invalid HWID format. Must be 64 hex characters (SHA-256).")
-
-    # resolve_user_option() (see /forceresethwid below) may have already
-    # deferred this interaction itself if its fetch_user() fallback ran --
-    # calling defer() again would raise InteractionResponded.
-    if not interaction.response.is_done():
-        await interaction.response.defer(ephemeral=True)
-
-    try:
-        users, sha = await fetch_users_with_sha()
-    except GitHubAPIError as e:
-        return await send_error(interaction, str(e))
-
-    discord_id_str = str(user.id)
-    entry = find_user_by_discord_id(users, discord_id_str)
-    if not entry:
-        return await send_error(interaction, f"{user.mention} was not found in the user database.")
-
-    old_hwid = entry.get("HWID")
-    if hwid.lower() == (old_hwid or "").lower():
-        return await send_error(interaction, f"{user.mention} already has this HWID.")
-
-    collision = find_user_by_hwid(users, hwid)
-    if collision and collision is not entry:
-        return await send_error(
-            interaction,
-            f"This HWID is already whitelisted under **{collision.get('Identifier', 'Unknown')}** (<@{collision.get('DiscordId')}>).",
-        )
-
-    entry["HWID"] = hwid
-    entry["LastHwidReset"] = format_join_date()
-    entry["totalHwidResets"] = entry.get("totalHwidResets", 0) + 1
-
-    try:
-        await commit_users(users, sha, f"Force reset HWID for user: {entry.get('Identifier', discord_id_str)} ({discord_id_str})")
-    except GitHubAPIError as e:
-        return await send_error(interaction, str(e))
-
-    await send_alert(interaction.client, alert_embed(
-        "🛠️ HWID Force Reset",
-        f"{interaction.user.mention} force-reset {user.mention}'s (**{entry.get('Identifier', 'Unknown')}**) HWID via `/forceresethwid`.",
-        color=ALERT_COLOR_CAUTION,
-        fields=[("Old HWID", f"||`{old_hwid}`||", True), ("New HWID", f"||`{hwid}`||", True)],
-    ))
-
-    # No DM to the target -- this just confirms the change to the moderator
-    # who ran the command.
-    await send_success(
-        interaction,
-        f"{user.mention}'s HWID has been force reset.",
-        fields=[
-            ("Old HWID", f"||`{old_hwid}`||", False),
-            ("New HWID", f"||`{hwid}`||", False),
-            ("Last HWID Reset", format_discord_timestamp(entry["LastHwidReset"]), False),
-            ("Total HWID Resets", str(entry["totalHwidResets"]), False),
-        ],
-    )
-
 
 async def _resethwidcooldown_impl(interaction: discord.Interaction, user: discord.User):
     # resolve_user_option() (see /resethwidcooldown below) may have
@@ -596,10 +529,13 @@ async def _resethwidcooldown_impl(interaction: discord.Interaction, user: discor
     if not entry:
         return await send_error(interaction, f"{user.mention} was not found in the user database.")
 
-    # hwid_reset_cooldown_remaining() (not just checking LastHwidReset for
-    # None) so this correctly reports "nothing to clear" if the cooldown
-    # already lapsed on its own, not just if it was never set.
-    if hwid_reset_cooldown_remaining(entry) is None:
+    try:
+        botstate, _ = await fetch_botstate_with_sha()
+    except GitHubAPIError as e:
+        return await send_error(interaction, str(e))
+
+    cooldown_started = botstate.get("hwid_reset_cooldowns", {}).get(discord_id_str)
+    if hwid_reset_cooldown_remaining(cooldown_started) is None:
         return await send_error(interaction, f"{user.mention} is not currently on an HWID reset cooldown.")
 
     entry["LastHwidReset"] = None
@@ -608,6 +544,18 @@ async def _resethwidcooldown_impl(interaction: discord.Interaction, user: discor
         await commit_users(users, sha, f"Reset HWID cooldown for user: {entry.get('Identifier', discord_id_str)} ({discord_id_str})")
     except GitHubAPIError as e:
         return await send_error(interaction, str(e))
+
+    try:
+        def _clear_hwid_reset_cooldown(state):
+            state.setdefault("hwid_reset_cooldowns", {}).pop(discord_id_str, None)
+            return state
+
+        await update_botstate(
+            _clear_hwid_reset_cooldown,
+            f"HWID reset cooldown cleared: {entry.get('Identifier', discord_id_str)} ({discord_id_str})",
+        )
+    except GitHubAPIError as e:
+        print(f"Failed to clear HWID reset cooldown for {discord_id_str} in BotState.json: {e}")
 
     await send_alert(interaction.client, alert_embed(
         "⏱️ HWID Cooldown Cleared",
@@ -978,18 +926,6 @@ class KeysHwid(commands.Cog):
         if resolved is None:
             return
         await _extend_impl(interaction, resolved, minutes)
-
-    @app_commands.command(name="forceresethwid", description="Forcefully sets a whitelisted user's HWID, bypassing their reset cooldown.")
-    @app_commands.guilds(GUILD)
-    @app_commands.describe(user="The whitelisted user whose HWID to force-reset -- start typing an ID or name to search.", hwid="The user's new HWID, pre-hashed in SHA-256 (64 hex characters).")
-    @app_commands.autocomplete(user=whitelisted_user_autocomplete)
-    @has_role(config.REQUIRED_ROLE_ID)
-    @is_in_guild(config.GUILD_ID)
-    async def forceresethwid(self, interaction: discord.Interaction, user: str, hwid: str):
-        resolved = await resolve_user_option(interaction, user)
-        if resolved is None:
-            return
-        await _forceresethwid_impl(interaction, resolved, hwid)
 
     @app_commands.command(name="resethwidcooldown", description="Clears a user's HWID reset cooldown so they can reset their own HWID again immediately.")
     @app_commands.guilds(GUILD)

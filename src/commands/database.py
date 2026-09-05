@@ -18,7 +18,7 @@ from api.discord_helpers import (
 from api.alerts import send_alert, alert_embed, ALERT_COLOR_CAUTION
 from api.github import (
     GitHubAPIError, fetch_raw_text, fetch_api_text_and_sha, fetch_api_file,
-    commit_content, fetch_users_with_sha, list_commits, get_commit,
+    commit_content, fetch_users_with_sha, list_commits, get_commit, serialize_users_json,
 )
 from api.users import find_removed_discord_ids, revoke_buyer_role
 from api.time_utils import format_discord_timestamp
@@ -434,7 +434,7 @@ class Database(commands.Cog):
         except Exception as e:
             return await send_error(interaction, f"Failed to parse JSON: {e}")
 
-        content_str = json.dumps(users_data, indent=4)
+        content_str = serialize_users_json(users_data)
 
         try:
             current_users, sha = await fetch_users_with_sha()

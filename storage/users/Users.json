@@ -7,7 +7,8 @@
         "Key": "FCcpZcmJLRczYGVx9MCstK8hBjFkGajkhLi7k3tr",
         "Notes": null,
         "Activated": null,
-        "Executions": 0
+        "Executions": 0,
+        "Games": ["*"]
     },
     {
         "Identifier": "Wemmbu",
@@ -17,7 +18,8 @@
         "Key": "BhVa9Q7BMXZbvFYklLqRlmLTdGTZHTcnHsZiwA4",
         "Notes": null,
         "Activated": null,
-        "Executions": 0
+        "Executions": 0,
+        "Games": ["*"]
     },
     {
         "Identifier": "William",
@@ -27,7 +29,8 @@
         "Key": "hRrAXTYDDkYQo1FIf6OLKMFdUMrw8Q0yO34",
         "Notes": "Schedule I guy",
         "Activated": null,
-        "Executions": 0
+        "Executions": 0,
+        "Games": ["*"]
     },
     {
         "Identifier": "Knit",
@@ -37,7 +40,8 @@
         "Key": "3BRlH9Xzz0Z9zPFYEP8oQm3tQ2MS3",
         "Notes": "test account",
         "Activated": null,
-        "Executions": 0
+        "Executions": 0,
+        "Games": ["*"]
     },
     {
         "Identifier": "Roblox Update Tracker",
@@ -47,7 +51,8 @@
         "Key": "Lu3yDtq8FcaNzhOzwxENspwpVYg",
         "Notes": "Expires on 7/18/2026, 5:32:16 PM",
         "Activated": null,
-        "Executions": 0
+        "Executions": 0,
+        "Games": ["*"]
     },
     {
         "Identifier": "Parrot",
@@ -57,7 +62,8 @@
         "Key": "fWEch8kepHLLYMPT9t6UDRMDcykxTVMMDW",
         "Notes": "Special",
         "Activated": null,
-        "Executions": 0
+        "Executions": 0,
+        "Games": ["*"]
     },
     {
         "Identifier": "Spoke",
@@ -67,7 +73,8 @@
         "Key": "lUTS9McbPGs6shzrzoMYnxPSW9U6",
         "Notes": "Special",
         "Activated": null,
-        "Executions": 0
+        "Executions": 0,
+        "Games": ["*"]
     },
     {
         "Identifier": "Corrade",
@@ -77,7 +84,8 @@
         "Key": "Qrt2tWntLoxpEcY57BxqK2oN3hiDswjVxwb",
         "Notes": "ts notes",
         "Activated": null,
-        "Executions": 0
+        "Executions": 0,
+        "Games": ["*"]
     },
     {
         "Identifier": "FlameFrags",
@@ -87,6 +95,7 @@
         "Key": "DmQ9jmctXG2OQhUMMoTjxCsQqu71",
         "Notes": "Special",
         "Activated": null,
-        "Executions": 0
+        "Executions": 0,
+        "Games": ["*"]
     }
 ]

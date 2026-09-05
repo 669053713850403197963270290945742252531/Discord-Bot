@@ -409,7 +409,7 @@ class ResetHWIDModal(Modal, title="Reset HWID"):
 
     hwid = Label(
         text="HWID",
-        description="Pre-hashed HWID in SHA-256 (64 hex characters). Run /hwidhelp for help getting yours.",
+        description="Pre-hashed HWID in SHA-256 (64 hex characters). Provide the pre-hashed HWID from your executor.",
         component=TextInput(placeholder="64-character hex string", min_length=64, max_length=64),
     )
 
@@ -639,31 +639,101 @@ class ControlPanelView(LayoutView):
         await send_success(interaction, f"You've been given the {role.mention} role.")
 
     async def reset_hwid(self, interaction: discord.Interaction):
-        # Best-effort pre-check: skip prompting for a new HWID if the user
-        # isn't whitelisted or is still on cooldown. This has to stay fast --
-        # send_modal (like send_message) must be the interaction's first
-        # response, so it reads from the in-memory Users.json cache instead
-        # of hitting GitHub live.
-        #
-        # get_cached_users() can still be None very briefly right after a
-        # bot restart, before the first refresh has landed -- in that one
-        # window this falls back to opening the modal unconditionally, same
-        # as redeem_key. ResetHWIDModal.on_submit() re-checks both
-        # whitelist and cooldown against a fresh fetch regardless.
-        users = get_cached_users()
-        if users is None:
-            return await interaction.response.send_modal(ResetHWIDModal())
+        # Reset the authenticated user's HWID directly. The next successful
+        # client launch will claim and bind the new HWID automatically.
+        # This intentionally identifies the record by Discord ID rather than
+        # by an HWID supplied by the client/user.
+        await interaction.response.defer(ephemeral=True)
+
+        try:
+            users, sha = await fetch_users_with_sha()
+        except GitHubAPIError as e:
+            return await send_error(interaction, str(e))
 
         discord_id_str = str(interaction.user.id)
         entry = find_user_by_discord_id(users, discord_id_str)
         if not entry:
-            return await send_error(interaction, "You need to redeem a key before you can reset your HWID.")
+            return await send_error(
+                interaction,
+                "You need to redeem a key before you can reset your HWID.",
+            )
 
-        remaining = hwid_reset_cooldown_remaining(entry)
+        try:
+            botstate, _ = await fetch_botstate_with_sha()
+        except GitHubAPIError as e:
+            return await send_error(interaction, str(e))
+
+        cooldown_started = botstate.get("hwid_reset_cooldowns", {}).get(discord_id_str)
+        remaining = hwid_reset_cooldown_remaining(cooldown_started)
         if remaining:
-            return await send_error(interaction, f"You can reset your HWID again in {humanize_timeleft(remaining, suffix=False)}.")
+            return await send_error(
+                interaction,
+                f"You can reset your HWID again in {humanize_timeleft(remaining, suffix=False)}.",
+            )
 
-        await interaction.response.send_modal(ResetHWIDModal())
+        old_hwid = entry.get("HWID")
+        if not old_hwid:
+            return await send_error(
+                interaction,
+                "Your HWID is already cleared. Run your script again to bind this device.",
+            )
+
+        reset_timestamp = format_join_date()
+        entry["HWID"] = None
+        entry["LastHwidReset"] = reset_timestamp
+        entry["totalHwidResets"] = entry.get("totalHwidResets", 0) + 1
+
+        try:
+            await commit_users(
+                users,
+                sha,
+                f"Reset HWID for user: {entry.get('Identifier', discord_id_str)} ({discord_id_str})",
+            )
+        except GitHubAPIError as e:
+            return await send_error(interaction, str(e))
+
+        # Persist the one-week self-service cooldown in BotState.json so it
+        # survives bot restarts and no longer depends on the Users.json row
+        # being the source of truth for cooldown enforcement.
+        try:
+            def _record_hwid_reset_cooldown(state):
+                state.setdefault("hwid_reset_cooldowns", {})[discord_id_str] = reset_timestamp
+                return state
+
+            await update_botstate(
+                _record_hwid_reset_cooldown,
+                f"HWID reset cooldown started: {entry.get('Identifier', discord_id_str)} ({discord_id_str})",
+            )
+        except GitHubAPIError as e:
+            print(f"Failed to persist HWID reset cooldown for {discord_id_str} to BotState.json: {e}")
+
+        reset_embed = build_embed(
+            title="🔄 HWID Reset Complete",
+            description=(
+                f"{interaction.user.mention}'s HWID has been cleared. "
+                "Their next successful script launch will automatically bind "
+                "the new device to this license."
+            ),
+            color=discord.Color.blue(),
+            fields=[
+                ("User", f"{interaction.user.mention} (`{discord_id_str}`)", False),
+                ("Previous HWID", f"||`{old_hwid}`||", False),
+                ("Current HWID", "`null` — awaiting next activation", False),
+                ("Total Resets", str(entry["totalHwidResets"]), True),
+            ],
+            timestamp=datetime.now(timezone.utc),
+        )
+        await send_alert(interaction.client, reset_embed)
+
+        await send_success(
+            interaction,
+            "Your HWID has been cleared successfully.",
+            fields=[
+                ("Status", "Ready for a new device", True),
+                ("Next Reset Available", humanize_timeleft(config.RESET_HWID_COOLDOWN), True),
+                ("What to do next", "Run the script on the device you want to bind.", False),
+            ],
+        )
 
     async def get_info(self, interaction: discord.Interaction):
         # Same lookup + embed as /myinfo, just triggered from the panel
