@@ -21,6 +21,7 @@
     "moderation": true
   },
   "dms_enabled": true,
+  "hwid_reset_cooldowns": {},
   "warnings": [],
   "warning_config": {
     "enabled": true,
