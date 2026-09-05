@@ -349,10 +349,8 @@ class RedeemKeyModal(Modal, title="Redeem Key"):
 
         identifier = interaction.user.name
         rank = "User"
-        join_date = format_join_date()
-
         try:
-            users.append(build_user_entry(hwid or None, identifier, rank, discord_id_str, key, notes=None, join_date=join_date, games=getattr(pending_record, "games", ["*"])))
+            users.append(build_user_entry(hwid or None, identifier, rank, discord_id_str, key, notes=None, games=getattr(pending_record, "games", ["*"])))
             await commit_users(users, sha, f"Redeemed key for user: {identifier} ({discord_id_str})")
         except GitHubAPIError as e:
             return await send_error(interaction, str(e))
@@ -375,7 +373,7 @@ class RedeemKeyModal(Modal, title="Redeem Key"):
         success_fields = [
             ("Identifier", identifier, True),
             ("Rank", rank, True),
-            ("Join Date", format_join_date_display := format_join_date(), True),
+            ("Activated", "Pending first successful execution", True),
             ("HWID", f"||`{hwid}`||", False),
         ]
 
@@ -688,11 +686,12 @@ class ControlPanelView(LayoutView):
         embed.set_thumbnail(url=interaction.user.display_avatar.url)
         embed.add_field(name="Identifier", value=user_data.get("Identifier", "N/A"), inline=True)
         embed.add_field(name="Rank", value=user_data.get("Rank", "N/A"), inline=True)
-        embed.add_field(name="Join Date", value=user_data.get("JoinDate", "N/A"), inline=True)
+        embed.add_field(name="Activated", value=user_data.get("Activated", "N/A"), inline=True)
         embed.add_field(name="HWID", value=f"||{user_data.get('HWID', 'N/A')}||", inline=True)
         embed.add_field(name="Key", value=f"||{user_data.get('Key', 'N/A')}||", inline=True)
         embed.add_field(name="Last HWID Reset", value=user_data.get("LastHwidReset") or "N/A", inline=True)
         embed.add_field(name="Total HWID Resets", value=str(user_data.get("totalHwidResets", 0)), inline=True)
+        embed.add_field(name="Executions", value=str(user_data.get("Executions", 0)), inline=True)
 
         await interaction.followup.send(embed=embed, ephemeral=True)
 

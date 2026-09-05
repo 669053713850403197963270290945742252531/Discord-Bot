@@ -26,17 +26,17 @@ HWID_B = "b" * 64
 USERS = [
     {
         "Identifier": "Bound", "HWID": HWID_A, "DiscordId": "111", "Rank": "VIP",
-        "JoinDate": "1/1/2026, 12:00:00 AM", "Key": "GOODKEY123", "Notes": None,
+        "Activated": None, "Key": "GOODKEY123", "Notes": None, "Executions": 0,
         "Games": ["12345"], "LastHwidReset": None, "totalHwidResets": 0,
     },
     {
         "Identifier": "Unbound", "HWID": None, "DiscordId": "222", "Rank": "User",
-        "JoinDate": "1/1/2026, 12:00:00 AM", "Key": "UNBOUND456", "Notes": None,
+        "Activated": None, "Key": "UNBOUND456", "Notes": None, "Executions": 0,
         "Games": ["12345"], "LastHwidReset": None, "totalHwidResets": 0,
     },
     {
         "Identifier": "Restricted", "HWID": HWID_A, "DiscordId": "333", "Rank": "User",
-        "JoinDate": "1/1/2026, 12:00:00 AM", "Key": "OTHER789", "Notes": None,
+        "Activated": None, "Key": "OTHER789", "Notes": None, "Executions": 0,
         "Games": ["99999"], "LastHwidReset": None, "totalHwidResets": 0,
     },
 ]
@@ -132,6 +132,21 @@ def main():
         result = ls.evaluate_and_load("UNBOUND456", HWID_B, "12345")
         check("unbound key binds and allows", result.get("allowed") is True and unbound[1]["HWID"] == HWID_B)
         check("first activation writes then fetches script", calls == ["fetch", "commit", "script"])
+        token = result.get("execution_token")
+        check("successful check returns execution token", isinstance(token, str) and token)
+
+        def complete_run(coro):
+            try: coro.close()
+            except Exception: pass
+            if len(calls) == 3:
+                calls.append("fetch_complete")
+                return unbound, "sha2"
+            calls.append("commit_complete")
+            return None
+        ls._run = complete_run
+        completed = ls.complete_execution("UNBOUND456", HWID_B, "12345", token)
+        check("successful execution records activation", completed.get("completed") is True and unbound[1]["Activated"] is not None)
+        check("successful execution increments counter", unbound[1]["Executions"] == 1 and completed.get("executions") == 1)
     finally:
         ls._run = original
 

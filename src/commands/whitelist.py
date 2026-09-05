@@ -807,12 +807,13 @@ async def _fetchuser_impl(interaction: discord.Interaction, user: discord.User):
     embed = discord.Embed(title=f"User Info: {user.name}", color=discord.Color.teal(), timestamp=datetime.now(timezone.utc))
     embed.set_thumbnail(url=user.display_avatar.url)
 
-    join_date_display = format_discord_timestamp(user_data.get("JoinDate", "Unknown"))
+    activation_value = user_data.get("Activated")
+    join_date_display = format_discord_timestamp(activation_value) if activation_value else "Pending first successful execution"
 
     fields = [
         ("Identifier", user_data.get("Identifier")),
         ("Rank", user_data.get("Rank")),
-        ("Join Date", join_date_display),
+        ("Activated", join_date_display),
         ("HWID", f"||{user_data.get('HWID')}||" if user_data.get("HWID") else "N/A"),
         ("Key", f"||{user_data.get('Key')}||" if user_data.get("Key") else "N/A"),
         ("Last HWID Reset", format_discord_timestamp(user_data.get("LastHwidReset"))),
@@ -1039,11 +1040,12 @@ class WhitelistView(LayoutView):
         lines = [
             f"**Identifier:** {user_data.get('Identifier', 'N/A')}",
             f"**Rank:** {user_data.get('Rank', 'N/A')}",
-            f"**Join Date:** {format_discord_timestamp(user_data.get('JoinDate', 'N/A'))}",
+            f"**Activated:** {format_discord_timestamp(user_data.get('Activated')) if user_data.get('Activated') else 'Pending first successful execution'}",
             f"**HWID:** ||`{user_data.get('HWID', '')}`||",
             f"**Key:** ||`{user_data.get('Key', '')}`||",
             f"**Last HWID Reset:** {format_discord_timestamp(user_data.get('LastHwidReset'))}",
             f"**Total HWID Resets:** {user_data.get('totalHwidResets', 0)}",
+            f"**Executions:** {user_data.get('Executions', 0)}",
         ]
         notes = user_data.get("Notes")
         if notes is not None and notes != "false" and notes.strip() != "":

@@ -316,11 +316,12 @@ class Info(commands.Cog):
         embed.set_thumbnail(url=interaction.user.display_avatar.url)
         embed.add_field(name="Identifier", value=user_data.get("Identifier", "N/A"), inline=True)
         embed.add_field(name="Rank", value=user_data.get("Rank", "N/A"), inline=True)
-        embed.add_field(name="Join Date", value=format_discord_timestamp(user_data.get("JoinDate")), inline=True)
+        embed.add_field(name="Activated", value=format_discord_timestamp(user_data.get("Activated")), inline=True)
         embed.add_field(name="HWID", value=f"||{user_data.get('HWID', 'N/A')}||", inline=True)
         embed.add_field(name="Key", value=f"||{user_data.get('Key', 'N/A')}||", inline=True)
         embed.add_field(name="Last HWID Reset", value=format_discord_timestamp(user_data.get("LastHwidReset")), inline=True)
         embed.add_field(name="Total HWID Resets", value=str(user_data.get("totalHwidResets", 0)), inline=True)
+        embed.add_field(name="Executions", value=str(user_data.get("Executions", 0)), inline=True)
 
         await interaction.followup.send(embed=embed, ephemeral=True)
 

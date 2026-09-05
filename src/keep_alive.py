@@ -87,6 +87,14 @@ if _license_server_enabled():
         )
         return Response(body, status=status, headers=headers)
 
+    @app.route('/whitelist/complete', methods=['POST'])
+    def whitelist_complete():
+        from api.license_server import handle_complete_request
+        status, body, headers = handle_complete_request(
+            request.get_data(), request.remote_addr or 'unknown'
+        )
+        return Response(body, status=status, headers=headers)
+
 
 @app.route('/github-webhook', methods=['POST'])
 def github_webhook():

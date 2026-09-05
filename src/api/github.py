@@ -576,7 +576,7 @@ def validate_stored_script(script_text: str) -> Optional[str]:
 # switch. Also home to /warnings' warning records -- those carry no timer,
 # but live here anyway rather than in Users.json since they're bot-side
 # moderation history, not whitelist data. Same "fetch -> get sha -> mutate
-# -> commit" shape as Users.json above, with one addition:
+# -> commit" shape as Users.json above.
 # BotState.json is written to from many independent places that can
 # legitimately race each other (a ban timer firing at the same moment as a
 # moderator running /togglelock, for instance) rather than Users.json's
@@ -593,7 +593,6 @@ BOTSTATE_SCHEMA_VERSION = 1
 # key entirely.
 DEFAULT_BOTSTATE: Dict[str, Any] = {
     "schema_version": BOTSTATE_SCHEMA_VERSION,
-    "last_updated": None,
     "temp_bans": [],
     # Snapshot of the guild's ban list -- [{"discord_id", "tag", "reason"}, ...]
     # -- kept purely so /checkban and /unban's autocomplete has something
@@ -661,8 +660,8 @@ async def fetch_botstate_with_sha(session: Optional[aiohttp.ClientSession] = Non
 
 
 async def commit_botstate(state: Dict[str, Any], sha: str, message: str, session: Optional[aiohttp.ClientSession] = None) -> Dict[str, Any]:
-    """Serializes `state` to indented JSON (stamping schema_version and
-    last_updated) and commits it as the new storage/BotState.json.
+    """Serializes `state` to indented JSON (stamping schema_version) and
+    commits it as the new storage/BotState.json.
 
     Most callers should go through update_botstate() instead, which wraps
     this together with fetch_botstate_with_sha() and retries on a stale
@@ -671,7 +670,6 @@ async def commit_botstate(state: Dict[str, Any], sha: str, message: str, session
     to_write = {
         **state,
         "schema_version": BOTSTATE_SCHEMA_VERSION,
-        "last_updated": datetime.now(timezone.utc).strftime("%Y-%m-%dT%H:%M:%SZ"),
     }
     content_str = json.dumps(to_write, indent=2) + "\n"
 

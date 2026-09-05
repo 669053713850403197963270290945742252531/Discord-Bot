@@ -405,9 +405,10 @@ async def _checktemp_impl(interaction: discord.Interaction, user: discord.User):
             ("Discord ID", f"{entry.get('DiscordId')} ({user.mention})", True),
             ("HWID", f"||{entry.get('HWID')}||" if entry.get("HWID") else "N/A", True),
             ("Key", f"||{entry.get('Key')}||" if entry.get("Key") else "N/A", True),
-            ("Join Date", format_discord_timestamp(entry.get("JoinDate", "Unknown")), True),
+            ("Activated", format_discord_timestamp(entry.get("Activated")), True),
             ("Last HWID Reset", format_discord_timestamp(entry.get("LastHwidReset")), True),
             ("Total HWID Resets", str(entry.get("totalHwidResets", 0)), True),
+            ("Executions", str(entry.get("Executions", 0)), True),
             ("Expires", f"<t:{expires_ts}:F>", True),
             ("Time Left", humanize_timeleft(remaining_), True),
         ]
@@ -807,10 +808,11 @@ class KeysHwid(commands.Cog):
         embed = discord.Embed(title="Valid Key", description=f"**The info for key:** ||`{key}`||", color=discord.Color.green())
         embed.add_field(name="Identifier", value=entry.get("Identifier", "N/A"), inline=True)
         embed.add_field(name="Rank", value=entry.get("Rank", "N/A"), inline=True)
-        embed.add_field(name="Join Date", value=format_discord_timestamp(entry.get("JoinDate", "Unknown")), inline=True)
+        embed.add_field(name="Activated", value=format_discord_timestamp(entry.get("Activated", "Unknown")), inline=True)
         embed.add_field(name="Discord ID", value=f"<@{entry.get('DiscordId')}>" if entry.get("DiscordId") else "N/A", inline=True)
         embed.add_field(name="Last HWID Reset", value=format_discord_timestamp(entry.get("LastHwidReset")), inline=True)
         embed.add_field(name="Total HWID Resets", value=str(entry.get("totalHwidResets", 0)), inline=True)
+        embed.add_field(name="Executions", value=str(entry.get("Executions", 0)), inline=True)
         embed.add_field(name="Key", value=f"||`{entry.get('Key')}`||", inline=False)
         embed.add_field(name="HWID", value=f"||`{entry.get('HWID')}`||", inline=False)
 

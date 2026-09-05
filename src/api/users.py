@@ -5,7 +5,6 @@ from typing import Any, Dict, List, Optional, Tuple
 import discord
 
 from . import config
-from .time_utils import format_join_date
 
 
 def find_user_by_discord_id(users: List[Dict[str, Any]], discord_id) -> Optional[Dict[str, Any]]:
@@ -39,21 +38,23 @@ def build_user_entry(
     discord_id: str,
     key: str,
     notes: Optional[str] = None,
-    join_date: Optional[str] = None,
+    activated: Optional[str] = None,
     games: Optional[List[str]] = None,
 ) -> Dict[str, Any]:
-    """Builds a new Users.json entry with the standard field ordering."""
+    """Build a new whitelist record. Activated is null until the client
+    completes a successful first execution."""
     return {
         "Identifier": identifier,
         "HWID": hwid,
         "DiscordId": discord_id,
         "Rank": rank,
-        "JoinDate": join_date or format_join_date(),
+        "Activated": activated,
         "Key": key,
         "Notes": notes,
         "Games": games if games is not None else ["*"],
         "LastHwidReset": None,
         "totalHwidResets": 0,
+        "Executions": 0,
     }
 
 
