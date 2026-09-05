@@ -140,7 +140,11 @@ def evaluate_and_load(key: str, hwid: str, game_id: str) -> Dict[str, Any]:
 
         try:
             script = _run(fetch_storage_file(path))
-        except GitHubAPIError:
+        except GitHubAPIError as exc:
+            print(
+                f"[License] Failed to fetch game script "
+                f"(game={game_id}, path={path!r}): {exc}"
+            )
             return {"allowed": False, "reason": "game_script_unavailable"}
 
         return {
