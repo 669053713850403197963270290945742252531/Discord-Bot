@@ -25,7 +25,7 @@ from api.github import (
     remove_permitted_key, remove_permitted_keys, remove_first_n_permitted_keys,
 )
 from api.users import find_user_by_discord_id, find_user_by_hwid, build_user_entry, remove_user_by_discord_id, revoke_buyer_role
-from api.keys import generate_unique_key, generate_unique_keys, parse_key_length_range, is_valid_hwid
+from api.keys import generate_unique_key, generate_unique_keys, parse_game_ids, parse_key_length_range, is_valid_hwid
 from api.time_utils import (
     format_join_date, format_discord_timestamp, format_expiration_note,
     parse_expiration_note, humanize_timeleft, hwid_reset_cooldown_remaining,
@@ -643,10 +643,11 @@ class KeysHwid(commands.Cog):
         amount="How many keys to generate",
         allow_redemption="Commit the generated keys to permittedKeys.txt so they're redeemable via the control panel",
         length="Key length: a single number (e.g. 20) or a range (e.g. 5-10). Defaults to 25-40.",
+        games="Roblox PlaceIds allowed by this license (comma-separated), or `all` for unrestricted.",
     )
     @has_role(config.REQUIRED_ROLE_ID)
     @is_in_guild(config.GUILD_ID)
-    async def key_generate(self, interaction: discord.Interaction, amount: int, allow_redemption: bool = False, length: Optional[str] = None):
+    async def key_generate(self, interaction: discord.Interaction, amount: int, allow_redemption: bool = False, length: Optional[str] = None, games: Optional[str] = None):
         if amount > MAX_BULK_GENKEY_AMOUNT:
             return await send_error(interaction, f"`amount` can't exceed {MAX_BULK_GENKEY_AMOUNT} at once.")
 
@@ -657,6 +658,11 @@ class KeysHwid(commands.Cog):
                 return await send_error(interaction, str(e))
         else:
             min_length, max_length = 25, 40  # generate_key()'s own defaults
+
+        try:
+            allowed_games = parse_game_ids(games or "all")
+        except ValueError as e:
+            return await send_error(interaction, str(e))
 
         await interaction.response.defer(ephemeral=True)
 
@@ -677,8 +683,10 @@ class KeysHwid(commands.Cog):
 
         if allow_redemption:
             try:
+                from api.github import PermittedKey
+                pending = [PermittedKey(k, allowed_games) for k in new_keys]
                 await commit_permitted_keys(
-                    permitted_keys + new_keys,
+                    permitted_keys + pending,
                     keys_sha,
                     f"Bulk generated {len(new_keys)} key(s) for redemption by {interaction.user}",
                 )
@@ -698,6 +706,7 @@ class KeysHwid(commands.Cog):
             fields=[
                 ("Amount", str(len(new_keys)), True),
                 ("Length", f"{min_length}-{max_length}" if min_length != max_length else str(min_length), True),
+                ("Games", "All games" if "*" in allowed_games else ", ".join(allowed_games), True),
                 (
                     "Status",
                     "✅ Committed to permittedKeys.txt -- redeemable now"
@@ -731,6 +740,53 @@ class KeysHwid(commands.Cog):
             file = discord.File(io.BytesIO(("\n".join(new_keys) + "\n").encode()), filename=filename)
             layout = file_success_layout(f"**{title}**\n{footer_text}", filename)
             await interaction.followup.send(view=layout, file=file, ephemeral=True)
+
+    @key_group.command(name="games", description="Sets the Roblox PlaceIds a whitelisted license key may run on.")
+    @app_commands.describe(
+        key="The existing whitelisted license key",
+        games="Roblox PlaceIds separated by commas, or `all` for unrestricted",
+    )
+    @has_role(config.REQUIRED_ROLE_ID)
+    @is_in_guild(config.GUILD_ID)
+    async def key_games(self, interaction: discord.Interaction, key: str, games: str):
+        try:
+            from api.keys import parse_game_ids
+            allowed_games = parse_game_ids(games)
+        except ValueError as e:
+            return await send_error(interaction, str(e))
+
+        await interaction.response.defer(ephemeral=True)
+        try:
+            users, sha = await fetch_users_with_sha()
+        except GitHubAPIError as e:
+            return await send_error(interaction, str(e))
+
+        entry = next((u for u in users if u.get("Key") == key), None)
+        if entry is None:
+            return await send_error(interaction, "That key is not assigned to a whitelisted user.")
+
+        entry["Games"] = allowed_games
+        try:
+            await commit_users(users, sha, f"License games updated: {key[:8]}... by {interaction.user}")
+        except GitHubAPIError as e:
+            return await send_error(interaction, str(e))
+
+        await send_alert(interaction.client, alert_embed(
+            "🎮 License Games Updated",
+            f"{interaction.user.mention} updated the game restrictions for a license.",
+            color=ALERT_COLOR_EDIT,
+            fields=[
+                ("License", f"||`{key}`||", False),
+                ("Owner", str(entry.get("Identifier", "Unknown")), True),
+                ("Games", "All games" if "*" in allowed_games else ", ".join(allowed_games), False),
+            ],
+        ))
+
+        await send_success(
+            interaction,
+            f"Updated **{entry.get('Identifier', 'Unknown')}**'s license game restrictions.",
+            fields=[("Games", "All games" if "*" in allowed_games else ", ".join(allowed_games), False)],
+        )
 
     @key_group.command(name="validate", description="Validates and returns the full information for a key including ownership.")
     @app_commands.describe(key="Key to validate")

@@ -256,9 +256,10 @@ class HWIDBreachAlertView(View):
 
 class RedeemKeyModal(Modal, title="Redeem Key"):
     """Self-service equivalent of /register + /whitelist: the user supplies
-    their key and pre-hashed HWID, the key is checked against
-    permittedKeys.txt, and -- if valid -- a new Users.json entry is
-    committed for them directly, with no moderator step in between. On
+    their key and optional HWID, the key is checked against
+    permittedKeys.txt, and -- if valid -- a new Users.json entry is committed
+    for them directly. The HWID may be omitted so the public license client
+    can perform the first-run binding. On
     success, the redeemed key is also removed from permittedKeys.txt so it
     can't be used again."""
 
@@ -269,8 +270,8 @@ class RedeemKeyModal(Modal, title="Redeem Key"):
     )
     hwid = Label(
         text="HWID",
-        description="Pre-hashed HWID in SHA-256 (64 hex characters). Run /hwidhelp for help getting yours.",
-        component=TextInput(placeholder="64-character hex string", min_length=64, max_length=64),
+        description="Optional. Leave blank and the public client will bind the current Potassium HWID on first launch.",
+        component=TextInput(placeholder="Optional 64-character SHA-256 HWID", min_length=0, max_length=64, required=False),
     )
 
     async def on_error(self, interaction: discord.Interaction, error: Exception) -> None:
@@ -280,7 +281,7 @@ class RedeemKeyModal(Modal, title="Redeem Key"):
         key = self.key.component.value.strip()
         hwid = self.hwid.component.value.strip()
 
-        if not is_valid_hwid(hwid):
+        if hwid and not is_valid_hwid(hwid):
             return await send_error(interaction, "Invalid HWID format. Must be 64 hex characters (SHA-256).")
 
         await interaction.response.defer(ephemeral=True)
@@ -302,7 +303,7 @@ class RedeemKeyModal(Modal, title="Redeem Key"):
         if existing:
             return await send_error(interaction, "You have already redeemed a key and are whitelisted.")
 
-        existing_hwid = find_user_by_hwid(users, hwid)
+        existing_hwid = find_user_by_hwid(users, hwid) if hwid else None
         if existing_hwid:
             owner_identifier = existing_hwid.get("Identifier", "Unknown")
             owner_discord_id = str(existing_hwid.get("DiscordId", ""))
@@ -338,7 +339,8 @@ class RedeemKeyModal(Modal, title="Redeem Key"):
         except GitHubAPIError as e:
             return await send_error(interaction, str(e))
 
-        if key not in permitted_keys:
+        pending_record = next((pk for pk in permitted_keys if str(pk) == key), None)
+        if pending_record is None:
             return await send_error(interaction, "That key is invalid. Please double-check it and try again.")
 
         existing_key = find_user_by_key(users, key)
@@ -350,7 +352,7 @@ class RedeemKeyModal(Modal, title="Redeem Key"):
         join_date = format_join_date()
 
         try:
-            users.append(build_user_entry(hwid, identifier, rank, discord_id_str, key, notes=None, join_date=join_date))
+            users.append(build_user_entry(hwid or None, identifier, rank, discord_id_str, key, notes=None, join_date=join_date, games=getattr(pending_record, "games", ["*"])))
             await commit_users(users, sha, f"Redeemed key for user: {identifier} ({discord_id_str})")
         except GitHubAPIError as e:
             return await send_error(interaction, str(e))
@@ -363,7 +365,8 @@ class RedeemKeyModal(Modal, title="Redeem Key"):
                 ("Identifier", identifier, True),
                 ("Rank", rank, True),
                 ("Key", f"||`{key}`||", False),
-                ("HWID", f"||`{hwid}`||", False),
+                ("Games", "All games" if "*" in getattr(pending_record, "games", ["*"]) else ", ".join(getattr(pending_record, "games", ["*"])), False),
+                ("HWID", f"||`{hwid}`||" if hwid else "Pending client activation", False),
             ],
             timestamp=datetime.now(timezone.utc),
         )

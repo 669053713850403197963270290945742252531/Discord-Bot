@@ -104,3 +104,33 @@ def is_valid_date(d: str) -> bool:
         return True
     except ValueError:
         return False
+
+def parse_game_ids(value: str):
+    """Parse a comma-separated list of Roblox PlaceIds.
+
+    `all`/`*` means unrestricted. Returns a canonical list of decimal
+    strings, or raises ValueError with a user-facing explanation.
+    """
+    value = (value or "").strip()
+    if not value or value.lower() in {"all", "*"}:
+        return ["*"]
+
+    raw_items = [item.strip() for item in value.split(",") if item.strip()]
+    if not raw_items:
+        return ["*"]
+
+    result = []
+    seen = set()
+    for item in raw_items:
+        if not item.isdigit():
+            raise ValueError(f"Invalid game id `{item}`. Use Roblox PlaceIds separated by commas, or `all`.")
+        game_id = str(int(item))
+        if int(game_id) <= 0:
+            raise ValueError(f"Invalid game id `{item}`. Roblox PlaceIds must be positive integers.")
+        if game_id not in seen:
+            seen.add(game_id)
+            result.append(game_id)
+
+    if len(result) > 50:
+        raise ValueError("A license cannot be restricted to more than 50 games.")
+    return result

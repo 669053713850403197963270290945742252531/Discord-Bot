@@ -62,6 +62,27 @@ async def fetch_raw_text(url: str, session: Optional[aiohttp.ClientSession] = No
             await sess.close()
 
 
+
+async def fetch_storage_file(path: str, session: Optional[aiohttp.ClientSession] = None) -> str:
+    """Fetch a protected file from the configured storage repository via the
+    authenticated GitHub Contents API. The file itself is never exposed via
+    the public raw GitHub URL to the Roblox client."""
+    path = path.lstrip("/")
+    url = f"https://api.github.com/repos/{config.OWNER}/{config.STORAGE_REPO}/contents/{path}?ref={config.STORAGE_BRANCH}"
+    sess, should_close = await _get_session(session)
+    try:
+        async with sess.get(url, headers=config.HEADERS) as resp:
+            if resp.status != 200:
+                raise GitHubAPIError(f"Failed to fetch protected game script (HTTP {resp.status})", resp.status)
+            data = await resp.json()
+    finally:
+        if should_close:
+            await sess.close()
+    try:
+        return base64.b64decode(data["content"]).decode("utf-8")
+    except (KeyError, ValueError, UnicodeDecodeError) as exc:
+        raise GitHubAPIError("Protected game script returned invalid content") from exc
+
 async def fetch_api_file(session: Optional[aiohttp.ClientSession] = None) -> Dict[str, Any]:
     """
     Returns the raw GitHub Contents API response for Users.json (a dict with
@@ -336,6 +357,32 @@ async def get_commit(sha: str, session: Optional[aiohttp.ClientSession] = None) 
 # Permitted keys (permittedKeys.txt)
 # =========================================================================
 
+class PermittedKey(str):
+    """String-compatible pending license key with optional game restrictions.
+
+    Existing callers can still compare/use it exactly like a normal string;
+    the metadata survives a fetch/commit round-trip through `key.serialize()`.
+    """
+    def __new__(cls, key: str, games: Optional[List[str]] = None):
+        obj = str.__new__(cls, key)
+        obj.games = list(games or ["*"])
+        return obj
+
+    def serialize(self) -> str:
+        if not self.games or "*" in self.games:
+            return str(self)
+        return f"{self}|{','.join(self.games)}"
+
+
+def parse_permitted_key_line(line: str) -> PermittedKey:
+    parts = [part.strip() for part in line.split("|", 1)]
+    key = parts[0]
+    games = ["*"]
+    if len(parts) == 2 and parts[1]:
+        games = [x.strip() for x in parts[1].split(",") if x.strip()] or ["*"]
+    return PermittedKey(key, games)
+
+
 async def fetch_permitted_keys_with_sha(session: Optional[aiohttp.ClientSession] = None) -> Tuple[List[str], str]:
     """
     Fetches permittedKeys.txt + its sha via the Contents API, parsed into a
@@ -353,13 +400,13 @@ async def fetch_permitted_keys_with_sha(session: Optional[aiohttp.ClientSession]
 
     sha = data["sha"]
     text = base64.b64decode(data["content"]).decode("utf-8")
-    keys = [line.strip() for line in text.splitlines() if line.strip()]
+    keys = [parse_permitted_key_line(line.strip()) for line in text.splitlines() if line.strip()]
     return keys, sha
 
 
 async def commit_permitted_keys(keys: List[str], sha: str, message: str, session: Optional[aiohttp.ClientSession] = None) -> Dict[str, Any]:
     """Serializes `keys` back to permittedKeys.txt (one per line) and commits it."""
-    content_str = "\n".join(keys) + ("\n" if keys else "")
+    content_str = "\n".join(k.serialize() if isinstance(k, PermittedKey) else str(k) for k in keys) + ("\n" if keys else "")
     sess, should_close = await _get_session(session)
     try:
         payload = {

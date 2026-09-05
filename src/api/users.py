@@ -33,13 +33,14 @@ def remove_user_by_discord_id(users: List[Dict[str, Any]], discord_id) -> Tuple[
 
 
 def build_user_entry(
-    hwid: str,
+    hwid: Optional[str],
     identifier: str,
     rank: str,
     discord_id: str,
     key: str,
     notes: Optional[str] = None,
     join_date: Optional[str] = None,
+    games: Optional[List[str]] = None,
 ) -> Dict[str, Any]:
     """Builds a new Users.json entry with the standard field ordering."""
     return {
@@ -50,6 +51,7 @@ def build_user_entry(
         "JoinDate": join_date or format_join_date(),
         "Key": key,
         "Notes": notes,
+        "Games": games if games is not None else ["*"],
         "LastHwidReset": None,
         "totalHwidResets": 0,
     }
