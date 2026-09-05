@@ -1,0 +1,1 @@
+print("arsenal script loaded")
