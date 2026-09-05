@@ -1,30 +1,15 @@
-# Celestial Celestial License Client
+# Celestial License Client
 
-This directory contains the public Roblox/Potassium loader. It intentionally contains **no server secret**. Render serves `Celestial License Client.luau` through the bot's `/client` endpoint and substitutes the API base URL at request time.
+This public client contains no server secrets. It requests a short-lived challenge, sends the license key + executor HWID + Roblox PlaceId to the license server, and only receives the protected game payload after the server authorizes the request.
 
-## Normal user invocation
+Protected game scripts are stored in the private Supabase Storage `game-scripts` bucket. The license server uses its server-only Supabase credential to retrieve the configured object; Roblox never receives Supabase credentials or direct bucket access.
 
-```lua
-getgenv().script_key = "YOUR_LICENSE_KEY"
-loadstring(game:HttpGet("https://YOUR-RENDER-HOST.onrender.com/client"))()
-```
-
-The client obtains the Potassium HWID with `gethwid()`, hashes it with `crypt.hash(..., "sha256")`, gets a short-lived one-use challenge, and posts the license key, HWID hash, and current `game.PlaceId` to `/whitelist/check`.
-
-The server checks Users.json, enforces the license's `Games` list and expiration, binds an empty HWID on the first successful launch, commits that change to GitHub, then fetches the protected game payload from the authenticated storage repository.
-
-## Server configuration
-
-Set `LICENSE_GAME_SCRIPTS_FILE` only when you need a non-default path. By default the bot reads `storage/license_game_scripts.json`. The values are paths in `GITHUB_STORAGE_REPO`; keep that repository private if the game scripts must not be publicly downloadable.
-
-Example:
+The PlaceId-to-object mapping lives in the server-only `storage/license_game_scripts.json` file. For example:
 
 ```json
-{"123456789":"storage/games/my_game.lua"}
+{
+  "123974602339071": "baseplate.luau"
+}
 ```
 
-A license entry with `Games: ["*"]` is unrestricted. Otherwise `Games` must contain the current Roblox PlaceId.
-
-## Security boundary
-
-The client is public by design. There is no HMAC/shared secret in it. A first HWID claim cannot be cryptographically authenticated by a public client; therefore the server treats the license key as the claim credential and binds the first valid HWID it receives. Keep license keys private. The protected game source is not shipped in the client or the public `/client` response; it is fetched server-side only after the license check succeeds.
+The public `/client` endpoint fills its own API base URL at request time, so users can run the normal two-line loader without editing the client.

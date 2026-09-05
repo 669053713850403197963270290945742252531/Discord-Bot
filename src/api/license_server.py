@@ -26,7 +26,8 @@ from datetime import datetime, timezone
 from typing import Any, Dict, Tuple
 
 from . import config
-from .github import GitHubAPIError, fetch_users_with_sha, commit_users, fetch_storage_file
+from .github import GitHubAPIError, fetch_users_with_sha, commit_users
+from .supabase_storage import SupabaseStorageError, fetch_game_script
 from .users import find_user_by_key
 from .keys import is_valid_hwid
 from .time_utils import parse_expiration_note, format_join_date
@@ -161,8 +162,8 @@ def evaluate_and_load(key: str, hwid: str, game_id: str) -> Dict[str, Any]:
             return {"allowed": False, "reason": "game_script_not_configured"}
 
         try:
-            script = _run(fetch_storage_file(path))
-        except GitHubAPIError:
+            script = _run(fetch_game_script(path))
+        except SupabaseStorageError:
             return {"allowed": False, "reason": "game_script_unavailable"}
 
         execution_token = _new_execution_token(key, hwid, game_id)

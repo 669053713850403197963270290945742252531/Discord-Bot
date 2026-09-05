@@ -1,1 +1,0 @@
-print("arsenal script loaded")
