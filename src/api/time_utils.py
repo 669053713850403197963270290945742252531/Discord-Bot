@@ -197,18 +197,19 @@ def seconds_until(dt: Optional[datetime]) -> float:
     return max(0.0, (dt - datetime.now(timezone.utc)).total_seconds())
 
 
-def hwid_reset_cooldown_remaining(entry: Dict[str, Any]) -> Optional[timedelta]:
-    """Returns how much time is left before `entry` can use the control
-    panel's "Reset HWID" button again, based on its LastHwidReset field and
-    RESET_HWID_COOLDOWN. Returns None if a reset is allowed right now --
-    either because LastHwidReset is missing/unparseable (never reset
-    before), or because RESET_HWID_COOLDOWN has already elapsed since the
-    last one."""
-    last_reset = parse_join_date(entry.get("LastHwidReset"))
-    if not last_reset:
+def hwid_reset_cooldown_remaining(last_reset: Any) -> Optional[timedelta]:
+    """Returns how much time is left before the control-panel HWID reset
+    cooldown expires. ``last_reset`` may be a raw timestamp string from
+    BotState.json or a full Users.json entry for backward compatibility.
+    Returns None when no valid cooldown is active."""
+    if isinstance(last_reset, dict):
+        last_reset = last_reset.get("LastHwidReset")
+
+    parsed = parse_join_date(last_reset)
+    if not parsed:
         return None
 
-    remaining = config.RESET_HWID_COOLDOWN - (datetime.now(timezone.utc) - last_reset)
+    remaining = config.RESET_HWID_COOLDOWN - (datetime.now(timezone.utc) - parsed)
     return remaining if remaining.total_seconds() > 0 else None
 
 

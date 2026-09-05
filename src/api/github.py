@@ -160,10 +160,44 @@ async def commit_content(content_str: str, sha: str, message: str, session: Opti
     return result
 
 
+def serialize_users_json(users: List[Dict[str, Any]]) -> str:
+    """Serialize Users.json with the Games list kept compact on one line.
+
+    Users.json remains normally indented for readability, but each user's
+    `Games` value stays as a horizontal JSON array so adding many game IDs
+    does not consume a large number of lines.
+    """
+    lines = json.dumps(users, indent=4).splitlines()
+    output = []
+    i = 0
+    while i < len(lines):
+        line = lines[i]
+        if line.lstrip().startswith('"Games": ['):
+            indent = line[:len(line) - len(line.lstrip())]
+            if line.rstrip().endswith('],') or line.rstrip().endswith(']'):
+                output.append(line)
+            else:
+                parts = [line.strip()[len('"Games": '):]]
+                i += 1
+                while i < len(lines):
+                    part = lines[i].strip()
+                    parts.append(part)
+                    if part.endswith('],') or part.endswith(']'):
+                        break
+                    i += 1
+                compact_array = ' '.join(parts)
+                compact_array = compact_array.replace('[ ', '[').replace(' ]', ']')
+                compact_array = compact_array.replace(', ', ', ')
+                output.append(f'{indent}"Games": {compact_array}')
+        else:
+            output.append(line)
+        i += 1
+    return "\n".join(output) + "\n"
+
+
 async def commit_users(users: List[Dict[str, Any]], sha: str, message: str, session: Optional[aiohttp.ClientSession] = None) -> Dict[str, Any]:
-    """Serializes `users` to indented JSON and commits it as the new
-    Users.json. commit_content() takes care of updating the in-memory cache."""
-    content_str = json.dumps(users, indent=4)
+    """Serialize Users.json while keeping each Games list on one line."""
+    content_str = serialize_users_json(users)
     return await commit_content(content_str, sha, message, session)
 
 
@@ -610,6 +644,7 @@ DEFAULT_BOTSTATE: Dict[str, Any] = {
     "autorole": {"enabled": False, "role_id": None},
     "alerts_enabled": {"whitelist": True, "moderation": True},
     "dms_enabled": True,
+    "hwid_reset_cooldowns": {},
     "warnings": [],
     # /warnings config's auto-action preferences -- see commands/warnings.py's
     # DEFAULT_WARNING_CONFIG for the authoritative copy of these defaults and

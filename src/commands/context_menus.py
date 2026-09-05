@@ -33,7 +33,7 @@ from commands.whitelist import (
     WhitelistModal, _edituser_impl, _unwhitelist_impl, _fetchuser_impl, _clearnotes_impl,
 )
 from commands.keys_hwid import (
-    _checktemp_impl, _forceresethwid_impl, _resethwidcooldown_impl, _tempwhitelist_impl,
+    _checktemp_impl, _resethwidcooldown_impl, _tempwhitelist_impl,
 )
 from commands.access import _toggleaccess_impl, _tempaccess_impl
 
@@ -214,32 +214,6 @@ async def ctx_clear_notes(interaction: discord.Interaction, target: discord.Memb
     await _clearnotes_impl(interaction, target)
 
 
-# // Force Reset HWID //
-
-class ForceResetHwidContextModal(Modal):
-    def __init__(self, target: discord.Member):
-        super().__init__(title=f"Reset HWID: {target.display_name}"[:45])
-        self.target = target
-        self.hwid = TextInput(label="New HWID (SHA-256, 64 hex chars)", max_length=100, placeholder="64-character hex string")
-        self.add_item(self.hwid)
-
-    async def on_error(self, interaction: discord.Interaction, error: Exception) -> None:
-        await default_ui_error(interaction, error, label="ForceResetHwidContextModal")
-
-    async def on_submit(self, interaction: discord.Interaction):
-        # _forceresethwid_impl already validates the HWID format and reports
-        # a clear error itself, so it's passed straight through.
-        await _forceresethwid_impl(interaction, self.target, self.hwid.value.strip())
-
-
-@app_commands.context_menu(name="Force Reset HWID")
-@app_commands.guilds(GUILD)
-@has_role(config.REQUIRED_ROLE_ID)
-@is_in_guild(config.GUILD_ID)
-async def ctx_force_reset_hwid(interaction: discord.Interaction, target: discord.Member):
-    await interaction.response.send_modal(ForceResetHwidContextModal(target))
-
-
 # // Reset HWID Cooldown //
 
 @app_commands.context_menu(name="Reset HWID Cooldown")
@@ -320,7 +294,7 @@ async def ctx_temp_whitelist(interaction: discord.Interaction, target: discord.M
 _CONTEXT_MENUS = (
     ctx_ban_user, ctx_kick_user, ctx_mute_user, ctx_unmute_user,
     ctx_whitelist_user, ctx_edit_user, ctx_unwhitelist_user, ctx_fetch_user,
-    ctx_check_temp, ctx_clear_notes, ctx_force_reset_hwid, ctx_reset_hwid_cooldown,
+    ctx_check_temp, ctx_clear_notes, ctx_reset_hwid_cooldown,
     ctx_toggle_access, ctx_temp_access, ctx_temp_whitelist,
 )
 
