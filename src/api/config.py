@@ -110,7 +110,7 @@ ALERTS_CHANNEL_ID = _require_int("REDEEM_ALERTS_CHANNEL_ID")
 # muted independently via /togglealerts whitelist|moderation.
 MODERATION_ALERTS_CHANNEL_ID = _require_int("MODERATION_ALERTS_CHANNEL_ID")
 
-# Timezone JoinDate values are displayed/stored in (handles EST/EDT automatically)
+# Timezone-local timestamps such as Activated/LastHwidReset are displayed/stored in (handles EST/EDT automatically)
 LOCAL_TZ = ZoneInfo("America/New_York")
 
 # How long a whitelisted user must wait between self-service HWID resets via

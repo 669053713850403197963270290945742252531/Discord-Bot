@@ -39,11 +39,12 @@ CSV_EXPORT_COLUMN_MAP = {
     "HWID": "hwid",
     "DiscordId": "discord_id",
     "Rank": "rank",
-    "JoinDate": "join_date",
+    "Activated": "activated",
     "Key": "key",
     "Notes": "notes",
     "LastHwidReset": "last_hwid_reset",
     "totalHwidResets": "total_hwid_resets",
+    "Executions": "executions",
 }
 
 
@@ -93,6 +94,7 @@ class DbSearchView(LayoutView):
             f"**Key:** ||`{user.get('Key', '')}`||",
             f"**Last HWID Reset:** {format_discord_timestamp(user.get('LastHwidReset'))}",
             f"**Total HWID Resets:** {user.get('totalHwidResets', 0)}",
+            f"**Executions:** {user.get('Executions', 0)}",
         ]
         notes = user.get("Notes")
         if notes and notes != "false" and notes.strip() != "":

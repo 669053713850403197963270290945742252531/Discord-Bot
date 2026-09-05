@@ -1,6 +1,6 @@
-# Celestial License Client
+# Celestial Celestial License Client
 
-This directory contains the public Roblox/Potassium loader. It intentionally contains **no server secret**. Render serves `License Client.luau` through the bot's `/client` endpoint and substitutes the API base URL at request time.
+This directory contains the public Roblox/Potassium loader. It intentionally contains **no server secret**. Render serves `Celestial License Client.luau` through the bot's `/client` endpoint and substitutes the API base URL at request time.
 
 ## Normal user invocation
 
