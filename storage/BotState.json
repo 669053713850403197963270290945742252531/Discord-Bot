@@ -21,6 +21,7 @@
     "moderation": true
   },
   "dms_enabled": true,
+  "hwid_reset_cooldowns": {},
   "warnings": [],
   "warning_config": {
     "enabled": true,
@@ -29,6 +30,5 @@
     "timeout_minutes": 40320,
     "reset_after_action": true,
     "notify_target": true
-  },
-  "hwid_reset_cooldowns": {}
+  }
 }
