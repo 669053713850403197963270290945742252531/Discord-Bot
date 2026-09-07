@@ -73,10 +73,12 @@ def parse_key_length_range(length_str: str) -> Tuple[int, int]:
     return min_length, max_length
 
 
-def is_valid_hwid(hwid: str) -> bool:
-    # sha256 hash = 64 hex characters
-    return bool(re.fullmatch(r"[a-fA-F0-9]{64}", hwid))
 
+def is_valid_hwid(hwid: str) -> bool:
+    """Return True for the SHA-256 HWID format produced by the client."""
+    if not isinstance(hwid, str):
+        return False
+    return bool(re.fullmatch(r"[0-9a-fA-F]{64}", hwid.strip()))
 
 def is_valid_discord_id(discord_id: str) -> bool:
     if not discord_id.isdigit():

@@ -1,0 +1,34 @@
+Identifier: Corrade
+DiscordId: 999776749070078004
+Rank: Owner
+Notes: ts notes
+
+Identifier: CaptainEz
+DiscordId: 895500903799463976
+Rank: User
+
+Identifier: Knit
+DiscordId: 1058495565899505763
+Rank: User
+Notes: test account
+
+Identifier: William
+DiscordId: 339870406737395712
+Rank: Head Honker
+Notes: Schedule I guy
+
+Identifier: FlameFrags
+DiscordId: 364436420414144512
+Rank: Special
+
+Identifier: Wemmbu
+DiscordId: 1161658957513895946
+Rank: Special
+
+Identifier: Parrot
+DiscordId: 400097639917420548
+Rank: Special
+
+Identifier: Spoke
+DiscordId: 349347610295009311
+Rank: Special

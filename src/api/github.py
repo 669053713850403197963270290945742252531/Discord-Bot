@@ -46,7 +46,7 @@ async def _get_session(session: Optional[aiohttp.ClientSession]):
 
 
 # =========================================================================
-# Users.json
+# Legacy GitHub content helpers used by non-license features
 # =========================================================================
 
 async def fetch_raw_text(url: str, session: Optional[aiohttp.ClientSession] = None) -> str:
@@ -103,15 +103,7 @@ async def fetch_api_text_and_sha(session: Optional[aiohttp.ClientSession] = None
 
 
 async def commit_content(content_str: str, sha: str, message: str, session: Optional[aiohttp.ClientSession] = None) -> Dict[str, Any]:
-    """Commits a raw string as the new Users.json content, then updates the
-    in-memory users cache to match.
-
-    The cache update lives here (rather than only in commit_users() below)
-    because /editwhitelist, /rollback, and /upload all commit through this
-    function directly with a hand-built content string, bypassing
-    commit_users() entirely -- centralizing the cache update here means
-    every write path is covered with no risk of a new one forgetting to
-    keep the cache in sync."""
+    """Commits a raw string as the new Users.json content."""
     sess, should_close = await _get_session(session)
     try:
         payload = {
@@ -128,14 +120,6 @@ async def commit_content(content_str: str, sha: str, message: str, session: Opti
     finally:
         if should_close:
             await sess.close()
-
-    try:
-        set_users_cache(json.loads(content_str))
-    except (json.JSONDecodeError, TypeError):
-        # Shouldn't happen for any real caller (API_URL is always
-        # Users.json), but leave the existing cache alone rather than
-        # poison it with something unparseable.
-        pass
 
     return result
 
@@ -182,161 +166,6 @@ async def commit_users(users: List[Dict[str, Any]], sha: str, message: str, sess
 
 
 # =========================================================================
-# In-memory Users.json cache
-# =========================================================================
-#
-# Read-only "is this person whitelisted / off cooldown" pre-checks (e.g. the
-# control panel's Reset HWID button) need an answer within Discord's ~3s
-# interaction-ack window, which a live network call can't reliably guarantee.
-# This cache removes the network call from that critical path entirely.
-# `refresh_users_cache()` is polled periodically by a background task (see
-# start.py), and `commit_content()` above also updates it immediately after
-# any successful write, so it never has to wait for the next poll to reflect
-# the bot's own changes. `get_cached_users()` never makes a network call and
-# can't time out.
-
-_users_cache: Optional[List[Dict[str, Any]]] = None
-_users_cache_updated_at: Optional[datetime] = None
-
-
-def get_cached_users() -> Optional[List[Dict[str, Any]]]:
-    """Returns the last-known Users.json contents from memory, or None if the
-    cache hasn't been populated yet (e.g. the first refresh hasn't completed
-    since bot startup). Never makes a network call."""
-    return _users_cache
-
-
-def cached_users_updated_at() -> Optional[datetime]:
-    """The exact UTC timestamp of the last successful cache refresh, or None
-    if it's never been populated."""
-    return _users_cache_updated_at
-
-
-def set_users_cache(users: List[Dict[str, Any]]) -> None:
-    """Overwrites the in-memory cache directly. Called by commit_content()
-    (and, in turn, refresh_users_cache()) so writes and periodic refreshes
-    are reflected immediately."""
-    global _users_cache, _users_cache_updated_at
-    _users_cache = users
-    _users_cache_updated_at = datetime.now(timezone.utc)
-
-
-async def refresh_users_cache(session: Optional[aiohttp.ClientSession] = None) -> List[Dict[str, Any]]:
-    """Fetches the current Users.json via the Contents API and stores it as
-    the cache.
-
-    Raises GitHubAPIError on failure -- the cache is left untouched
-    (stale-but-known beats throwing it away), so callers should catch and
-    log rather than let this take down the polling loop."""
-    users, _sha = await fetch_users_with_sha(session)
-    set_users_cache(users)
-    return users
-
-
-# The actual `@tasks.loop` object lives in start.py (it needs the `bot`
-# instance to guard start()/before_loop against on_ready firing twice). That
-# module can't be imported from here, or from any command module, without
-# also re-running its top-level side effects (keep_alive(), constructing a
-# second Client, etc.) -- it's the entry point, not a library. So start.py
-# hands us a reference once the loop object exists, and anything that wants
-# to report "when does the cache refresh next" (e.g. /botstatus) reads it
-# back through here instead.
-_refresh_task = None
-
-
-def register_refresh_task(task) -> None:
-    """Called once from start.py with the refresh_users_cache_task loop
-    object, so next_cache_refresh() below has something to read."""
-    global _refresh_task
-    _refresh_task = task
-
-
-def next_cache_refresh() -> Optional[datetime]:
-    """When the background task is next scheduled to refresh the cache, or
-    None if the task hasn't been registered yet (shouldn't happen once the
-    bot is running) or isn't currently running (e.g. before the bot's first
-    on_ready)."""
-    if _refresh_task is None:
-        return None
-    return _refresh_task.next_iteration
-
-
-# --- Webhook-triggered refresh ---
-#
-# keep_alive.py's /github-webhook route runs inside Flask's own thread (via
-# app.run() in a Thread -- see keep_alive()), completely outside the bot's
-# asyncio event loop. It can't just `await refresh_users_cache()` directly
-# -- there's no running loop on that thread to await it on. Instead, once
-# the bot's real event loop exists (registered below via register_bot_loop,
-# called from Client.setup_hook in start.py), the webhook thread hands the
-# refresh off to it with asyncio.run_coroutine_threadsafe, which is the
-# supported way to schedule a coroutine onto a loop from another thread.
-_bot_loop: Optional[asyncio.AbstractEventLoop] = None
-
-
-def register_bot_loop(loop: asyncio.AbstractEventLoop) -> None:
-    """Called once from start.py (Client.setup_hook) with the bot's running
-    event loop, so trigger_cache_refresh_threadsafe() below has somewhere
-    to schedule onto."""
-    global _bot_loop
-    _bot_loop = loop
-
-
-async def _webhook_triggered_refresh() -> None:
-    """The coroutine actually scheduled by trigger_cache_refresh_threadsafe.
-    Mirrors refresh_users_cache_task's own error handling in start.py -- a
-    failed refresh just leaves the existing cache in place; the next push
-    (or the periodic fallback poll) will catch it."""
-    try:
-        await refresh_users_cache()
-        print("Users.json cache refreshed via GitHub webhook.")
-    except GitHubAPIError as e:
-        print(f"Failed to refresh Users.json cache from webhook: {e}")
-
-
-def trigger_cache_refresh_threadsafe() -> bool:
-    """Schedules a cache refresh onto the bot's event loop from any other
-    thread -- meant to be called from keep_alive.py's webhook route once
-    it's confirmed Users.json actually changed. Returns True once
-    scheduling succeeds (the refresh itself still happens asynchronously,
-    not before this returns), or False if the bot's loop hasn't been
-    registered yet (e.g. a webhook arrives in the brief window before
-    setup_hook runs) -- callers should treat False as "the periodic
-    fallback poll will pick this up instead", not as an error."""
-    if _bot_loop is None:
-        return False
-    asyncio.run_coroutine_threadsafe(_webhook_triggered_refresh(), _bot_loop)
-    return True
-
-
-# =========================================================================
-# Rate limit status (shared by /ratelimits)
-# =========================================================================
-
-RATE_LIMIT_URL = "https://api.github.com/rate_limit"
-
-
-async def fetch_rate_limit(session: Optional[aiohttp.ClientSession] = None) -> Dict[str, Any]:
-    """
-    Fetches the full GitHub Rate Limit API response for the configured PAT
-    (config.GITHUB_TOKEN) -- every resource category this token has a quota
-    for (core, search, graphql, etc), each with its own limit/used/
-    remaining/reset. Hitting this endpoint is explicitly free per GitHub's
-    docs (it doesn't count against any of the limits it reports), so it's
-    always safe to call on demand from a live command.
-    """
-    sess, should_close = await _get_session(session)
-    try:
-        async with sess.get(RATE_LIMIT_URL, headers=config.HEADERS) as resp:
-            if resp.status != 200:
-                raise GitHubAPIError(f"Failed to fetch rate limit status (HTTP {resp.status})", resp.status)
-            return await resp.json()
-    finally:
-        if should_close:
-            await sess.close()
-
-
-# =========================================================================
 # Commit-history helpers (shared by /commithistory and /fetchcommit)
 # =========================================================================
 
@@ -365,108 +194,6 @@ async def get_commit(sha: str, session: Optional[aiohttp.ClientSession] = None) 
     finally:
         if should_close:
             await sess.close()
-
-
-# =========================================================================
-# Permitted keys (permittedKeys.txt)
-# =========================================================================
-
-class PermittedKey(str):
-    """String-compatible pending license key with optional game restrictions.
-
-    Existing callers can still compare/use it exactly like a normal string;
-    the metadata survives a fetch/commit round-trip through `key.serialize()`.
-    """
-    def __new__(cls, key: str, games: Optional[List[str]] = None):
-        obj = str.__new__(cls, key)
-        obj.games = list(games or ["*"])
-        return obj
-
-    def serialize(self) -> str:
-        if not self.games or "*" in self.games:
-            return str(self)
-        return f"{self}|{','.join(self.games)}"
-
-
-def parse_permitted_key_line(line: str) -> PermittedKey:
-    parts = [part.strip() for part in line.split("|", 1)]
-    key = parts[0]
-    games = ["*"]
-    if len(parts) == 2 and parts[1]:
-        games = [x.strip() for x in parts[1].split(",") if x.strip()] or ["*"]
-    return PermittedKey(key, games)
-
-
-async def fetch_permitted_keys_with_sha(session: Optional[aiohttp.ClientSession] = None) -> Tuple[List[str], str]:
-    """
-    Fetches permittedKeys.txt + its sha via the Contents API, parsed into a
-    list of keys.
-    """
-    sess, should_close = await _get_session(session)
-    try:
-        async with sess.get(config.PERMITTED_KEYS_API_URL, headers=config.HEADERS) as resp:
-            if resp.status != 200:
-                raise GitHubAPIError(f"Failed to fetch permittedKeys.txt metadata (HTTP {resp.status})", resp.status)
-            data = await resp.json()
-    finally:
-        if should_close:
-            await sess.close()
-
-    sha = data["sha"]
-    text = base64.b64decode(data["content"]).decode("utf-8")
-    keys = [parse_permitted_key_line(line.strip()) for line in text.splitlines() if line.strip()]
-    return keys, sha
-
-
-async def commit_permitted_keys(keys: List[str], sha: str, message: str, session: Optional[aiohttp.ClientSession] = None) -> Dict[str, Any]:
-    """Serializes `keys` back to permittedKeys.txt (one per line) and commits it."""
-    content_str = "\n".join(k.serialize() if isinstance(k, PermittedKey) else str(k) for k in keys) + ("\n" if keys else "")
-    sess, should_close = await _get_session(session)
-    try:
-        payload = {
-            "message": message,
-            "content": base64.b64encode(content_str.encode()).decode("utf-8"),
-            "branch": config.STORAGE_BRANCH,
-            "sha": sha,
-        }
-        async with sess.put(config.PERMITTED_KEYS_API_URL, headers=config.HEADERS, json=payload) as resp:
-            if resp.status != 200:
-                err = await resp.text()
-                raise GitHubAPIError(f"Failed to commit permittedKeys.txt changes (HTTP {resp.status}): {err}", resp.status)
-            return await resp.json()
-    finally:
-        if should_close:
-            await sess.close()
-
-
-def remove_permitted_key(permitted_keys: List[str], key: str) -> List[str]:
-    """Returns a new list with every exact match of `key` removed, ready to hand to commit_permitted_keys()."""
-    return [k for k in permitted_keys if k != key]
-
-
-def remove_permitted_keys(permitted_keys: List[str], keys_to_remove: List[str]) -> Tuple[List[str], List[str]]:
-    """
-    Returns (remaining_keys, actually_removed) after removing every exact
-    match of anything in `keys_to_remove` from `permitted_keys`. Used by
-    /key clear's explicit-list mode; `actually_removed` only contains keys
-    that were actually present, so the caller can report any requested key
-    that wasn't found.
-    """
-    to_remove = set(keys_to_remove)
-    remaining = [k for k in permitted_keys if k not in to_remove]
-    actually_removed = [k for k in permitted_keys if k in to_remove]
-    return remaining, actually_removed
-
-
-def remove_first_n_permitted_keys(permitted_keys: List[str], n: int) -> Tuple[List[str], List[str]]:
-    """
-    Returns (remaining_keys, removed_keys) after removing the first `n`
-    entries from `permitted_keys` (file order). Used by /key clear's amount
-    mode. `n` is clamped to len(permitted_keys) -- clearing more than exist
-    just clears all of them.
-    """
-    n = min(max(n, 0), len(permitted_keys))
-    return permitted_keys[n:], permitted_keys[:n]
 
 
 # =========================================================================
@@ -583,8 +310,8 @@ def validate_stored_script(script_text: str) -> Optional[str]:
 #
 # Durable checkpoint for everything that used to live only in process
 # memory -- temp ban unban timers, server lockdown / per-channel lock
-# snapshots+timers, temp Bot Access grants, pending HWID-breach alert
-# buttons, the reaction-role panel message pointer, temp role auto-removal
+# snapshots+timers, temp Bot Access grants, the reaction-role panel message
+# pointer, temp role auto-removal
 # timers, ghost ping detection mode, the autorole toggle+role, the
 # /togglealerts whitelist/moderation mute switches, and the /toggledms
 # switch. Also home to /warnings' warning records -- those carry no timer,
@@ -624,7 +351,6 @@ DEFAULT_BOTSTATE: Dict[str, Any] = {
     "autorole": {"enabled": False, "role_id": None},
     "alerts_enabled": {"whitelist": True, "moderation": True},
     "dms_enabled": True,
-    "hwid_reset_cooldowns": {},
     "warnings": [],
     # /warnings config's auto-action preferences -- see commands/warnings.py's
     # DEFAULT_WARNING_CONFIG for the authoritative copy of these defaults and

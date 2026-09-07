@@ -7,7 +7,6 @@ python-dotenv -- so nothing here is hardcoded.
 
 import os
 import json
-from datetime import timedelta
 from zoneinfo import ZoneInfo
 
 from dotenv import load_dotenv
@@ -93,14 +92,13 @@ PASTEBIN_API_USER_KEY = os.getenv("PASTEBIN_API_USER_KEY")
 # Discord IDs
 GUILD_ID = _require_int("GUILD_ID")
 REQUIRED_ROLE_ID = _require_int("REQUIRED_ROLE_ID")
-REGISTRATION_CHANNEL_ID = _require_int("REGISTRATION_CHANNEL_ID")
 REACTION_ROLE_CHANNEL_ID = _require_int("REACTION_ROLE_CHANNEL_ID")
 PANEL_CHANNEL_ID = _require_int("PANEL_CHANNEL_ID")
 # Role granted by the control panel's "Get Role" button to whitelisted users.
 BUYER_ROLE_ID = _require_int("BUYER_ROLE_ID")
 # Staff-only channel that receives an alert for every meaningful whitelist/
-# key/HWID/access change across the bot -- whitelisting, unwhitelisting,
-# bulk operations, edits, HWID resets, key generation/clearing, temp
+# key/access change across the bot -- whitelisting, unwhitelisting,
+# bulk operations, edits, key generation/clearing, temporary licenses,
 # whitelists, database rollbacks/uploads, and Bot Access role changes -- on
 # top of the control panel's self-service "Key Redeemed" and "Potential
 # Breach" alerts. One shared channel so staff can watch everything that
@@ -116,12 +114,13 @@ ALERTS_CHANNEL_ID = _require_int("REDEEM_ALERTS_CHANNEL_ID")
 # muted independently via /togglealerts whitelist|moderation.
 MODERATION_ALERTS_CHANNEL_ID = _require_int("MODERATION_ALERTS_CHANNEL_ID")
 
-# Timezone-local timestamps such as Activated/LastHwidReset are displayed/stored in (handles EST/EDT automatically)
+# Timezone-local timestamps such as Activated are displayed in the configured local timezone.
 LOCAL_TZ = ZoneInfo("America/New_York")
 
-# How long a whitelisted user must wait between self-service HWID resets via
-# the control panel's "Reset HWID" button.
-RESET_HWID_COOLDOWN = timedelta(weeks=1)
+# Persistent cooldown applied whenever the control-panel Reset HWID button is used.
+from datetime import timedelta
+RESET_HWID_COOLDOWN = timedelta(days=7)
+
 
 # GitHub repo the whitelist database (Users.json) lives in
 OWNER = _require("GITHUB_OWNER")
@@ -132,17 +131,12 @@ BRANCH = os.getenv("GITHUB_BRANCH", "main")
 RAW_URL = f"https://raw.githubusercontent.com/{OWNER}/{REPO}/refs/heads/{BRANCH}/{FILE_PATH}"
 API_URL = f"https://api.github.com/repos/{OWNER}/{REPO}/contents/{FILE_PATH}?ref={BRANCH}"
 
-# GitHub repo permittedKeys.txt / storedscript.lua / BotState.json / shortened URLs live in
-# this bot's own repo. Protected game scripts are stored separately in Supabase Storage.
-STORAGE_REPO = os.getenv("GITHUB_STORAGE_REPO", "Discord-Bot")
+# Separate GitHub repository used for non-license bot storage such as
+# storedscript.lua, BotState.json, and shortened-urls.json.
+STORAGE_REPO = _require("GITHUB_STORAGE_REPO")
 STORAGE_BRANCH = os.getenv("GITHUB_STORAGE_BRANCH", "main")
 
-# permittedKeys.txt -- one key per line, checked (read-only) by /createpanel's
-# "Redeem Key" flow.
-PERMITTED_KEYS_FILE_PATH = "storage/permittedKeys.txt"
-PERMITTED_KEYS_RAW_URL = f"https://raw.githubusercontent.com/{OWNER}/{STORAGE_REPO}/refs/heads/{STORAGE_BRANCH}/{PERMITTED_KEYS_FILE_PATH}"
-PERMITTED_KEYS_API_URL = f"https://api.github.com/repos/{OWNER}/{STORAGE_REPO}/contents/{PERMITTED_KEYS_FILE_PATH}?ref={STORAGE_BRANCH}"
-
+# GitHub-backed stored script used by the Discord control panel. Protected game scripts are stored in Supabase Storage.
 # storedscript.lua -- the base script /createpanel's "Get Script" button hands
 # out, with each user's Key spliced into its getgenv().script_key line.
 # /updatescript writes this back via commit_stored_script().
@@ -152,15 +146,15 @@ STORED_SCRIPT_API_URL = f"https://api.github.com/repos/{OWNER}/{STORAGE_REPO}/co
 
 # storage/BotState.json -- durable checkpoint for everything that used to
 # live only in process memory: temp ban unban timers, server lockdown/
-# per-channel lock snapshots+timers, temp Bot Access grants, pending HWID-
-# breach alert buttons, the reaction-role panel message pointer, temp role
+# per-channel lock snapshots+timers, temp Bot Access grants, the reaction-role
+# panel message pointer, temp role
 # auto-removal timers, ghost ping detection mode, the autorole toggle+role,
 # the /togglealerts whitelist/moderation mute switches, and /warnings'
 # warning records. Read back on
 # every startup (see each cog's reconcile_*() function, called from
 # start.py's on_ready) so a restart degrades to "resume where it left off"
 # instead of "silently forget this was ever temporary." Lives in this bot's
-# own storage repo, same as permittedKeys.txt/storedscript.lua above.
+# own storage repo, same as storedscript.lua above.
 BOTSTATE_FILE_PATH = "storage/BotState.json"
 BOTSTATE_RAW_URL = f"https://raw.githubusercontent.com/{OWNER}/{STORAGE_REPO}/refs/heads/{STORAGE_BRANCH}/{BOTSTATE_FILE_PATH}"
 BOTSTATE_API_URL = f"https://api.github.com/repos/{OWNER}/{STORAGE_REPO}/contents/{BOTSTATE_FILE_PATH}?ref={STORAGE_BRANCH}"
@@ -170,7 +164,7 @@ BOTSTATE_API_URL = f"https://api.github.com/repos/{OWNER}/{STORAGE_REPO}/content
 # shared across every provider (namespaced per-provider inside, e.g.
 # "ez_host") rather than one file per provider. See api/github.py's
 # "Shortened URLs" section for the schema. Lives in this bot's own
-# storage repo, same as BotState.json/permittedKeys.txt/storedscript.lua
+# storage repo, same as BotState.json/storedscript.lua
 # above.
 SHORTENED_URLS_FILE_PATH = "storage/shortened-urls.json"
 SHORTENED_URLS_RAW_URL = f"https://raw.githubusercontent.com/{OWNER}/{STORAGE_REPO}/refs/heads/{STORAGE_BRANCH}/{SHORTENED_URLS_FILE_PATH}"
@@ -181,50 +175,11 @@ HEADERS = {
     "Accept": "application/vnd.github+json",
 }
 
-# Shared secret for keep_alive.py's /github-webhook route -- must match the
-# "Secret" configured on the GitHub push webhook (repo Settings > Webhooks)
-# so incoming requests can be verified as actually coming from GitHub (via
-# the X-Hub-Signature-256 header) rather than anyone who finds the URL.
-# Optional: if unset, the webhook route refuses all requests (fails closed)
-# rather than accepting unverifiable ones, and the bot falls back to the
-# periodic poll in start.py alone.
-GITHUB_WEBHOOK_SECRET = os.getenv("GITHUB_WEBHOOK_SECRET")
 
 # Public license-service settings. The client only needs the public endpoint;
-# no server secret is ever shipped to users. Each PlaceId maps to a protected
-# object path inside the private Supabase Storage bucket. The mapping lives in
-# a separate local JSON file so it does not have to be stored in .env.
+# no server secret is ever shipped to users. Game/script mappings are stored in
+# the Supabase `games` table and protected scripts live in Supabase Storage.
 LICENSE_SERVER_ENABLED = os.getenv("LICENSE_SERVER_ENABLED", "true").strip().lower() not in ("false", "0", "no", "off")
-
-LICENSE_GAME_SCRIPTS_FILE = os.getenv(
-    "LICENSE_GAME_SCRIPTS_FILE",
-    os.path.join(os.path.dirname(os.path.dirname(os.path.dirname(os.path.abspath(__file__)))), "storage", "license_game_scripts.json"),
-)
-
-def _load_license_game_scripts() -> dict:
-    path = LICENSE_GAME_SCRIPTS_FILE
-    try:
-        with open(path, "r", encoding="utf-8") as fp:
-            value = json.load(fp)
-    except FileNotFoundError as exc:
-        raise ValueError(
-            f"License game-script config was not found: {path}. Create the JSON file before starting the bot."
-        ) from exc
-    except json.JSONDecodeError as exc:
-        raise ValueError(f"License game-script config contains invalid JSON: {path}") from exc
-    except OSError as exc:
-        raise ValueError(f"Could not read license game-script config: {path}") from exc
-    if not isinstance(value, dict):
-        raise ValueError("License game-script config must be a JSON object mapping PlaceIds to Supabase Storage object paths")
-    normalized = {str(k): str(v) for k, v in value.items()}
-    for place_id, script_path in normalized.items():
-        if not place_id.isdigit() or not script_path.strip():
-            raise ValueError(
-                f"Invalid license game-script mapping {place_id!r}: PlaceIds must be numeric and paths must be non-empty"
-            )
-    return normalized
-
-LICENSE_GAME_SCRIPTS = _load_license_game_scripts()
 
 # Used by api/webhook_sync.py to figure out where this process is currently
 # reachable, so it can keep the GitHub webhook's Payload URL pointed at the

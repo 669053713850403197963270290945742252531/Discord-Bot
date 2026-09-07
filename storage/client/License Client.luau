@@ -29,6 +29,8 @@ local REASONS = {
     invalid_hwid_format = "Your device HWID could not be validated.",
     hwid_mismatch = "Unauthorized key sharing detected: this license key is bound to another device.",
     game_not_configured = "This game is not configured for Celestial licensing.",
+    game_not_supported = "This game is not currently supported by Celestial.",
+    game_disabled = "This game is currently disabled by Celestial.",
     game_not_authorized = "Your license is not authorized for this game.",
     game_script_not_configured = "The script for this game is not configured correctly.",
     game_script_unavailable = "The script for this game is temporarily unavailable.",
@@ -138,7 +140,8 @@ if not challengeResponse then
 end
 
 if challengeResponse.Success ~= true then
-    return reject("challenge_http")
+    local challengeErrorBody = decode(challengeResponse.Body or "")
+    return reject(challengeErrorBody and challengeErrorBody.reason or "challenge_http")
 end
 
 local challenge = decode(challengeResponse.Body or "")
@@ -163,6 +166,10 @@ end
 local decoded = decode(response.Body or "")
 if not decoded then
     return reject("bad_server_response")
+end
+
+if type(decoded.reason) == "string" and decoded.allowed ~= true then
+    return reject(decoded.reason)
 end
 
 if decoded.allowed ~= true then
@@ -213,8 +220,11 @@ if not completionResponse then
 end
 
 local completion = decode(completionResponse.Body or "")
-if not completion or completion.completed ~= true then
-    return reject(completion and completion.reason or "bad_server_response")
+if not completion then
+    return reject("bad_server_response")
+end
+if completion.ok ~= true or completion.completed ~= true then
+    return reject(completion.reason or "bad_server_response")
 end
 
 print("[Celestial] License authenticated successfully.")

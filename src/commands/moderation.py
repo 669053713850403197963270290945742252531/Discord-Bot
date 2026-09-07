@@ -132,7 +132,7 @@ async def _cancel_temp_ban_for(discord_id, guild_id) -> bool:
 # list purely so /checkban and /unban's autocomplete (like every Discord
 # autocomplete callback, answered well inside a ~3s window) has something
 # fast to search instead of a live guild.bans() call -- same reasoning as
-# Users.json's get_cached_users()/set_users_cache() in api/github.py and
+# the old Users.json cache and
 # warnings.py's _warnings_cache.
 #
 # Unlike Users.json/warnings though, a guild's actual ban list can change

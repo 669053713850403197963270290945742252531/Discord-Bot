@@ -1,7 +1,7 @@
 """
 Central logging for the staff alerts channels.
 
-Every command that changes the whitelist, keys, HWIDs, temp access, or the
+Every command that changes the whitelist, keys, temporary access, or the
 Bot Access role posts one compact embed to the (whitelist) Alerts channel via
 send_alert() -- so staff can watch everything happening across the bot from
 one place, the same way the control panel's "Key Redeemed" / "Potential
