@@ -50,7 +50,7 @@ GUILD = discord.Object(id=config.GUILD_ID)
 # so /warnings delete's autocomplete (which, like every Discord autocomplete
 # callback, has to answer well inside a ~3s window) has something fast to
 # read instead of a live GitHub API call -- same reasoning as Users.json's
-# get_cached_users()/set_users_cache() in api/github.py. update_botstate()
+# the old Users.json cache. update_botstate()
 # already hands back the committed state on every successful write, so
 # every add/clear/delete below refreshes this cache straight from that
 # return value -- no separate re-fetch needed, and no risk of it drifting
@@ -720,7 +720,7 @@ async def warning_autocomplete(interaction: discord.Interaction, current: str) -
     warnings, read from the in-memory cache above so the common case stays
     well inside Discord's ~3s autocomplete window -- same as
     whitelisted_user_autocomplete() in whitelist.py leaning on
-    get_cached_users() instead of a fresh fetch. Unlike that cache though,
+    the stored warnings snapshot instead of a fresh fetch. Unlike that cache though,
     an empty result here falls back to one live BotState.json fetch before
     concluding "no warnings" -- see the cache-miss handling below for why.
 

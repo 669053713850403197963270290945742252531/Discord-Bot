@@ -6,9 +6,10 @@ This used to be a single bot_api.py; it's split by concern so each file
 stays a manageable size:
 
     config.py          env-driven constants (Discord IDs, GitHub repo, secrets)
-    github.py          GitHub Contents API + Users.json cache, permitted keys, stored script
+    github.py          GitHub helpers for non-license assets
+    supabase_db.py     license/user database access
     supabase_storage.py private Supabase Storage access for protected game scripts
-    users.py           user-record lookups/building + buyer role revocation
+    users.py           Discord-facing user helpers + buyer role revocation
     keys.py            key generation + input validation
     time_utils.py       date formatting/parsing + temp-whitelist expiration
     hashing.py         /hash algorithm utilities
@@ -31,28 +32,20 @@ Everything below is re-exported here too, so cogs can do either
 from . import config
 from .config import (
     DISCORD_TOKEN, GITHUB_TOKEN, EZ_HOST_API_KEY,
-    GUILD_ID, REQUIRED_ROLE_ID, REGISTRATION_CHANNEL_ID, REACTION_ROLE_CHANNEL_ID,
+    GUILD_ID, REQUIRED_ROLE_ID, REACTION_ROLE_CHANNEL_ID,
     PANEL_CHANNEL_ID, BUYER_ROLE_ID, ALERTS_CHANNEL_ID,
-    LOCAL_TZ, RESET_HWID_COOLDOWN,
+    LOCAL_TZ,
     OWNER, REPO, FILE_PATH, BRANCH, RAW_URL, API_URL,
     STORAGE_REPO, STORAGE_BRANCH,
     SUPABASE_URL, SUPABASE_SECRET_KEY, SUPABASE_GAME_SCRIPTS_BUCKET,
-    PERMITTED_KEYS_FILE_PATH, STORED_SCRIPT_FILE_PATH,
+    STORED_SCRIPT_FILE_PATH,
     HEADERS,
 )
 
 from .github import (
     GitHubAPIError,
-    fetch_raw_text, fetch_api_file, get_current_sha,
-    fetch_users_with_sha, fetch_api_text_and_sha, commit_content, commit_users,
-    get_cached_users, cached_users_updated_at,
-    set_users_cache, refresh_users_cache,
-    register_refresh_task, next_cache_refresh,
-    register_bot_loop, trigger_cache_refresh_threadsafe,
+    fetch_raw_text,
     list_commits, get_commit,
-    fetch_rate_limit,
-    fetch_permitted_keys_with_sha, commit_permitted_keys,
-    remove_permitted_key, remove_permitted_keys, remove_first_n_permitted_keys,
     fetch_stored_script, fetch_stored_script_with_sha, commit_stored_script,
     inject_script_key, validate_stored_script,
     fetch_shortened_urls_with_sha, commit_shortened_urls, update_shortened_urls,
@@ -66,23 +59,28 @@ from .github import (
 from .providers.errors import ProviderAPIError
 from .providers.ez_host import EZHostAPIError
 
+from .supabase_db import (
+    fetch_users, fetch_users_with_sha, fetch_api_text_and_sha, commit_content, commit_users,
+    get_license_by_key, get_license_by_discord_id, get_license_by_identifier,
+    create_license, update_license, delete_license, redeem_license, set_license_games,
+    get_license_game_ids, list_games, get_game, game_allowed, complete_successful_execution,
+)
+
 from .supabase_storage import SupabaseStorageError, fetch_game_script
 
 from .users import (
-    find_user_by_discord_id, find_user_by_hwid, find_user_by_key,
+    find_user_by_discord_id, find_user_by_key,
     remove_user_by_discord_id, build_user_entry,
     revoke_buyer_role, find_removed_discord_ids,
 )
 
 from .keys import (
     generate_key, generate_unique_key, generate_unique_keys,
-    parse_key_length_range, is_valid_hwid, is_valid_discord_id, is_valid_url, is_valid_date,
+    parse_key_length_range, is_valid_discord_id, is_valid_url, is_valid_date,
 )
 
 from .time_utils import (
-    format_join_date, parse_join_date, format_discord_timestamp,
-    format_expiration_note, parse_expiration_note, is_notes_locked,
-    humanize_timeleft, hwid_reset_cooldown_remaining,
+    format_join_date, parse_join_date, format_discord_timestamp, humanize_timeleft,
 )
 
 from .hashing import get_available_hash_algorithms, hash_text, SHAKE_OUTPUT_BYTES
@@ -114,7 +112,6 @@ from .discord_helpers import (
     file_success_layout, status_layout,
 )
 
-from .webhook_sync import sync_webhook_url
 
 from .alerts import (
     send_alert, alert_embed,

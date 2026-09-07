@@ -1,18 +1,17 @@
 """Small Flask server with four jobs:
 
 1. `/` -- plain keep-alive endpoint.
-2. `/github-webhook` -- refreshes the Users.json cache after GitHub pushes.
 3. `/client` -- serves the public Potassium license loader. It contains no
    server secret and is safe to distribute in the normal two-line loader.
-4. `/whitelist/challenge` + `/whitelist/check` -- public license API. The
-   challenge is one-use/short-lived; the check validates key + HWID +
-   game, binds an empty HWID through the authenticated GitHub Contents API,
-   and returns the protected game payload only after authorization.
+3. `/whitelist/challenge` + `/whitelist/check` + `/whitelist/complete` -- public license API.
+   The challenge is one-use/short-lived; the check validates the license key
+   and game; the protected game payload is returned only after authorization;
+   completion records activation and increments the execution counter.
 
-There is intentionally no client-shared HMAC secret. A public Roblox script
-cannot keep a secret from the user executing it. HTTPS, one-use challenges,
-rate limits, server-side GitHub access, first-claim HWID binding, per-game
-license restrictions, and payload withholding are the security boundaries.
+There is intentionally no client-shared secret. A public Roblox script cannot
+keep a secret from the user executing it. HTTPS, one-use challenges, rate
+limits, server-side Supabase access, game restrictions, and payload withholding
+are the security boundaries.
 """
 
 import hashlib
@@ -95,65 +94,6 @@ if _license_server_enabled():
         )
         return Response(body, status=status, headers=headers)
 
-
-@app.route('/github-webhook', methods=['POST'])
-def github_webhook():
-    # Imported lazily, inside the request handler, rather than at module
-    # level -- keep_alive() is called in start.py before the heavier
-    # discord.py import chain specifically so this server's port is open
-    # as early as possible. Importing api.config/api.github at module load
-    # time would drag that whole chain in immediately (api/__init__.py
-    # pulls in discord_helpers.py, which imports discord). Deferring the
-    # import to request time costs nothing -- by the time a real webhook
-    # request can arrive, the rest of the bot has long since finished
-    # starting up anyway.
-    from api import config
-    from api.github import trigger_cache_refresh_threadsafe
-
-    if not config.GITHUB_WEBHOOK_SECRET:
-        # Fail closed: with no secret configured there's no way to verify
-        # a request actually came from GitHub, so refuse rather than let
-        # anyone who finds this URL trigger refreshes.
-        return jsonify({"error": "Webhook secret not configured"}), 503
-
-    signature = request.headers.get('X-Hub-Signature-256', '')
-    expected = 'sha256=' + hmac.new(
-        config.GITHUB_WEBHOOK_SECRET.encode(), request.data, hashlib.sha256
-    ).hexdigest()
-    if not hmac.compare_digest(signature, expected):
-        return jsonify({"error": "Invalid signature"}), 401
-
-    event = request.headers.get('X-GitHub-Event', '')
-    if event == 'ping':
-        # GitHub sends this once, when the webhook is first created, to
-        # confirm the endpoint is reachable -- no payload to act on.
-        return jsonify({"status": "pong"}), 200
-    if event != 'push':
-        return jsonify({"status": "ignored", "reason": f"unhandled event: {event}"}), 200
-
-    payload = request.get_json(silent=True) or {}
-
-    # Ignore pushes to any branch other than the one Users.json is actually
-    # read/written on -- a push to some feature branch shouldn't invalidate
-    # the live cache.
-    if payload.get('ref') != f'refs/heads/{config.BRANCH}':
-        return jsonify({"status": "ignored", "reason": "different branch"}), 200
-
-    touched = any(
-        config.FILE_PATH in (
-            commit.get('added', []) + commit.get('removed', []) + commit.get('modified', [])
-        )
-        for commit in payload.get('commits', [])
-    )
-    if not touched:
-        return jsonify({"status": "ignored", "reason": "Users.json not touched"}), 200
-
-    if trigger_cache_refresh_threadsafe():
-        return jsonify({"status": "refresh scheduled"}), 200
-
-    # The bot's event loop isn't registered yet (still starting up) -- the
-    # periodic fallback poll in start.py will pick this change up instead.
-    return jsonify({"status": "deferred", "reason": "bot still starting up"}), 202
 
 
 def run():

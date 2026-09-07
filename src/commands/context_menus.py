@@ -3,9 +3,9 @@ Context-menu ("right-click a user") commands: 15 total. None of these
 duplicate any logic -- each one either forwards straight to an existing
 slash command's _xxx_impl() (when the right-clicked user is the only input
 needed), or opens a small Modal to collect the extra option(s) that slash
-command takes (reason, duration, hwid, minutes, ...) and *then* forwards to
+command takes (reason, duration, minutes, ...) and *then* forwards to
 that same _xxx_impl(). That way validation, DMs, embeds, etc. all still
-live in exactly one place (moderation.py / whitelist.py / keys_hwid.py /
+live in exactly one place (moderation.py / whitelist.py / keys.py /
 access.py) and can't drift between the slash command and its context-menu
 twin.
 
@@ -30,10 +30,10 @@ from api import config
 from api.discord_helpers import has_role, is_in_guild, send_error, default_ui_error
 from commands.moderation import _ban_impl, _kick_impl, _mute_impl, _unmute_impl
 from commands.whitelist import (
-    WhitelistModal, _edituser_impl, _unwhitelist_impl, _fetchuser_impl, _clearnotes_impl,
+    WhitelistModal, _edituser_impl, _unwhitelist_impl, _fetchuser_impl,
 )
-from commands.keys_hwid import (
-    _checktemp_impl, _resethwidcooldown_impl, _tempwhitelist_impl,
+from commands.keys import (
+    _checktemp_impl, _tempwhitelist_impl,
 )
 from commands.access import _toggleaccess_impl, _tempaccess_impl
 
@@ -204,25 +204,6 @@ async def ctx_check_temp(interaction: discord.Interaction, target: discord.Membe
     await _checktemp_impl(interaction, target)
 
 
-# // Clear User Notes //
-
-@app_commands.context_menu(name="Clear User Notes")
-@app_commands.guilds(GUILD)
-@has_role(config.REQUIRED_ROLE_ID)
-@is_in_guild(config.GUILD_ID)
-async def ctx_clear_notes(interaction: discord.Interaction, target: discord.Member):
-    await _clearnotes_impl(interaction, target)
-
-
-# // Reset HWID Cooldown //
-
-@app_commands.context_menu(name="Reset HWID Cooldown")
-@app_commands.guilds(GUILD)
-@has_role(config.REQUIRED_ROLE_ID)
-@is_in_guild(config.GUILD_ID)
-async def ctx_reset_hwid_cooldown(interaction: discord.Interaction, target: discord.Member):
-    await _resethwidcooldown_impl(interaction, target)
-
 
 # // Toggle Bot Access //
 
@@ -265,12 +246,12 @@ async def ctx_temp_access(interaction: discord.Interaction, target: discord.Memb
 
 class TempWhitelistContextModal(Modal):
     def __init__(self, target: discord.Member):
-        super().__init__(title=f"Temp Whitelist: {target.display_name}"[:45])
+        super().__init__(title=f"Temp License: {target.display_name}"[:45])
         self.target = target
-        self.hwid = TextInput(label="HWID (SHA-256, 64 hex chars)", max_length=100, placeholder="64-character hex string")
         self.minutes = TextInput(label="Duration in minutes", max_length=10, placeholder="e.g. 60")
-        self.add_item(self.hwid)
+        self.games = TextInput(label="Games", max_length=500, placeholder="* or 123456789,5936782561", default="*")
         self.add_item(self.minutes)
+        self.add_item(self.games)
 
     async def on_error(self, interaction: discord.Interaction, error: Exception) -> None:
         await default_ui_error(interaction, error, label="TempWhitelistContextModal")
@@ -279,7 +260,7 @@ class TempWhitelistContextModal(Modal):
         raw = self.minutes.value.strip()
         if not raw.isdigit() or int(raw) <= 0:
             return await send_error(interaction, "Duration must be a positive whole number of minutes.")
-        await _tempwhitelist_impl(interaction, self.target, self.hwid.value.strip(), int(raw))
+        await _tempwhitelist_impl(interaction, self.target, int(raw), self.games.value.strip() or "*")
 
 
 @app_commands.context_menu(name="Temp Whitelist User")
@@ -294,8 +275,7 @@ async def ctx_temp_whitelist(interaction: discord.Interaction, target: discord.M
 _CONTEXT_MENUS = (
     ctx_ban_user, ctx_kick_user, ctx_mute_user, ctx_unmute_user,
     ctx_whitelist_user, ctx_edit_user, ctx_unwhitelist_user, ctx_fetch_user,
-    ctx_check_temp, ctx_clear_notes, ctx_reset_hwid_cooldown,
-    ctx_toggle_access, ctx_temp_access, ctx_temp_whitelist,
+    ctx_check_temp, ctx_toggle_access, ctx_temp_access, ctx_temp_whitelist,
 )
 
 

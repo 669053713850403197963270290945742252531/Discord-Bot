@@ -242,7 +242,7 @@ async def _tempaccess_impl(interaction: discord.Interaction, user: discord.Membe
 
 async def _togglealerts_whitelist_impl(interaction: discord.Interaction):
     """Flips api.alerts's whitelist-side mute switch (the Alerts channel --
-    whitelist/keys/HWID/temp access/Bot Access role changes). The toggle
+    whitelist/key/temporary-access/Bot Access role changes). The toggle
     itself always posts to the Alerts channel (bypass_mute=True) even when
     turning alerts *off*, so there's a visible record of exactly when/why
     the channel went quiet instead of it just stopping with no trace.
@@ -369,7 +369,7 @@ class Access(commands.Cog):
         )
     )
 
-    @togglealerts_group.command(name="whitelist", description="Toggles whether alert embeds post to the staff Alerts channel (whitelist/keys/HWID/access changes).")
+    @togglealerts_group.command(name="whitelist", description="Toggles whether alert embeds post to the staff Alerts channel (whitelist/key/access changes).")
     @has_role(config.REQUIRED_ROLE_ID)
     @is_in_guild(config.GUILD_ID)
     async def togglealerts_whitelist(self, interaction: discord.Interaction):

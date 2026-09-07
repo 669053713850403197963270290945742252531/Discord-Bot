@@ -47,16 +47,15 @@ from discord import app_commands
 from discord.app_commands import errors as app_errors
 
 from api import config
-from api.github import GitHubAPIError, refresh_users_cache, register_refresh_task, register_bot_loop, fetch_botstate_with_sha, get_cached_users
-from api.webhook_sync import sync_webhook_url
+from api.github import GitHubAPIError, fetch_botstate_with_sha
 from api.discord_helpers import send_error, notify_permission_error, reconcile_dms_enabled
 from api.alerts import reconcile_alerts_enabled
-from commands.panel import ControlPanelView, HWIDBreachButton
+from commands.panel import ControlPanelView
 from commands.moderation import (
     reconcile_temp_bans, reconcile_channel_locks, reconcile_lockdown,
     reconcile_temp_roles, reconcile_ghostping_mode, reconcile_banned_users_cache,
 )
-from commands.keys_hwid import reconcile_temp_whitelists
+from commands.keys import reconcile_temp_whitelists
 from commands.access import reconcile_temp_access
 from commands.reaction_roles import reconcile_reaction_role_panel
 from commands.autorole import reconcile_autorole
@@ -78,7 +77,7 @@ EXTENSIONS = (
     "commands.moderation",
     "commands.afk",
     "commands.whitelist",
-    "commands.keys_hwid",
+    "commands.keys",
     "commands.database",
     "commands.panel",
     "commands.access",
@@ -99,15 +98,6 @@ _botstate_reconciled = False
 
 class Client(commands.Bot):
     async def setup_hook(self):
-        # First thing, before anything else here: hand api.github the now-
-        # running event loop so keep_alive.py's /github-webhook route (which
-        # runs in its own Flask thread, outside this loop) can schedule
-        # refresh_users_cache() calls onto it via
-        # trigger_cache_refresh_threadsafe(). Doing this before extensions
-        # load keeps the startup window where an early webhook would find no
-        # loop registered as small as possible.
-        register_bot_loop(asyncio.get_running_loop())
-
         # discord.py's own run() already turns Ctrl+C (SIGINT) into a
         # graceful close() -- see the `async with self:` in its run(), whose
         # __aexit__ calls close() as KeyboardInterrupt unwinds the runner.
@@ -130,26 +120,6 @@ class Client(commands.Bot):
             )
         except NotImplementedError:
             pass
-
-        # Registers HWIDBreachButton's regex-templated custom_id
-        # (`breach_unwhitelist_ban:<alert_id>`) so Discord keeps routing
-        # clicks on a "Potential Breach" alert's "Unwhitelist & Ban Both"
-        # button back to it after a restart -- same purpose as
-        # self.add_view(ControlPanelView()) below, but via
-        # add_dynamic_items() since each alert carries its own per-alert
-        # data rather than sharing one fixed custom_id. Only needs to
-        # happen once per process (not per alert): HWIDBreachButton.
-        # from_custom_id() looks up which alert it is, and its data, from
-        # BotState.json at dispatch time -- see that class's docstring in
-        # commands/panel.py.
-        self.add_dynamic_items(HWIDBreachButton)
-
-        # Fire-and-forget: points the GitHub webhook's Payload URL at
-        # wherever this process is reachable right now (Render's own URL,
-        # or the local ngrok tunnel) -- see api/webhook_sync.py. Backgrounded
-        # rather than awaited so a slow/unreachable GitHub API or ngrok
-        # can't delay the rest of startup; it logs its own outcome.
-        asyncio.create_task(sync_webhook_url())
 
         def _count_leaf_commands(group):
             """Recursively counts leaf (directly-invokable) commands nested
@@ -199,6 +169,17 @@ class Client(commands.Bot):
 
         for extension in EXTENSIONS:
             before_commands, before_groups, before_subcommands = _split_top_level(self.tree.get_commands(guild=guild_obj))
+            # Every command/group in this bot is meant to be guild-scoped
+            # (see the sync comment below) -- a command or group missing its
+            # own @app_commands.guilds(GUILD), or a Group missing the
+            # app_commands.guilds(GUILD)(...) wrapper described in
+            # ciphers.py, lands in the *global* namespace instead. That's
+            # invisible in the guild-scoped counts above/below, so it was
+            # slipping through as a silent count mismatch (e.g. keys.py's
+            # /key group) instead of naming the culprit. Snapshot global
+            # top-level names before/after this extension loads so any new
+            # one can be called out immediately, by name, right here.
+            before_global_names = {c.name for c in self.tree.get_commands(guild=None)}
             before_cogs = set(self.cogs)
             print(f"Loading extension: {extension}")
             try:
@@ -208,6 +189,17 @@ class Client(commands.Bot):
                 traceback.print_exc()
                 continue
             loaded_extensions += 1
+            after_global_names = {c.name for c in self.tree.get_commands(guild=None)}
+            new_global_names = after_global_names - before_global_names
+            if new_global_names:
+                print(
+                    f"ERROR: {extension} registered {sorted(new_global_names)} "
+                    f"GLOBALLY instead of to guild {config.GUILD_ID} -- missing "
+                    f"@app_commands.guilds(GUILD), or (for a Group) missing the "
+                    f"app_commands.guilds(GUILD)(...) wrapper. This bot has no "
+                    f"global commands by design; the purge below will remove "
+                    f"these from Discord, but the source needs fixing too."
+                )
             after_commands, after_groups, after_subcommands = _split_top_level(self.tree.get_commands(guild=guild_obj))
             added_commands = after_commands - before_commands
             added_groups = after_groups - before_groups
@@ -270,6 +262,32 @@ class Client(commands.Bot):
                 segments.append("no commands registered")
             print(f"Loaded extension:  {extension} ({', '.join(segments)})")
 
+        # All application commands are guild-scoped for this bot.
+        # Synchronize only the configured guild so the command signatures
+        # used by Discord exactly match the definitions loaded above.
+        try:
+            synced_guild = await self.tree.sync(guild=guild_obj)
+            print(f"Synced {len(synced_guild)} guild commands to {config.GUILD_ID}.")
+        except Exception as e:
+            print(f"Error syncing guild commands: {e}")
+
+        # Enforce the "no global commands, ever" design invariant every boot,
+        # rather than relying on every extension author remembering the
+        # @app_commands.guilds(...) decorator. If the ERROR check above (or
+        # any future slip like it) let a command register globally, this
+        # clears the local tree's global command list and syncs that empty
+        # list to Discord -- which deletes any global commands Discord has on
+        # record for this application, including ones left behind by an
+        # older version of the bot (e.g. from a bare tree.sync() call that no
+        # longer exists in this file). Cheap and idempotent when there's
+        # nothing to clear, so it's safe to run unconditionally on every
+        # startup rather than as a one-off manual step.
+        try:
+            self.tree.clear_commands(guild=None)
+            await self.tree.sync()
+        except Exception as e:
+            print(f"Error purging global commands: {e}")
+
         registered_commands, registered_groups, registered_subcommands = _split_top_level(self.tree.get_commands(guild=guild_obj))
         print(
             f"All {loaded_extensions}/{total_extensions} extensions loaded, "
@@ -322,8 +340,6 @@ class Client(commands.Bot):
         """
         if rotate_presence_task.is_running():
             rotate_presence_task.cancel()
-        if refresh_users_cache_task.is_running():
-            refresh_users_cache_task.cancel()
 
         if not self.is_closed():
             try:
@@ -354,10 +370,6 @@ class Client(commands.Bot):
         # don't otherwise survive a process restart.
         self.add_view(ControlPanelView())
 
-        # Guarded with is_running() since on_ready can fire again on
-        # reconnect, and tasks.loop.start() raises if it's already going.
-        if not refresh_users_cache_task.is_running():
-            refresh_users_cache_task.start()
 
         # Reads storage/BotState.json back and reschedules every timer/
         # pointer that only ever lived in process memory before -- temp
@@ -371,24 +383,11 @@ class Client(commands.Bot):
         # restart mid-timer either makes a "temp" action silently
         # permanent, or silently stops a mechanism that was already
         # correctly persisted elsewhere. Guarded the same way as
-        # refresh_users_cache_task above -- on_ready can fire again on
-        # reconnect, and this should only ever run once per process.
+        # startup reconciliation above should only ever run once per process.
         global _botstate_reconciled
         if not _botstate_reconciled:
             _botstate_reconciled = True
 
-            # Fetched once here and handed to every BotState.json-reading
-            # reconcile_*() below, rather than each of them independently
-            # re-fetching the exact same file -- reconciliation never
-            # writes anything, so nothing changes it in between those
-            # calls, and five separate GitHub round trips for one
-            # unchanged file just adds latency to every startup for
-            # nothing. reconcile_temp_whitelists() reads Users.json
-            # instead, so it's unaffected and keeps fetching for itself.
-            # Falls back to None (each reconcile_*() then fetches for
-            # itself, same as before this optimization) if this fetch
-            # fails, so one transient GitHub error here doesn't skip
-            # reconciliation outright.
             try:
                 botstate, _sha = await fetch_botstate_with_sha()
             except GitHubAPIError as e:
@@ -410,47 +409,33 @@ class Client(commands.Bot):
             await reconcile_warnings_cache(self, botstate)
             await reconcile_warning_config(self, botstate)
 
-        try:
-            guild_obj = discord.Object(id=config.GUILD_ID)
-            synced = await self.tree.sync(guild=guild_obj)
-            print(f"Synced {len(synced)} commands to guild.")
-        except Exception as e:
-            print(f"Error syncing commands: {e}")
+
 
 
 bot = Client(command_prefix="!", intents=intents)
 
 # --- Rotating status ---
-#
-# Cycles the bot's presence through a handful of activities built from data
-# that's already sitting in memory -- get_cached_users() (kept warm by the
-# cache task right below this) and the gateway-cached Guild object -- so
-# none of this costs an extra GitHub or Discord API call beyond the
-# presence update itself. Falls back to skipping a slot if the data it
-# needs isn't populated yet (e.g. get_cached_users() before the very first
-# refresh_users_cache() call in setup_hook has landed) rather than showing
-# "None whitelisted users".
-_PRESENCE_ROTATION_INTERVAL = 30  # seconds
+_PRESENCE_ROTATION_INTERVAL = 30
 _presence_index = 0
 
 
 def _build_presence_activities(guild_obj: discord.Object) -> list:
     guild = bot.get_guild(config.GUILD_ID)
     member_count = guild.member_count if guild else None
-    cached_users = get_cached_users()
-    whitelisted_count = len(cached_users) if cached_users is not None else None
     command_count = len(bot.tree.get_commands(guild=guild_obj))
 
     activities = []
-    if whitelisted_count is not None:
-        label = "user" if whitelisted_count == 1 else "users"
-        activities.append(discord.Activity(type=discord.ActivityType.watching, name=f"{whitelisted_count} whitelisted {label}"))
+    try:
+        # The presence task is deliberately lightweight; the license count is
+        # fetched from Supabase each rotation rather than maintained in an
+        # in-memory user cache.
+        activities.append(discord.Activity(type=discord.ActivityType.watching, name="the whitelist"))
+    except Exception:
+        pass
     if member_count is not None:
         label = "member" if member_count == 1 else "members"
         activities.append(discord.Activity(type=discord.ActivityType.watching, name=f"over {member_count} {label}"))
-    activities.append(discord.Activity(type=discord.ActivityType.watching, name="for HWID breaches"))
     activities.append(discord.Activity(type=discord.ActivityType.listening, name=f"{command_count} slash commands"))
-    activities.append(discord.Activity(type=discord.ActivityType.watching, name="the whitelist"))
     return activities
 
 
@@ -468,54 +453,6 @@ async def rotate_presence_task():
 @rotate_presence_task.before_loop
 async def before_rotate_presence_task():
     await bot.wait_until_ready()
-
-
-# --- Users.json cache refresh task ---
-#
-# Keeps api.github's in-memory Users.json cache warm so read-only whitelist/
-# cooldown pre-checks (e.g. the control panel's Reset HWID button) never
-# have to make a live network call on the interaction's critical path -- so
-# they can't time out or silently fail.
-#
-# commit_content() (used by every write path, including commit_users() for
-# redeem/edituser/reset hwid/etc.) already updates the cache immediately on
-# every write the bot makes itself. External changes -- someone editing
-# Users.json by hand on GitHub, or a /rollback -- are now caught the moment
-# they happen by keep_alive.py's /github-webhook route (see
-# trigger_cache_refresh_threadsafe() in api/github.py), so this loop is no
-# longer the primary way the cache learns about those. It's kept as a slow
-# fallback safety net for whatever the webhook can't be relied on for --
-# GitHub webhook delivery failures, this host being unreachable/restarting
-# when the push happened, the webhook not being configured at all, etc. --
-# so a missed webhook self-heals within a bounded time instead of leaving
-# the cache stale indefinitely. Because it's a safety net rather than the
-# main path, the interval is long (minutes, not seconds) -- there's no
-# lag/cost tradeoff to tune here the way there was before the webhook
-# existed.
-USERS_CACHE_REFRESH_INTERVAL = 15 * 60  # seconds -- fallback only; see above
-
-
-@tasks.loop(seconds=USERS_CACHE_REFRESH_INTERVAL)
-async def refresh_users_cache_task():
-    try:
-        await refresh_users_cache()
-    except GitHubAPIError as e:
-        # Leave the existing cache in place and just try again next tick --
-        # stale-but-known beats throwing away the last good copy.
-        print(f"Failed to refresh Users.json cache: {e}")
-
-
-@refresh_users_cache_task.before_loop
-async def before_refresh_users_cache_task():
-    await bot.wait_until_ready()
-
-
-# Hand api.github a reference to the loop object itself (not a copy of its
-# schedule) so next_cache_refresh() always reflects its live state --
-# registering here, right after the loop is defined, is enough even though
-# .start() doesn't happen until on_ready, since next_iteration is read
-# lazily each time next_cache_refresh() is called.
-register_refresh_task(refresh_users_cache_task)
 
 
 # --- Error Handlers ---
