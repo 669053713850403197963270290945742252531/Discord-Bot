@@ -68,7 +68,68 @@ def public_license_client():
     except OSError:
         return "-- license client unavailable", 503, {"Content-Type": "text/plain; charset=utf-8"}
     source = source.replace("__LICENSE_API_BASE__", base_url)
-    return Response(source, status=200, mimetype="text/plain", headers={"Cache-Control": "no-store"})
+
+    # `/client` must remain usable by the executor's HTTP client, but opening
+    # the endpoint in a normal browser should never expose the license client
+    # source. Browsers advertise HTML navigation through headers such as
+    # `Accept: text/html`, `Sec-Fetch-*`, and/or `Upgrade-Insecure-Requests`.
+    # For those requests, serve a source-safe page that contains only the two
+    # public loader lines. The actual Luau source is returned only to requests
+    # that do not look like browser navigation.
+    accept = request.headers.get("Accept", "").lower()
+    sec_fetch_mode = request.headers.get("Sec-Fetch-Mode", "").lower()
+    sec_fetch_dest = request.headers.get("Sec-Fetch-Dest", "").lower()
+    browser_navigation = (
+        "text/html" in accept
+        or sec_fetch_mode == "navigate"
+        or sec_fetch_dest == "document"
+        or "Upgrade-Insecure-Requests" in request.headers
+    )
+
+    if browser_navigation:
+        import html
+
+        loader_source = (
+            'getgenv().script_key = "YOUR-LICENSE-KEY"\n'
+            f'loadstring(game:HttpGet("{base_url}/client"))()'
+        )
+        escaped_loader = html.escape(loader_source)
+        page = f"""<!doctype html>
+<html lang=\"en\">
+<head>
+<meta charset=\"utf-8\">
+<meta name=\"viewport\" content=\"width=device-width,initial-scale=1\">
+<title>Celestial</title>
+<meta http-equiv=\"Content-Security-Policy\" content=\"default-src 'none'; style-src 'unsafe-inline'\">
+<style>
+body {{ margin: 0; background: #fff; color: #111; font-family: Consolas, monospace; }}
+pre {{ margin: 24px; white-space: pre-wrap; }}
+</style>
+</head>
+<body><pre>{escaped_loader}</pre></body>
+</html>"""
+        return Response(
+            page,
+            status=200,
+            mimetype="text/html",
+            headers={
+                "Cache-Control": "no-store, no-cache, must-revalidate, max-age=0",
+                "Pragma": "no-cache",
+                "X-Content-Type-Options": "nosniff",
+                "Content-Security-Policy": "default-src 'none'; style-src 'unsafe-inline'",
+            },
+        )
+
+    return Response(
+        source,
+        status=200,
+        mimetype="text/plain",
+        headers={
+            "Cache-Control": "no-store, no-cache, must-revalidate, max-age=0",
+            "Pragma": "no-cache",
+            "X-Content-Type-Options": "nosniff",
+        },
+    )
 
 
 if _license_server_enabled():
