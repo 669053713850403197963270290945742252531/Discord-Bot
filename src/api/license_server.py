@@ -11,6 +11,8 @@ import re
 import secrets
 import threading
 import time
+import urllib.error
+import urllib.request
 from datetime import datetime, timezone
 from typing import Any, Dict, Tuple
 
@@ -112,7 +114,11 @@ def _consume_execution_token(token: str, identifier: str, hwid: str, game_id: st
         record = _execution_tokens.pop(token, None)
     if not record:
         return False
-    return record["identifier"] == identifier and record["game_id"] == game_id
+    return (
+        record["identifier"] == identifier
+        and record["hwid"] == hwid.lower()
+        and record["game_id"] == game_id
+    )
 
 
 def evaluate_and_load(key: str, hwid: str, game_id: str, remote: str) -> Dict[str, Any]:
@@ -188,14 +194,135 @@ def evaluate_and_load(key: str, hwid: str, game_id: str, remote: str) -> Dict[st
         print(f"[License] Unexpected game script fetch failure for {game_id}: {exc}")
         return {"allowed": False, "reason": "backend_unavailable"}
 
+    user_data = {
+        "Identifier": entry.get("Identifier"),
+        "DiscordId": entry.get("DiscordId"),
+        "Key": entry.get("Key"),
+        "Activated": entry.get("Activated"),
+        "Executions": int(entry.get("Executions") or 0),
+        "Rank": entry.get("Rank") or "User",
+        "Notes": entry.get("Notes"),
+        "Games": [str(x) for x in (entry.get("Games") or [])],
+        "ScriptName": str(game.get("name") or game.get("script_path") or game_id),
+        "GameId": game_id,
+        "Enabled": bool(entry.get("Enabled", True)),
+        "ExpiresAt": entry.get("ExpiresAt"),
+        "CreatedAt": entry.get("CreatedAt"),
+        "UpdatedAt": entry.get("UpdatedAt"),
+        "HWID": entry.get("HWID"),
+        "LastHwidReset": entry.get("LastHwidReset"),
+        "totalHwidResets": int(entry.get("totalHwidResets") or 0),
+    }
+
     return {
         "allowed": True,
         "reason": "ok",
         "identifier": entry["Identifier"],
         "game_id": game_id,
+        "user": user_data,
         "payload": base64.b64encode(payload.encode("utf-8") if isinstance(payload, str) else payload).decode("ascii"),
         "execution_token": _issue_execution_token(str(entry["Identifier"]), hwid, game_id),
     }
+
+
+def _safe_log_value(value: Any, fallback: str = "Unknown", max_length: int = 1024) -> str:
+    if value is None:
+        return fallback
+    text = str(value).strip()
+    if not text:
+        return fallback
+    return text[:max_length]
+
+
+def _send_execution_webhook(
+    entry: Dict[str, Any],
+    game: Dict[str, Any],
+    executions: int,
+    executor: Any,
+    job_id: Any,
+    device: Any,
+) -> None:
+    webhook_url = getattr(config, "LICENSE_EXECUTION_WEBHOOK_URL", "").strip()
+    enabled = bool(getattr(config, "LICENSE_EXECUTION_LOGGING_ENABLED", False))
+    if not enabled or not webhook_url:
+        return
+
+    identifier = _safe_log_value(entry.get("Identifier"))
+    discord_id = _safe_log_value(entry.get("DiscordId"), fallback="Unknown")
+    key = _safe_log_value(entry.get("Key"), fallback="Unknown")
+    database_hwid = _safe_log_value(entry.get("HWID"), fallback="Unset")
+    game_id = _safe_log_value(game.get("id") or game.get("game_id"), fallback="Unknown")
+    script_name = _safe_log_value(game.get("name") or game.get("script_path") or game_id)
+
+    executor_text = _safe_log_value(executor)
+    job_id_text = _safe_log_value(job_id)
+    device_text = _safe_log_value(device)
+
+    description = (
+        f"{identifier} has successfully executed the script `{executions}` "
+        f"time{'' if executions == 1 else 's'}"
+    )
+
+    embed = {
+        "title": "Script Execution",
+        "description": description,
+        "color": 0x00FF00,
+        "fields": [
+            {"name": "HWID", "value": f"``{database_hwid}``", "inline": True},
+            {"name": "Executor", "value": executor_text, "inline": True},
+            {"name": "Discord ID", "value": f"<@{discord_id}>" if discord_id != "Unknown" else "Unknown", "inline": True},
+            {"name": "Key", "value": f"||`{key}`||", "inline": True},
+            {"name": "Job ID", "value": f"``{job_id_text}``", "inline": True},
+            {"name": "Device", "value": device_text, "inline": True},
+            {"name": "Script", "value": f"{game_id} ({script_name})", "inline": False},
+        ],
+        "footer": {"text": "Celestial License"},
+        "timestamp": datetime.now(timezone.utc).isoformat(),
+    }
+
+    payload = json.dumps({"embeds": [embed]}).encode("utf-8")
+    request = urllib.request.Request(
+        webhook_url,
+        data=payload,
+        headers={
+            "Content-Type": "application/json",
+            "User-Agent": "Celestial-License-Server/1.0",
+        },
+        method="POST",
+    )
+
+    try:
+        with urllib.request.urlopen(request, timeout=5) as response:
+            status = getattr(response, "status", response.getcode())
+            if status < 200 or status >= 300:
+                print(f"[License] Execution webhook returned HTTP {status}.")
+    except urllib.error.HTTPError as exc:
+        print(f"[License] Execution webhook failed with HTTP {exc.code}.")
+    except urllib.error.URLError as exc:
+        print(f"[License] Execution webhook connection failed: {exc.reason}")
+    except Exception as exc:
+        print(f"[License] Execution webhook failed: {exc}")
+
+
+def _queue_execution_webhook(
+    entry: Dict[str, Any],
+    game: Dict[str, Any],
+    executions: int,
+    executor: Any,
+    job_id: Any,
+    device: Any,
+) -> None:
+    if not getattr(config, "LICENSE_EXECUTION_LOGGING_ENABLED", False):
+        return
+    if not getattr(config, "LICENSE_EXECUTION_WEBHOOK_URL", "").strip():
+        return
+
+    threading.Thread(
+        target=_send_execution_webhook,
+        args=(entry, game, executions, executor, job_id, device),
+        daemon=True,
+        name="celestial-execution-webhook",
+    ).start()
 
 
 def handle_challenge_request(remote: str) -> Tuple[int, str, Dict[str, str]]:
@@ -253,6 +380,9 @@ def handle_complete_request(raw: bytes, remote: str) -> Tuple[int, str, Dict[str
     hwid = str(payload.get("hwid") or "").strip().lower()
     game_id = str(payload.get("game_id") or "").strip()
     execution_token = str(payload.get("execution_token") or "").strip()
+    executor = _safe_log_value(payload.get("executor"), fallback="Unknown", max_length=256)
+    job_id = _safe_log_value(payload.get("job_id"), fallback="Unknown", max_length=128)
+    device = _safe_log_value(payload.get("device"), fallback="Unknown", max_length=64)
     if not _valid_key(key) or not is_valid_hwid(hwid) or not game_id.isdigit() or not NONCE_RE.fullmatch(execution_token):
         return 400, json.dumps({"ok": False, "reason": "malformed_request"}), {"Content-Type": "application/json"}
 
@@ -263,17 +393,39 @@ def handle_complete_request(raw: bytes, remote: str) -> Tuple[int, str, Dict[str
         current_hwid = str(entry.get("HWID") or "").strip().lower()
         if not current_hwid or current_hwid != hwid:
             return 403, json.dumps({"ok": False, "reason": "hwid_mismatch"}), {"Content-Type": "application/json"}
+        game = _run(get_game(game_id))
+        if not game:
+            return 403, json.dumps({"ok": False, "reason": "game_not_supported"}), {"Content-Type": "application/json"}
+        if not game.get("enabled", True):
+            return 403, json.dumps({"ok": False, "reason": "game_disabled"}), {"Content-Type": "application/json"}
         if not _run(game_allowed(str(entry["Identifier"]), game_id)):
             return 403, json.dumps({"ok": False, "reason": "game_not_authorized"}), {"Content-Type": "application/json"}
         if not _consume_execution_token(execution_token, str(entry["Identifier"]), hwid, game_id):
             return 403, json.dumps({"ok": False, "reason": "invalid_execution_token"}), {"Content-Type": "application/json"}
-        if not _run(complete_successful_execution(str(entry["Identifier"]))):
+        completed_entry = _run(complete_successful_execution(str(entry["Identifier"])))
+        if not completed_entry:
             return 503, json.dumps({"ok": False, "reason": "backend_unavailable"}), {"Content-Type": "application/json"}
+        completed_executions = int(completed_entry.get("executions") or 0)
+        completed_activated = completed_entry.get("activated")
+        _queue_execution_webhook(
+            entry,
+            game,
+            completed_executions,
+            executor,
+            job_id,
+            device,
+        )
     except Exception as exc:
         print(f"[License] Execution completion failed: {exc}")
         return 503, json.dumps({"ok": False, "reason": "backend_unavailable"}), {"Content-Type": "application/json"}
 
-    return 200, json.dumps({"ok": True, "completed": True, "reason": "ok"}), {"Content-Type": "application/json", "Cache-Control": "no-store"}
+    return 200, json.dumps({
+        "ok": True,
+        "completed": True,
+        "reason": "ok",
+        "executions": completed_executions,
+        "activated": completed_activated,
+    }), {"Content-Type": "application/json", "Cache-Control": "no-store"}
 
 
 # Backwards-compatible names for keep_alive callers.

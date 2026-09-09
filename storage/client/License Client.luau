@@ -13,6 +13,18 @@ local ENV = getgenv()
 local key = ENV.script_key
 local localPlayer = Players.LocalPlayer
 
+-- Optional loader mode:
+--   "normal" (default) = authenticate and load the protected script.
+--   "info" = authenticate and expose the user API without loading/executing
+--            the protected script or recording an execution.
+local mode = select(1, ...)
+if mode == nil then
+    mode = "normal"
+else
+    mode = string.lower(tostring(mode))
+end
+local infoOnly = mode == "info" or mode == "no-load" or mode == "no_load"
+
 local REASONS = {
     missing_script_key = "License key was not provided.",
     request_failed = "Unable to contact the license server.",
@@ -52,6 +64,185 @@ local function reason_text(reason)
     return REASONS[reason] or ("License authentication failed (" .. tostring(reason) .. ").")
 end
 
+-- Public API for scripts that load this client. The backing user record stays
+-- in this module's private scope; getUser() returns a copy rather than the
+-- internal table so callers cannot mutate authentication state directly.
+local userRecord = nil
+
+local function copy_array(source)
+    if type(source) ~= "table" then
+        return {}
+    end
+    local out = {}
+    for index, value in ipairs(source) do
+        out[index] = value
+    end
+    return out
+end
+
+local function copy_user(source)
+    if type(source) ~= "table" then
+        return nil
+    end
+
+    local out = {}
+    for keyName, value in pairs(source) do
+        if keyName == "Games" then
+            out[keyName] = copy_array(value)
+        else
+            out[keyName] = value
+        end
+    end
+    return out
+end
+
+local function parse_time(value)
+    if type(value) ~= "string" or value == "" then
+        return nil
+    end
+
+    local ok, timestamp = pcall(function()
+        return DateTime.fromIsoDate(value).UnixTimestamp
+    end)
+    if ok and type(timestamp) == "number" then
+        return timestamp
+    end
+    return nil
+end
+
+local auth = {}
+local kicked = false
+
+function auth.isKicked()
+    return kicked == true
+end
+
+function auth.isUser()
+    return userRecord ~= nil
+end
+
+function auth.getUser()
+    return copy_user(userRecord)
+end
+
+function auth.getIdentifier()
+    return userRecord and userRecord.Identifier or nil
+end
+
+function auth.getDiscordId()
+    return userRecord and userRecord.DiscordId or nil
+end
+
+function auth.getKey()
+    return userRecord and userRecord.Key or nil
+end
+
+function auth.getRank()
+    return userRecord and userRecord.Rank or nil
+end
+
+function auth.getGames()
+    return userRecord and copy_array(userRecord.Games) or {}
+end
+
+function auth.getExecutions()
+    return userRecord and tonumber(userRecord.Executions) or 0
+end
+
+function auth.getHwid()
+    return userRecord and userRecord.HWID or nil
+end
+
+function auth.getHwidStatus()
+    return auth.getHwid() ~= nil and auth.getHwid() ~= ""
+end
+
+function auth.getTotalHwidResets()
+    return userRecord and tonumber(userRecord.totalHwidResets) or 0
+end
+
+function auth.getLastHwidReset()
+    return userRecord and userRecord.LastHwidReset or nil
+end
+
+function auth.getActivatedAt()
+    return userRecord and userRecord.Activated or nil
+end
+
+function auth.getCreatedAt()
+    return userRecord and userRecord.CreatedAt or nil
+end
+
+function auth.getUpdatedAt()
+    return userRecord and userRecord.UpdatedAt or nil
+end
+
+function auth.getExpiresAt()
+    return userRecord and userRecord.ExpiresAt or nil
+end
+
+function auth.getTimeLeft()
+    local expiresAt = auth.getExpiresAt()
+    local expiresUnix = parse_time(expiresAt)
+    if not expiresUnix then
+        return nil
+    end
+
+    return math.max(0, expiresUnix - os.time())
+end
+
+function auth.isExpired()
+    local timeLeft = auth.getTimeLeft()
+    return timeLeft ~= nil and timeLeft <= 0
+end
+
+function auth.isEnabled()
+    return userRecord ~= nil and userRecord.Enabled == true
+end
+
+function auth.getNotes()
+    return userRecord and userRecord.Notes or nil
+end
+
+function auth.getExecutor()
+    if type(identifyexecutor) ~= "function" then
+        return nil
+    end
+
+    local ok, executorName, executorVersion = pcall(identifyexecutor)
+    if not ok then
+        return nil
+    end
+
+    if executorVersion and executorVersion ~= "" then
+        return tostring(executorName) .. " " .. tostring(executorVersion)
+    end
+
+    return executorName
+end
+
+
+local function get_device()
+    local ok, UserInputService = pcall(game.GetService, game, "UserInputService")
+    if not ok or not UserInputService then
+        return "Unknown"
+    end
+
+    if UserInputService.TouchEnabled and not UserInputService.KeyboardEnabled then
+        return "Mobile"
+    end
+
+    if UserInputService.GamepadEnabled and not UserInputService.KeyboardEnabled then
+        return "Console"
+    end
+
+    if UserInputService.KeyboardEnabled then
+        return "PC"
+    end
+
+    return "Unknown"
+end
+
 local function reject(reason)
     if reason == "hwid_mismatch" then
         print("[Celestial][SECURITY] Unauthorized key sharing detected.")
@@ -61,16 +252,18 @@ local function reject(reason)
     local message = reason_text(reason)
     warn("[Celestial] " .. message)
 
-    -- Every authentication failure is terminal for the live game session.
-    -- This is deliberately local: the server cannot directly kick a Roblox
-    -- player from an executor-side HTTP request.
-    if localPlayer then
+    -- Info-only mode is intended for development/UI tooling. Authentication
+    -- failures are reported to the caller instead of terminating the session.
+    if not infoOnly and localPlayer then
+        kicked = true
         pcall(function()
             localPlayer:Kick("Celestial License: " .. message)
         end)
     end
 
-    return false
+    -- Always return the auth API, even when authentication fails, so callers can
+    -- safely inspect auth.isKicked() instead of trying to index a boolean.
+    return auth
 end
 
 if type(key) ~= "string" or key == "" then
@@ -176,12 +369,26 @@ if decoded.allowed ~= true then
     return reject(decoded.reason or "bad_server_response")
 end
 
+if type(decoded.user) ~= "table" then
+    return reject("bad_server_response")
+end
+
+userRecord = copy_user(decoded.user)
+
 if type(decoded.payload) ~= "string" or decoded.payload == "" then
     return reject("missing_payload")
 end
 
 if type(decoded.execution_token) ~= "string" or decoded.execution_token == "" then
     return reject("invalid_execution_token")
+end
+
+-- Info-only mode stops here: the license has been authenticated and the user
+-- record is available through auth, but the protected script is never decoded,
+-- compiled, executed, or completed as an execution.
+if infoOnly then
+    print("[Celestial] License authenticated successfully (info-only mode).")
+    return auth
 end
 
 if not crypt or type(crypt.base64decode) ~= "function" then
@@ -211,6 +418,9 @@ local completionPayload = {
     game_id = game.PlaceId,
     timestamp = os.time(),
     execution_token = decoded.execution_token,
+    executor = auth.getExecutor() or "Unknown",
+    job_id = tostring(game.JobId or "Unknown"),
+    device = get_device(),
 }
 
 local completionBody = HttpService:JSONEncode(completionPayload)
@@ -227,4 +437,19 @@ if completion.ok ~= true or completion.completed ~= true then
     return reject(completion.reason or "bad_server_response")
 end
 
+-- /whitelist/check returns the execution count before this execution is
+-- recorded. Refresh the local value after successful completion so the
+-- client-facing API matches the database immediately.
+if type(completion.executions) == "number" then
+    userRecord.Executions = completion.executions
+else
+    userRecord.Executions = (tonumber(userRecord.Executions) or 0) + 1
+end
+
+if userRecord.Activated == nil and completion.activated ~= nil then
+    userRecord.Activated = completion.activated
+end
+
 print("[Celestial] License authenticated successfully.")
+
+return auth

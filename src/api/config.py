@@ -181,6 +181,10 @@ HEADERS = {
 # the Supabase `games` table and protected scripts live in Supabase Storage.
 LICENSE_SERVER_ENABLED = os.getenv("LICENSE_SERVER_ENABLED", "true").strip().lower() not in ("false", "0", "no", "off")
 
+# Server-side execution monitoring. The webhook URL never reaches the Roblox client.
+LICENSE_EXECUTION_LOGGING_ENABLED = os.getenv("LICENSE_EXECUTION_LOGGING_ENABLED", "false").strip().lower() not in ("false", "0", "no", "off")
+LICENSE_EXECUTION_WEBHOOK_URL = os.getenv("LICENSE_EXECUTION_WEBHOOK_URL", "").strip()
+
 # Used by api/webhook_sync.py to figure out where this process is currently
 # reachable, so it can keep the GitHub webhook's Payload URL pointed at the
 # right place without manual editing on every restart. See that module for
