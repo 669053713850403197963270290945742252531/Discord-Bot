@@ -1,3 +1,4 @@
+import asyncio
 """Whitelist/license administration backed by Supabase."""
 
 import csv
@@ -12,7 +13,7 @@ from discord.ext import commands
 from discord.ui import Modal, TextInput, Label, LayoutView, Container, TextDisplay, ActionRow, Button
 
 from api import config
-from api.discord_helpers import has_role, is_in_guild, send_success, send_error, default_ui_error, resolve_user_option
+from api.discord_helpers import has_role, is_in_guild, send_success, send_error, default_ui_error, resolve_user_option, safe_edit_message, safe_send_modal, safe_defer, safe_respond
 from api.alerts import send_alert, alert_embed, ALERT_COLOR_ADD, ALERT_COLOR_REMOVE, ALERT_COLOR_EDIT
 from api.supabase_db import (
     fetch_users, fetch_users_with_sha, fetch_api_text_and_sha, commit_content,
@@ -82,7 +83,7 @@ class WhitelistModal(Modal, title="Whitelist a User"):
         await default_ui_error(interaction, error, label="WhitelistModal")
 
     async def on_submit(self, interaction):
-        await interaction.response.defer(ephemeral=True)
+        await safe_defer(interaction, ephemeral=True)
         identifier = self.identifier.component.value.strip()
         discord_id = self.target_user.component.value.strip()
         rank = self.rank.component.values[0]
@@ -129,7 +130,7 @@ def _parse_bulk_row(row):
 
 
 async def _bulkwhitelist_impl(interaction, attachment):
-    await interaction.response.defer(ephemeral=True)
+    await safe_defer(interaction, ephemeral=True)
     raw = await attachment.read()
     try:
         rows = list(csv.DictReader(io.StringIO(raw.decode("utf-8-sig"))))
@@ -176,7 +177,7 @@ async def _bulkwhitelist_impl(interaction, attachment):
 
 
 async def _unwhitelist_user_impl(interaction, user: discord.Member):
-    await interaction.response.defer(ephemeral=True)
+    await safe_defer(interaction, ephemeral=True)
     entry = await get_license_by_discord_id(str(user.id))
     if not entry:
         return await send_error(interaction, f"{user.mention} is not licensed.")
@@ -217,7 +218,7 @@ class EditUserModal(Modal, title="Edit User"):
         await default_ui_error(interaction, error, label="EditUserModal")
 
     async def on_submit(self, interaction):
-        await interaction.response.defer(ephemeral=True)
+        await safe_defer(interaction, ephemeral=True)
         identifier = self.identifier.component.value.strip()
         discord_id = self.discord_id.component.value.strip()
         if not identifier or not is_valid_discord_id(discord_id):
@@ -271,10 +272,10 @@ class DeleteUserConfirmView(LayoutView):
         ))
 
     async def _confirm(self, interaction: discord.Interaction):
-        await interaction.response.defer(ephemeral=True)
+        await safe_defer(interaction, ephemeral=True)
         view = self.whitelist_view
         if not view.users:
-            return await interaction.edit_original_response(view=view.render())
+            return await safe_edit_message(interaction, view=view.render())
 
         entry = view.users[view.index]
         identifier = str(entry.get("Identifier") or "")
@@ -309,11 +310,11 @@ class DeleteUserConfirmView(LayoutView):
             view.index = max(0, len(view.users) - 1)
         view.pending_notice = f"🗑️ Deleted **{identifier}**."
         view._rebuild()
-        await interaction.edit_original_response(view=view)
+        await safe_edit_message(interaction, view=view)
         view.pending_notice = None
 
     async def _cancel(self, interaction: discord.Interaction):
-        await interaction.response.edit_message(view=self.whitelist_view)
+        await safe_edit_message(interaction, view=self.whitelist_view)
 
 
 class WhitelistView(LayoutView):
@@ -400,24 +401,24 @@ class WhitelistView(LayoutView):
     async def _previous(self, interaction: discord.Interaction):
         self.index = max(0, self.index - 1)
         self._rebuild()
-        await interaction.response.edit_message(view=self)
+        await safe_edit_message(interaction, view=self)
         self.pending_notice = None
 
     async def _next(self, interaction: discord.Interaction):
         self.index = min(len(self.users) - 1, self.index + 1)
         self._rebuild()
-        await interaction.response.edit_message(view=self)
+        await safe_edit_message(interaction, view=self)
         self.pending_notice = None
 
     async def _edit_user(self, interaction: discord.Interaction):
         if not self.users:
             return await send_error(interaction, "No license entry is selected.")
-        await interaction.response.send_modal(EditUserModal(self.users[self.index], self))
+        await safe_send_modal(interaction, EditUserModal(self.users[self.index], self))
 
     async def _delete_user(self, interaction: discord.Interaction):
         if not self.users:
             return await send_error(interaction, "No license entry is selected.")
-        await interaction.response.edit_message(view=DeleteUserConfirmView(self))
+        await safe_edit_message(interaction, view=DeleteUserConfirmView(self))
 
     async def _refresh(self, interaction: discord.Interaction):
         try:
@@ -426,7 +427,7 @@ class WhitelistView(LayoutView):
             return await send_error(interaction, f"Failed to refresh whitelist: {e}")
         self.pending_notice = "🔄 Whitelist refreshed."
         self._rebuild()
-        await interaction.response.edit_message(view=self)
+        await safe_edit_message(interaction, view=self)
         self.pending_notice = None
 
     async def on_error(self, interaction, error, item):
@@ -445,7 +446,7 @@ class Whitelist(commands.Cog):
     @has_role(config.REQUIRED_ROLE_ID)
     @is_in_guild(config.GUILD_ID)
     async def whitelist(self, interaction):
-        await interaction.response.send_modal(WhitelistModal())
+        await safe_send_modal(interaction, WhitelistModal())
 
     @app_commands.command(name="bulkwhitelist", description="Bulk-add licenses from a CSV (identifier,discord_id,rank,notes,key,games).")
     @app_commands.guilds(GUILD)
@@ -468,7 +469,12 @@ class Whitelist(commands.Cog):
     @has_role(config.REQUIRED_ROLE_ID)
     @is_in_guild(config.GUILD_ID)
     async def editwhitelist(self, interaction):
-        current, _ = await fetch_api_text_and_sha()
+        try:
+            current, _ = await asyncio.wait_for(fetch_api_text_and_sha(), timeout=2.0)
+        except asyncio.TimeoutError:
+            return await send_error(interaction, "The license database took too long to respond. Please try again.")
+        except Exception as exc:
+            return await send_error(interaction, f"Failed to load the license database: {exc}")
         modal = Modal(title="Edit License JSON")
         text = TextInput(label="License JSON", style=discord.TextStyle.paragraph, default=current[:4000], max_length=4000)
         modal.add_item(text)
@@ -481,7 +487,7 @@ class Whitelist(commands.Cog):
                 return await send_error(i, f"Invalid license JSON: {e}")
             await send_success(i, "License database updated.")
         modal.on_submit = submit
-        await interaction.response.send_modal(modal)
+        await safe_send_modal(interaction, modal)
 
     @app_commands.command(name="edituser", description="Edits a licensed user's information.")
     @app_commands.guilds(GUILD)
@@ -489,10 +495,18 @@ class Whitelist(commands.Cog):
     @has_role(config.REQUIRED_ROLE_ID)
     @is_in_guild(config.GUILD_ID)
     async def edituser(self, interaction, user: discord.Member):
-        # This lookup must happen before opening the modal; keep it as fast as possible.
-        entry = await get_license_by_discord_id(str(user.id))
+        # A modal must be the interaction's initial response, so the lookup has
+        # to finish before Discord's acknowledgement window closes. Bound the
+        # lookup; a slow backend becomes a normal error instead of an expired
+        # interaction.
+        try:
+            entry = await asyncio.wait_for(get_license_by_discord_id(str(user.id)), timeout=2.0)
+        except asyncio.TimeoutError:
+            return await send_error(interaction, "The license database took too long to respond. Please try again.")
+        except Exception as exc:
+            return await send_error(interaction, f"License database error: {exc}")
         if not entry: return await send_error(interaction, "That user is not licensed.")
-        await interaction.response.send_modal(EditUserModal(entry))
+        await safe_send_modal(interaction, EditUserModal(entry))
 
     @app_commands.command(name="fetchuser", description="Fetches stored license information.")
     @app_commands.guilds(GUILD)
@@ -500,7 +514,7 @@ class Whitelist(commands.Cog):
     @has_role(config.REQUIRED_ROLE_ID)
     @is_in_guild(config.GUILD_ID)
     async def fetchuser(self, interaction, user: discord.Member):
-        await interaction.response.defer(ephemeral=True)
+        await safe_defer(interaction, ephemeral=True)
         entry = await get_license_by_discord_id(str(user.id))
         if not entry: return await send_error(interaction, "That user is not licensed.")
         embed = discord.Embed(title="License Information", color=discord.Color.green())
@@ -525,14 +539,14 @@ class Whitelist(commands.Cog):
             ("Expires At", expires_at),
         ]:
             embed.add_field(name=name, value=str(value), inline=True)
-        await interaction.followup.send(embed=embed, ephemeral=True)
+        await safe_respond(interaction, embed=embed, ephemeral=True)
 
     @app_commands.command(name="fetchdupes", description="Find duplicate identifiers, Discord IDs, or keys.")
     @app_commands.guilds(GUILD)
     @has_role(config.REQUIRED_ROLE_ID)
     @is_in_guild(config.GUILD_ID)
     async def fetchdupes(self, interaction):
-        await interaction.response.defer(ephemeral=True)
+        await safe_defer(interaction, ephemeral=True)
         users = await fetch_users()
         buckets = {"Identifier": {}, "Discord ID": {}, "License Key": {}}
         for u in users:
@@ -549,7 +563,7 @@ class Whitelist(commands.Cog):
     @has_role(config.REQUIRED_ROLE_ID)
     @is_in_guild(config.GUILD_ID)
     async def viewwhitelist(self, interaction):
-        await interaction.response.defer(ephemeral=True)
+        await safe_defer(interaction, ephemeral=True)
         try:
             users = await fetch_users()
         except Exception as e:
@@ -567,15 +581,20 @@ async def setup(bot):
 
 # Context-menu helpers
 async def _edituser_impl(interaction, target):
-    entry = await get_license_by_discord_id(str(target.id))
+    try:
+        entry = await asyncio.wait_for(get_license_by_discord_id(str(target.id)), timeout=2.0)
+    except asyncio.TimeoutError:
+        return await send_error(interaction, "The license database took too long to respond. Please try again.")
+    except Exception as exc:
+        return await send_error(interaction, f"License database error: {exc}")
     if not entry: return await send_error(interaction, "That user is not licensed.")
-    await interaction.response.send_modal(EditUserModal(entry))
+    await safe_send_modal(interaction, EditUserModal(entry))
 
 async def _unwhitelist_impl(interaction, target):
     return await _unwhitelist_user_impl(interaction, target)
 
 async def _fetchuser_impl(interaction, target):
-    await interaction.response.defer(ephemeral=True)
+    await safe_defer(interaction, ephemeral=True)
     entry = await get_license_by_discord_id(str(target.id))
     if not entry: return await send_error(interaction, "That user is not licensed.")
     last_hwid_reset = format_discord_timestamp(entry.get("LastHwidReset"), "R") if entry.get("LastHwidReset") else "Never"
@@ -594,5 +613,5 @@ async def _fetchuser_impl(interaction, target):
         ("License Updated", updated), ("HWID Status", "Assigned" if entry.get("HWID") else "Unset"), ("Expires At", expires_at),
     ]:
         embed.add_field(name=name, value=str(value), inline=True)
-    await interaction.followup.send(embed=embed, ephemeral=True)
+    await safe_respond(interaction, embed=embed, ephemeral=True)
 

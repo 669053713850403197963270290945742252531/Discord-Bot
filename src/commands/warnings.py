@@ -33,7 +33,7 @@ from discord.ui import LayoutView, Container, TextDisplay, ActionRow, Button, Se
 from api import config
 from api.discord_helpers import (
     has_role, is_in_guild, can_moderate, notify_user,
-    build_embed, safe_respond, send_success, send_error, default_ui_error,
+    build_embed, safe_respond, safe_edit_message, safe_defer, send_success, send_error, default_ui_error,
 )
 from api.alerts import (
     send_moderation_alert, alert_embed,
@@ -488,56 +488,72 @@ class WarningConfigView(LayoutView):
     async def on_action_select(self, interaction: discord.Interaction):
         if not await self._guard(interaction):
             return
+        if not await safe_defer(interaction, ephemeral=False):
+            return
         self.draft["action"] = self.action_select.values[0]
         self.build()
-        await interaction.response.edit_message(view=self)
+        await safe_edit_message(interaction, view=self)
 
     async def on_threshold_select(self, interaction: discord.Interaction):
         if not await self._guard(interaction):
             return
+        if not await safe_defer(interaction, ephemeral=False):
+            return
         self.draft["threshold"] = int(self.threshold_select.values[0])
         self.build()
-        await interaction.response.edit_message(view=self)
+        await safe_edit_message(interaction, view=self)
 
     async def on_duration_select(self, interaction: discord.Interaction):
         if not await self._guard(interaction):
             return
+        if not await safe_defer(interaction, ephemeral=False):
+            return
         self.draft["timeout_minutes"] = int(self.duration_select.values[0])
         self.build()
-        await interaction.response.edit_message(view=self)
+        await safe_edit_message(interaction, view=self)
 
     async def on_toggle_enabled(self, interaction: discord.Interaction):
         if not await self._guard(interaction):
             return
+        if not await safe_defer(interaction, ephemeral=False):
+            return
         self.draft["enabled"] = not self.draft["enabled"]
         self.build()
-        await interaction.response.edit_message(view=self)
+        await safe_edit_message(interaction, view=self)
 
     async def on_toggle_reset(self, interaction: discord.Interaction):
         if not await self._guard(interaction):
             return
+        if not await safe_defer(interaction, ephemeral=False):
+            return
         self.draft["reset_after_action"] = not self.draft["reset_after_action"]
         self.build()
-        await interaction.response.edit_message(view=self)
+        await safe_edit_message(interaction, view=self)
 
     async def on_toggle_notify(self, interaction: discord.Interaction):
         if not await self._guard(interaction):
             return
+        if not await safe_defer(interaction, ephemeral=False):
+            return
         self.draft["notify_target"] = not self.draft["notify_target"]
         self.build()
-        await interaction.response.edit_message(view=self)
+        await safe_edit_message(interaction, view=self)
 
     async def on_defaults(self, interaction: discord.Interaction):
         if not await self._guard(interaction):
+            return
+        if not await safe_defer(interaction, ephemeral=False):
             return
         self.draft = dict(DEFAULT_WARNING_CONFIG)
         self.pending_notice = "↩️ Reset to defaults below -- click Save to apply, or Cancel to discard."
         self.pending_notice_color = discord.Color.blurple()
         self.build()
-        await interaction.response.edit_message(view=self)
+        await safe_edit_message(interaction, view=self)
 
     async def on_save(self, interaction: discord.Interaction):
         if not await self._guard(interaction):
+            return
+        if not await safe_defer(interaction, ephemeral=False):
             return
         global _warning_config
         _warning_config = dict(self.draft)
@@ -557,14 +573,17 @@ class WarningConfigView(LayoutView):
         self.pending_notice = "✅ Settings saved -- these are now active."
         self.pending_notice_color = discord.Color.green()
         self.build()
-        await interaction.response.edit_message(view=self)
+        await safe_edit_message(interaction, view=self)
 
     async def on_cancel(self, interaction: discord.Interaction):
         if not await self._guard(interaction):
             return
         self.stop()
-        await interaction.response.defer()
-        await interaction.delete_original_response()
+        await safe_defer(interaction, ephemeral=False)
+        try:
+            await interaction.delete_original_response()
+        except (discord.NotFound, discord.HTTPException):
+            pass
 
 
 # =========================================================================
@@ -577,7 +596,7 @@ async def _warn_add_impl(interaction: discord.Interaction, user: discord.Member,
     except app_commands.CheckFailure as e:
         return await send_error(interaction, str(e))
 
-    await interaction.response.defer(ephemeral=True)
+    await safe_defer(interaction, ephemeral=True)
 
     entry = {
         "id": new_state_id("warn"),
@@ -639,7 +658,7 @@ def _warning_field(w: Dict[str, Any]) -> tuple:
 
 
 async def _warn_inspect_impl(interaction: discord.Interaction, user: discord.User):
-    await interaction.response.defer(ephemeral=True)
+    await safe_defer(interaction, ephemeral=True)
 
     try:
         state, _sha = await fetch_botstate_with_sha()
@@ -677,7 +696,7 @@ async def _warn_inspect_impl(interaction: discord.Interaction, user: discord.Use
 # =========================================================================
 
 async def _warn_clear_impl(interaction: discord.Interaction, user: discord.User):
-    await interaction.response.defer(ephemeral=True)
+    await safe_defer(interaction, ephemeral=True)
 
     # update_botstate() may retry _mutate() more than once against a fresh
     # fetch each time (see its docstring), so the removed count is tracked
@@ -776,7 +795,7 @@ async def warning_autocomplete(interaction: discord.Interaction, current: str) -
 
 
 async def _warn_delete_impl(interaction: discord.Interaction, user: discord.User, warning: str):
-    await interaction.response.defer(ephemeral=True)
+    await safe_defer(interaction, ephemeral=True)
 
     query = warning.strip().lower()
     if not query:
@@ -896,7 +915,7 @@ class Warnings(commands.Cog):
         # extra GitHub round trip -- this command isn't run often enough
         # for that to matter, and it's exactly the guarantee "config" in
         # its name implies.
-        await interaction.response.defer(ephemeral=True)
+        await safe_defer(interaction, ephemeral=True)
         await reconcile_warning_config(interaction.client)
         view = WarningConfigView(interaction.user.id)
         view.build()

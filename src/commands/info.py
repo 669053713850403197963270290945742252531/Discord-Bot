@@ -9,7 +9,7 @@ from discord import app_commands
 from discord.ext import commands
 
 from api import config
-from api.discord_helpers import has_role, is_in_guild, send_error, build_embed, safe_respond
+from api.discord_helpers import has_role, is_in_guild, send_error, build_embed, safe_respond, safe_defer
 from api.supabase_db import get_license_by_discord_id
 from api.time_utils import format_discord_timestamp
 from api.users import find_user_by_discord_id
@@ -54,7 +54,7 @@ class Info(commands.Cog):
     @has_role(config.REQUIRED_ROLE_ID)
     @is_in_guild(config.GUILD_ID)
     async def botstatus(self, interaction: discord.Interaction):
-        await interaction.response.defer(ephemeral=True)
+        await safe_defer(interaction, ephemeral=True)
 
         embed = self._build_status_embed(live=True)
         message = await interaction.followup.send(embed=embed, ephemeral=True)
@@ -111,7 +111,7 @@ class Info(commands.Cog):
     @app_commands.guilds(GUILD)
     @is_in_guild(config.GUILD_ID)
     async def myinfo(self, interaction: discord.Interaction):
-        await interaction.response.defer(ephemeral=True)
+        await safe_defer(interaction, ephemeral=True)
         try:
             user_data = await get_license_by_discord_id(str(interaction.user.id))
         except Exception as e:
@@ -134,7 +134,7 @@ class Info(commands.Cog):
     @is_in_guild(config.GUILD_ID)
     async def avatar(self, interaction: discord.Interaction, user: Optional[discord.Member] = None):
         member = user or interaction.user
-        await interaction.response.defer(ephemeral=True)
+        await safe_defer(interaction, ephemeral=True)
 
         # Member/cached-User objects never carry banner or accent_color --
         # those aren't sent over the gateway, only returned by a live fetch

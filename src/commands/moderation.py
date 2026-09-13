@@ -8,6 +8,7 @@ from discord.ext import commands
 
 from api import config
 from api.discord_helpers import (
+    safe_defer,
     has_role, is_in_guild, can_moderate, notify_user, build_embed,
     send_success, send_error, edit_or_send_error, error_embed, success_embed,
     dms_enabled,
@@ -324,7 +325,7 @@ async def reconcile_temp_bans(bot: commands.Bot, state: Optional[Dict[str, Any]]
 
 async def _ban_impl(interaction: discord.Interaction, target: discord.User, reason: str = "None", duration: int = None, preserve_messages: bool = True):
     try:
-        await interaction.response.send_message(f"Processing ban for {target.mention}...", ephemeral=True)
+        await safe_defer(interaction, ephemeral=True)
 
         member = interaction.guild.get_member(target.id)
 
@@ -443,6 +444,7 @@ async def _ban_impl(interaction: discord.Interaction, target: discord.User, reas
 
 async def _kick_impl(interaction: discord.Interaction, target: discord.Member, reason: str = "Unspecified"):
     try:
+        await safe_defer(interaction, ephemeral=True)
         await can_moderate(interaction, target)
         await notify_user(target, "kicked", interaction.user, reason, interaction.guild.name)
         await target.kick(reason=reason)
@@ -481,7 +483,7 @@ _MUTE_ALL_CHANNEL_PERMS = [
 
 async def _mute_impl(interaction: discord.Interaction, target: discord.Member, reason: str = "Unspecified"):
     try:
-        await interaction.response.send_message(f"Muting {target.mention}...", ephemeral=True)
+        await safe_defer(interaction, ephemeral=True)
 
         guild = interaction.guild
         muted_role = discord.utils.get(guild.roles, name="Muted")
@@ -532,6 +534,7 @@ async def _mute_impl(interaction: discord.Interaction, target: discord.Member, r
 
 async def _unmute_impl(interaction: discord.Interaction, target: discord.Member, reason: str = "No reason provided"):
     try:
+        await safe_defer(interaction, ephemeral=True)
         await can_moderate(interaction, target)
     except app_commands.CheckFailure as e:
         await send_error(interaction, str(e))
@@ -703,7 +706,7 @@ async def reconcile_temp_roles(bot: commands.Bot, state: Optional[Dict[str, Any]
 
 
 async def _temprole_impl(interaction: discord.Interaction, target: discord.Member, role: discord.Role, duration: int, reason: str = "No reason provided"):
-    await interaction.response.defer(ephemeral=True)
+    await safe_defer(interaction, ephemeral=True)
 
     if duration <= 0:
         return await send_error(interaction, "Duration must be a positive integer.")
@@ -863,6 +866,7 @@ def _format_slowmode(seconds: int) -> str:
 
 
 async def _slowmode_impl(interaction: discord.Interaction, seconds: int, channel: Optional[_LockableChannel] = None):
+    await safe_defer(interaction, ephemeral=True)
     target = channel or interaction.channel
 
     if not isinstance(target, _SLOWMODE_LOCK_CHANNEL_TYPES):
@@ -1398,7 +1402,7 @@ async def _togglelockdown_impl(
     # Defer immediately -- looping + editing permissions on every
     # channel in the server can easily take longer than the 3 second
     # window Discord gives an interaction before it expires.
-    await interaction.response.defer(ephemeral=True)
+    await safe_defer(interaction, ephemeral=True)
 
     guild = interaction.guild
     everyone_role = guild.default_role
@@ -1723,7 +1727,7 @@ class Moderation(commands.Cog):
     @has_role(config.REQUIRED_ROLE_ID)
     @is_in_guild(config.GUILD_ID)
     async def checkban(self, interaction: discord.Interaction, user: str):
-        await interaction.response.defer(ephemeral=True)
+        await safe_defer(interaction, ephemeral=True)
 
         try:
             target = await _resolve_user(interaction.client, user)
@@ -1769,7 +1773,7 @@ class Moderation(commands.Cog):
         # response (send_error/send_success below) can land after the
         # interaction token has already gone stale, surfacing to the user
         # as a silent "Unknown interaction" failure with no error shown.
-        await interaction.response.defer(ephemeral=True)
+        await safe_defer(interaction, ephemeral=True)
 
         try:
             target = await _resolve_user(interaction.client, user)
@@ -1832,7 +1836,7 @@ class Moderation(commands.Cog):
         # (the default) so there's visible feedback while it works, instead
         # of the old thinking=False-then-silently-delete trick that made it
         # look like the command hadn't done anything at all.
-        await interaction.response.defer(ephemeral=True)
+        await safe_defer(interaction, ephemeral=True)
 
         try:
             deleted = await interaction.channel.purge(limit=amount, reason=f"Purged by {interaction.user}")
@@ -1901,6 +1905,7 @@ class Moderation(commands.Cog):
     @has_role(config.REQUIRED_ROLE_ID)
     @is_in_guild(config.GUILD_ID)
     async def dm(self, interaction: discord.Interaction, target: discord.User, message: str):
+        await safe_defer(interaction, ephemeral=True)
         try:
             await target.send(message)
             trimmed_message = message if len(message) <= 500 else message[:497] + "..."

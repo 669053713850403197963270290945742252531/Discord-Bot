@@ -1,3 +1,4 @@
+import asyncio
 """Self-service control panel for the Discord-powered license system."""
 
 from datetime import datetime, timezone
@@ -8,8 +9,8 @@ from discord.ext import commands
 from discord.ui import Modal, TextInput, Label, LayoutView, Container, TextDisplay, ActionRow, Button
 
 from api import config
-from api.discord_helpers import has_role, is_in_guild, send_success, send_error, build_embed, default_ui_error, dms_enabled
-from api.supabase_db import get_license_by_discord_id, has_license_by_discord_id, is_redeemable_key, redeem_license, reset_license_hwid
+from api.discord_helpers import has_role, is_in_guild, send_success, send_error, build_embed, default_ui_error, dms_enabled, safe_send_modal, safe_respond, safe_defer
+from api.supabase_db import get_license_by_discord_id, is_redeemable_key, redeem_license, reset_license_hwid
 from api.time_utils import format_discord_timestamp, hwid_reset_cooldown_remaining, humanize_timeleft
 
 GUILD = discord.Object(id=config.GUILD_ID)
@@ -45,7 +46,7 @@ class RedeemKeyModal(Modal, title="Redeem Key"):
         await default_ui_error(interaction, error, label="RedeemKeyModal")
 
     async def on_submit(self, interaction):
-        await interaction.response.defer(ephemeral=True)
+        await safe_defer(interaction, ephemeral=True)
         key = self.key.component.value.strip()
         if not key:
             return await send_error(interaction, "Enter a license key.")
@@ -88,18 +89,25 @@ class ControlPanelView(LayoutView):
         self.add_item(Container(TextDisplay(CONTROL_PANEL_TITLE), TextDisplay(CONTROL_PANEL_DESCRIPTION), ActionRow(self.redeem, self.script, self.role, self.reset_hwid, self.info), accent_color=discord.Color.green()))
 
     async def on_redeem(self, interaction):
-        # Check whether the user already has a redeemed license before opening the modal.
-        # Keep the modal itself checking too, so the check cannot be bypassed by a race.
+        # A modal must be the initial interaction response. Keep the whitelist
+        # pre-check bounded so a slow database cannot turn this button into an
+        # expired interaction. The modal repeats the check after acknowledgement
+        # to protect against a race between the two requests.
         try:
-            already_redeemed = await has_license_by_discord_id(str(interaction.user.id))
-        except Exception as e:
-            return await send_error(interaction, f"Could not check your license status: {e}")
-        if already_redeemed:
+            existing = await asyncio.wait_for(
+                get_license_by_discord_id(str(interaction.user.id)),
+                timeout=2.0,
+            )
+        except asyncio.TimeoutError:
+            return await send_error(interaction, "The license database took too long to respond. Please try again.")
+        except Exception as exc:
+            return await send_error(interaction, f"License database error: {exc}")
+        if existing and existing.get("Key"):
             return await send_error(interaction, "You already have a license associated with your Discord account.")
-        await interaction.response.send_modal(RedeemKeyModal())
+        await safe_send_modal(interaction, RedeemKeyModal())
 
     async def on_script(self, interaction):
-        await interaction.response.defer(ephemeral=True)
+        await safe_defer(interaction, ephemeral=True)
         entry = await get_license_by_discord_id(str(interaction.user.id))
         if not entry or not entry.get("Key"):
             return await send_error(interaction, "You do not have a redeemed license.")
@@ -113,7 +121,7 @@ class ControlPanelView(LayoutView):
         await interaction.followup.send(f"```lua\n{script}\n```", ephemeral=True)
 
     async def on_role(self, interaction):
-        await interaction.response.defer(ephemeral=True)
+        await safe_defer(interaction, ephemeral=True)
         entry = await get_license_by_discord_id(str(interaction.user.id))
         if not entry:
             return await send_error(interaction, "You do not have a redeemed license.")
@@ -132,7 +140,7 @@ class ControlPanelView(LayoutView):
 
     async def on_reset_hwid(self, interaction):
         """Clear this user's bound HWID and start the persistent 7-day cooldown."""
-        await interaction.response.defer(ephemeral=True)
+        await safe_defer(interaction, ephemeral=True)
 
         try:
             entry = await get_license_by_discord_id(str(interaction.user.id))
@@ -178,7 +186,7 @@ class ControlPanelView(LayoutView):
         )
 
     async def on_info(self, interaction):
-        await interaction.response.defer(ephemeral=True)
+        await safe_defer(interaction, ephemeral=True)
         entry = await get_license_by_discord_id(str(interaction.user.id))
         if not entry:
             return await send_error(interaction, "You do not have a redeemed license.")
@@ -218,7 +226,7 @@ class Panel(commands.Cog):
     @has_role(config.REQUIRED_ROLE_ID)
     @is_in_guild(config.GUILD_ID)
     async def createpanel(self, interaction):
-        await interaction.response.send_message("Control panel posted.", ephemeral=True)
+        await safe_respond(interaction, "Control panel posted.", ephemeral=True)
         await interaction.channel.send(view=ControlPanelView())
 
 

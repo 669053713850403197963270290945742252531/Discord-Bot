@@ -31,7 +31,7 @@ from discord.ext import commands
 from discord.ui import Container, File, LayoutView, TextDisplay
 
 from api import config
-from api.discord_helpers import has_role, is_in_guild, send_error, build_embed, safe_respond
+from api.discord_helpers import has_role, is_in_guild, send_error, build_embed, safe_respond, safe_defer
 from api.qrcode_gen import (
     QROptions, QRResult, generate_qr, parse_color, swatch_emoji,
     SCALE_MIN, SCALE_MAX, DEFAULT_SCALE, DEFAULT_STYLE,
@@ -350,7 +350,7 @@ class QRCode(commands.Cog):
         logo_background: bool = True,
         public: bool = False,
     ):
-        await interaction.response.defer(ephemeral=not public)
+        await safe_defer(interaction, ephemeral=not public)
 
         ec_auto = error_correction is None
         if error_correction:
@@ -456,7 +456,7 @@ class QRCode(commands.Cog):
         image: discord.Attachment,
         public: bool = False,
     ):
-        await interaction.response.defer(ephemeral=not public)
+        await safe_defer(interaction, ephemeral=not public)
 
         if image.content_type and not image.content_type.startswith("image/"):
             return await send_error(
