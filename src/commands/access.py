@@ -140,6 +140,7 @@ async def reconcile_temp_access(bot: commands.Bot, state: Optional[Dict[str, Any
 
 
 async def _toggleaccess_impl(interaction: discord.Interaction, user: discord.Member):
+    await interaction.response.defer(ephemeral=True)
     guild = interaction.guild
     role = guild.get_role(config.REQUIRED_ROLE_ID)
     if not role:

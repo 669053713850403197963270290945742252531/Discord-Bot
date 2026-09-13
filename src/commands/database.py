@@ -27,6 +27,7 @@ class Database(commands.Cog):
     @has_role(config.REQUIRED_ROLE_ID)
     @is_in_guild(config.GUILD_ID)
     async def export(self, interaction, format: app_commands.Choice[str] = None):
+        await interaction.response.defer(ephemeral=True)
         users = await fetch_users()
         selected = format.value if format else "json"
         if selected == "csv":
@@ -35,10 +36,10 @@ class Database(commands.Cog):
             for u in users:
                 writer.writerow([u.get("Identifier"),u.get("DiscordId"),u.get("Key"),u.get("Activated"),u.get("Executions",0),u.get("Rank"),u.get("Notes"),u.get("Enabled",True),u.get("ExpiresAt"),",".join(u.get("Games") or [])])
             data = buf.getvalue().encode()
-            await interaction.response.send_message(file=discord.File(io.BytesIO(data), filename="licenses.csv"), ephemeral=True)
+            await interaction.followup.send(file=discord.File(io.BytesIO(data), filename="licenses.csv"), ephemeral=True)
             return
         data = serialize_users_json(users).encode()
-        await interaction.response.send_message(file=discord.File(io.BytesIO(data), filename="licenses.json"), ephemeral=True)
+        await interaction.followup.send(file=discord.File(io.BytesIO(data), filename="licenses.json"), ephemeral=True)
 
     @app_commands.command(name="upload", description="Replaces the Supabase license database using an exported JSON file.")
     @app_commands.guilds(GUILD)
@@ -46,6 +47,7 @@ class Database(commands.Cog):
     @has_role(config.REQUIRED_ROLE_ID)
     @is_in_guild(config.GUILD_ID)
     async def upload(self, interaction, file: discord.Attachment):
+        await interaction.response.defer(ephemeral=True)
         raw = await file.read()
         try:
             data = json.loads(raw.decode("utf-8-sig"))
@@ -65,6 +67,7 @@ class Database(commands.Cog):
     @has_role(config.REQUIRED_ROLE_ID)
     @is_in_guild(config.GUILD_ID)
     async def dbsearch(self, interaction, query: str):
+        await interaction.response.defer(ephemeral=True)
         q = query.lower().strip(); users = await fetch_users(); matches=[]
         for u in users:
             hay = " ".join(str(u.get(k,"")) for k in ("Identifier","DiscordId","Key","Rank","Notes","Games")).lower()
@@ -73,16 +76,17 @@ class Database(commands.Cog):
         lines=[]
         for u in matches[:25]:
             lines.append(f"**{u.get('Identifier','Unknown')}** — <@{u.get('DiscordId')}> — `{u.get('Key')}` — Games: {', '.join(u.get('Games') or [])}")
-        await interaction.response.send_message("\n".join(lines), ephemeral=True)
+        await interaction.followup.send("\n".join(lines), ephemeral=True)
 
     @app_commands.command(name="games", description="Lists supported games in the Supabase games database.")
     @app_commands.guilds(GUILD)
     @has_role(config.REQUIRED_ROLE_ID)
     @is_in_guild(config.GUILD_ID)
     async def games(self, interaction):
+        await interaction.response.defer(ephemeral=True)
         games = await list_games()
         lines=[f"`{g.get('id')}` — {g.get('name')} — `{g.get('script_path')}` — {'enabled' if g.get('enabled',True) else 'disabled'}" for g in games if g.get('id') != '*']
-        await interaction.response.send_message("\n".join(lines) if lines else "No games configured.", ephemeral=True)
+        await interaction.followup.send("\n".join(lines) if lines else "No games configured.", ephemeral=True)
 
 
 async def setup(bot):

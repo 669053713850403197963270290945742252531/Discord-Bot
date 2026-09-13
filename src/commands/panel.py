@@ -89,12 +89,11 @@ class ControlPanelView(LayoutView):
         self.add_item(Container(TextDisplay(CONTROL_PANEL_TITLE), TextDisplay(CONTROL_PANEL_DESCRIPTION), ActionRow(self.redeem, self.script, self.role, self.reset_hwid, self.info), accent_color=discord.Color.green()))
 
     async def on_redeem(self, interaction):
-        existing_user = await get_license_by_discord_id(str(interaction.user.id))
-        if existing_user and existing_user.get("Key"):
-            return await send_error(interaction, "You already have a license associated with your Discord account.")
+        # Open the modal immediately. A DB lookup here can exceed Discord's 3-second initial-response window; RedeemKeyModal validates the user's existing license after its submission has been deferred.
         await interaction.response.send_modal(RedeemKeyModal())
 
     async def on_script(self, interaction):
+        await interaction.response.defer(ephemeral=True)
         entry = await get_license_by_discord_id(str(interaction.user.id))
         if not entry or not entry.get("Key"):
             return await send_error(interaction, "You do not have a redeemed license.")
@@ -103,9 +102,10 @@ class ControlPanelView(LayoutView):
             script = inject_script_key(script, entry["Key"])
         except Exception as e:
             return await send_error(interaction, f"Failed to prepare the loader: {e}")
-        await interaction.response.send_message(f"```lua\n{script}\n```", ephemeral=True)
+        await interaction.followup.send(f"```lua\n{script}\n```", ephemeral=True)
 
     async def on_role(self, interaction):
+        await interaction.response.defer(ephemeral=True)
         entry = await get_license_by_discord_id(str(interaction.user.id))
         if not entry:
             return await send_error(interaction, "You do not have a redeemed license.")
@@ -170,6 +170,7 @@ class ControlPanelView(LayoutView):
         )
 
     async def on_info(self, interaction):
+        await interaction.response.defer(ephemeral=True)
         entry = await get_license_by_discord_id(str(interaction.user.id))
         if not entry:
             return await send_error(interaction, "You do not have a redeemed license.")
@@ -198,7 +199,7 @@ class ControlPanelView(LayoutView):
         embed.add_field(name="Last Reset", value=f"{last_reset} 📅", inline=True)
         embed.add_field(name="Expires At", value=f"{expires_at} 📅", inline=True)
 
-        await interaction.response.send_message(embed=embed, ephemeral=True)
+        await interaction.followup.send(embed=embed, ephemeral=True)
 
 
 class Panel(commands.Cog):
@@ -217,6 +218,7 @@ class Panel(commands.Cog):
     @has_role(config.REQUIRED_ROLE_ID)
     @is_in_guild(config.GUILD_ID)
     async def updatescript(self, interaction, file: discord.Attachment):
+        await interaction.response.defer(ephemeral=True)
         raw = (await file.read()).decode("utf-8")
         if len(raw) > 100_000:
             return await send_error(interaction, "The script is too large.")
