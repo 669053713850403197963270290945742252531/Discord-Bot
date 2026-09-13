@@ -11,7 +11,8 @@ from discord.ext import commands
 
 from api import config
 from api.discord_helpers import has_role, is_in_guild, send_error, send_success, safe_defer
-from api.supabase_db import fetch_users, fetch_api_text_and_sha, commit_content, serialize_users_json, list_games
+from api.supabase_db import fetch_users, fetch_api_text_and_sha, commit_content, serialize_users_json, list_games, get_game
+from api.supabase_storage import upload_game_script, SupabaseStorageError
 from api.users import revoke_buyer_role, find_removed_discord_ids
 
 GUILD = discord.Object(id=config.GUILD_ID)
@@ -76,17 +77,109 @@ class Database(commands.Cog):
         lines=[]
         for u in matches[:25]:
             lines.append(f"**{u.get('Identifier','Unknown')}** — <@{u.get('DiscordId')}> — `{u.get('Key')}` — Games: {', '.join(u.get('Games') or [])}")
-        await interaction.followup.send("\n".join(lines), ephemeral=True)
+        embed = discord.Embed(title="🔎 Database Search", description=f"Found {len(matches)} matching license record(s).", color=discord.Color.blurple())
+        for index, u in enumerate(matches[:25], start=1):
+            embed.add_field(
+                name=f"{index}. {u.get('Identifier', 'Unknown')}",
+                value=f"Discord: <@{u.get('DiscordId')}>\nKey: `{u.get('Key')}`\nGames: {', '.join(u.get('Games') or []) or 'None'}",
+                inline=False,
+            )
+        if len(matches) > 25:
+            embed.set_footer(text=f"Showing 25 of {len(matches)} matches")
+        await interaction.followup.send(embed=embed, ephemeral=True)
 
-    @app_commands.command(name="games", description="Lists supported games in the Supabase games database.")
-    @app_commands.guilds(GUILD)
+    games_group = app_commands.guilds(GUILD)(
+        app_commands.Group(name="games", description="Game management commands.")
+    )
+
+    @games_group.command(name="list", description="Lists all supported games.")
     @has_role(config.REQUIRED_ROLE_ID)
     @is_in_guild(config.GUILD_ID)
-    async def games(self, interaction):
+    async def games_list(self, interaction):
         await safe_defer(interaction, ephemeral=True)
         games = await list_games()
-        lines=[f"`{g.get('id')}` — {g.get('name')} — `{g.get('script_path')}` — {'enabled' if g.get('enabled',True) else 'disabled'}" for g in games if g.get('id') != '*']
-        await interaction.followup.send("\n".join(lines) if lines else "No games configured.", ephemeral=True)
+        visible = [g for g in games if g.get("id") != "*"]
+
+        embed = discord.Embed(
+            title="🎮 Supported Games",
+            description="Games currently available through the License Server.",
+            color=discord.Color.blurple(),
+        )
+
+        if visible:
+            chunks = []
+            current = []
+            current_length = 0
+            for game in visible:
+                game_id = str(game.get("id", "Unknown"))
+                name = str(game.get("name", "Unknown Game"))
+                status = "🟢 Enabled" if game.get("enabled", True) else "🔴 Disabled"
+                line = f"**{name}** — `{game_id}` • {status}"
+                if current and current_length + len(line) + 1 > 1024:
+                    chunks.append(current)
+                    current = []
+                    current_length = 0
+                current.append(line)
+                current_length += len(line) + 1
+            if current:
+                chunks.append(current)
+
+            for index, chunk in enumerate(chunks, start=1):
+                embed.add_field(
+                    name="Supported Games" if index == 1 else "Supported Games (continued)",
+                    value="\n".join(chunk),
+                    inline=False,
+                )
+            embed.set_footer(text=f"{len(visible)} supported game(s)")
+        else:
+            embed.description = "No games are currently configured."
+
+        await interaction.followup.send(embed=embed, ephemeral=True)
+
+    @games_group.command(name="update", description="Replaces a game's script in the private game-scripts bucket.")
+    @has_role(config.REQUIRED_ROLE_ID)
+    @is_in_guild(config.GUILD_ID)
+    @app_commands.describe(
+        game_id="The game ID whose configured script should be replaced.",
+        file="The new game script file to upload.",
+    )
+    async def games_update(self, interaction, game_id: str, file: discord.Attachment):
+        await safe_defer(interaction, ephemeral=True)
+
+        try:
+            game = await get_game(game_id.strip())
+        except Exception as exc:
+            return await send_error(interaction, f"Failed to look up game `{game_id}`: {exc}")
+
+        if not game:
+            return await send_error(interaction, f"No game with ID `{game_id}` was found in the Games database.")
+
+        script_path = str(game.get("script_path") or "").strip()
+        if not script_path:
+            return await send_error(interaction, f"Game `{game_id}` does not have a configured script path.")
+
+        try:
+            data = await file.read()
+        except Exception as exc:
+            return await send_error(interaction, f"Failed to read the uploaded script file: {exc}")
+
+        if not data:
+            return await send_error(interaction, "The uploaded script file is empty.")
+
+        try:
+            await upload_game_script(script_path, data)
+        except SupabaseStorageError as exc:
+            return await send_error(interaction, f"Failed to update the game script: {exc}")
+
+        embed = discord.Embed(
+            title="✅ Game Script Updated",
+            description=f"The script for **{game.get('name', game_id)}** has been replaced successfully.",
+            color=discord.Color.green(),
+        )
+        embed.add_field(name="Game ID", value=f"`{game_id}`", inline=True)
+        embed.add_field(name="Script Path", value=f"`{script_path}`", inline=True)
+        embed.add_field(name="Updated File", value=f"`{file.filename}`", inline=True)
+        await interaction.followup.send(embed=embed, ephemeral=True)
 
 
 async def setup(bot):
