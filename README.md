@@ -66,7 +66,7 @@ Discord-Bot/
 │       ├── whitelist.py         # /whitelist, /bulkwhitelist, /register, /editwhitelist, /edituser, /viewwhitelist, /fetchuser, /fetchdupes, /unwhitelist, /clearnotes, /clearregistrations, /checkregistration, /hwidhelp
 │       ├── keys_hwid.py         # /key generate|validate|fetch|clear, /tempwhitelist, /checktemp, /extend, /forceresethwid, /resethwidcooldown
 │       ├── database.py          # /dbsearch, /export, /upload, /rollback, /commithistory, /fetchcommit, /verifydata
-│       ├── panel.py             # /createpanel, /updatescript + the persistent ControlPanelView
+│       ├── panel.py             # /createpanel + the persistent ControlPanelView
 │       ├── access.py            # /toggleaccess, /tempaccess, /togglealerts (whitelist/moderation subcommands)
 │       ├── reaction_roles.py    # /reactionrole
 │       ├── afk.py               # /afk (set/clear/mod clear/mod check subcommands) -- AFK status with ping/reply notifications

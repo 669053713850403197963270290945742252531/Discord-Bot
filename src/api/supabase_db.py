@@ -360,6 +360,24 @@ async def get_license_by_discord_id(discord_id: str) -> Optional[Dict[str, Any]]
     return await asyncio.to_thread(_get_by_discord_sync, str(discord_id))
 
 
+def _has_license_by_discord_id_sync(discord_id: str) -> bool:
+    rows = (
+        _client_sync()
+        .table("licenses")
+        .select("license_key")
+        .eq("discord_id", str(discord_id))
+        .limit(1)
+        .execute()
+    ).data or []
+    return bool(rows and rows[0].get("license_key"))
+
+
+async def has_license_by_discord_id(discord_id: str) -> bool:
+    """Fast preflight used by the control-panel Redeem Key button."""
+    return await asyncio.to_thread(_has_license_by_discord_id_sync, str(discord_id))
+
+
+
 def _get_by_identifier_sync(identifier: str) -> Optional[Dict[str, Any]]:
     rows = (_client_sync().table("licenses").select("*").eq("identifier", str(identifier)).limit(1).execute()).data or []
     if not rows:

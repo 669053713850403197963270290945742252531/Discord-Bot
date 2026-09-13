@@ -4,7 +4,7 @@ This public client contains no server secrets. It requests a short-lived challen
 
 Protected game scripts are stored in the private Supabase Storage `game-scripts` bucket. The license server uses its server-only Supabase credential to retrieve the configured object; Roblox never receives Supabase credentials or direct bucket access.
 
-The PlaceId-to-object mapping lives in the server-only `storage/license_game_scripts.json` file. For example:
+The protected game-script mapping lives in the Supabase `games` table, whose `script_path` points into the private `game-scripts` bucket. The control-panel loader is stored at `loader.lua` in the same bucket.
 
 ```json
 {

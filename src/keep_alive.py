@@ -29,20 +29,6 @@ def home():
     return "Bot is alive!", 200
 
 
-def _license_server_enabled() -> bool:
-    """Reads LICENSE_SERVER_ENABLED straight off os.environ rather than
-    `from api import config` -- api/__init__.py pulls in discord_helpers.py
-    (and, through it, discord itself) the moment any api.* submodule is
-    imported, which is exactly the heavier chain keep_alive() runs ahead of
-    so this port opens as early as possible (see module docstring). A plain
-    os.getenv() here costs nothing and keeps that ordering intact.
-
-    Defaults to true (route registered, matching today's always-on
-    behavior) so an existing deployment's .env needs no change; set to
-    false to skip creating the route below entirely."""
-    return os.environ.get("LICENSE_SERVER_ENABLED", "true").strip().lower() not in ("false", "0", "no", "off")
-
-
 @app.route('/client', methods=['GET'])
 def public_license_client():
     """Serves the public loader. It contains no server secret; the API base
@@ -132,28 +118,29 @@ pre {{ margin: 24px; white-space: pre-wrap; }}
     )
 
 
-if _license_server_enabled():
-    @app.route('/whitelist/challenge', methods=['POST'])
-    def whitelist_challenge():
-        from api.license_server import handle_challenge_request
-        status, body, headers = handle_challenge_request(request.remote_addr or 'unknown')
-        return Response(body, status=status, headers=headers)
+@app.route('/whitelist/challenge', methods=['POST'])
+def whitelist_challenge():
+    from api.license_server import handle_challenge_request
+    status, body, headers = handle_challenge_request(request.remote_addr or 'unknown')
+    return Response(body, status=status, headers=headers)
 
-    @app.route('/whitelist/check', methods=['POST'])
-    def whitelist_check():
-        from api.license_server import handle_check_request
-        status, body, headers = handle_check_request(
-            request.get_data(), request.remote_addr or 'unknown'
-        )
-        return Response(body, status=status, headers=headers)
 
-    @app.route('/whitelist/complete', methods=['POST'])
-    def whitelist_complete():
-        from api.license_server import handle_complete_request
-        status, body, headers = handle_complete_request(
-            request.get_data(), request.remote_addr or 'unknown'
-        )
-        return Response(body, status=status, headers=headers)
+@app.route('/whitelist/check', methods=['POST'])
+def whitelist_check():
+    from api.license_server import handle_check_request
+    status, body, headers = handle_check_request(
+        request.get_data(), request.remote_addr or 'unknown'
+    )
+    return Response(body, status=status, headers=headers)
+
+
+@app.route('/whitelist/complete', methods=['POST'])
+def whitelist_complete():
+    from api.license_server import handle_complete_request
+    status, body, headers = handle_complete_request(
+        request.get_data(), request.remote_addr or 'unknown'
+    )
+    return Response(body, status=status, headers=headers)
 
 
 
