@@ -230,6 +230,14 @@ async def safe_respond(interaction: discord.Interaction, content: Optional[str] 
             await interaction.followup.send(content=content, **kwargs)
     except discord.NotFound:
         print("Interaction expired before it could be responded to.")
+    except discord.InteractionResponded:
+        # The interaction was acknowledged by another code path between the
+        # is_done() check and the initial response attempt. Use the follow-up
+        # webhook instead of surfacing an InteractionResponded exception.
+        try:
+            await interaction.followup.send(content=content, **kwargs)
+        except Exception as e2:
+            print(f"Failed to respond via followup after InteractionResponded: {e2}")
     except discord.HTTPException as e:
         # interaction.response.is_done() only reflects *this* Interaction
         # object's local state, which can be wrong if some other response

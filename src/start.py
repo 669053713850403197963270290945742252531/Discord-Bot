@@ -49,7 +49,7 @@ from discord.app_commands import errors as app_errors
 
 from api import config
 from api.github import GitHubAPIError, fetch_botstate_with_sha
-from api.discord_helpers import send_error, notify_permission_error, reconcile_dms_enabled
+from api.discord_helpers import send_error, notify_permission_error, reconcile_dms_enabled, safe_respond, error_embed
 from api.alerts import reconcile_alerts_enabled
 from commands.panel import ControlPanelView
 from commands.moderation import (
@@ -515,6 +515,22 @@ async def on_app_command_error(interaction: discord.Interaction, error: app_comm
 
     if isinstance(error, app_commands.CheckFailure):
         await send_error(interaction, str(error))
+        return
+
+    # Recover from a duplicate initial-response race. Some callbacks
+    # acknowledge the interaction in one path and an exception/error path
+    # can attempt to acknowledge it again. Reply through the follow-up
+    # webhook instead of letting InteractionResponded escape as an unhandled
+    # command error.
+    if isinstance(original, discord.InteractionResponded):
+        await safe_respond(
+            interaction,
+            embed=error_embed(
+                "Something went wrong while responding to that interaction. Please try again.",
+                title="Interaction Error",
+            ),
+            ephemeral=True,
+        )
         return
 
     # Catch Discord's "Embed size exceeds maximum size of 6000" HTTPException
