@@ -9,7 +9,6 @@ from discord.ui import Modal, TextInput, Label, LayoutView, Container, TextDispl
 
 from api import config
 from api.discord_helpers import has_role, is_in_guild, send_success, send_error, build_embed, default_ui_error, dms_enabled
-from api.github import fetch_stored_script, fetch_stored_script_with_sha, commit_stored_script, validate_stored_script, inject_script_key
 from api.supabase_db import get_license_by_discord_id, is_redeemable_key, redeem_license, reset_license_hwid
 from api.time_utils import format_discord_timestamp, hwid_reset_cooldown_remaining, humanize_timeleft
 
@@ -97,11 +96,13 @@ class ControlPanelView(LayoutView):
         entry = await get_license_by_discord_id(str(interaction.user.id))
         if not entry or not entry.get("Key"):
             return await send_error(interaction, "You do not have a redeemed license.")
-        try:
-            script = await fetch_stored_script()
-            script = inject_script_key(script, entry["Key"])
-        except Exception as e:
-            return await send_error(interaction, f"Failed to prepare the loader: {e}")
+
+        key = str(entry["Key"])
+        safe_key = key.replace("\\", "\\\\").replace('"', '\\"')
+        script = (
+            f'getgenv().script_key = "{safe_key}"\n'
+            f'loadstring(game:HttpGet("{config.LICENSE_SERVER_BASE_URL}/client"))()'
+        )
         await interaction.followup.send(f"```lua\n{script}\n```", ephemeral=True)
 
     async def on_role(self, interaction):
@@ -213,22 +214,6 @@ class Panel(commands.Cog):
         await interaction.response.send_message("Control panel posted.", ephemeral=True)
         await interaction.channel.send(view=ControlPanelView())
 
-    @app_commands.command(name="updatescript", description="Updates the public loader used by the Get Script button.")
-    @app_commands.guilds(GUILD)
-    @has_role(config.REQUIRED_ROLE_ID)
-    @is_in_guild(config.GUILD_ID)
-    async def updatescript(self, interaction, file: discord.Attachment):
-        await interaction.response.defer(ephemeral=True)
-        raw = (await file.read()).decode("utf-8")
-        if len(raw) > 100_000:
-            return await send_error(interaction, "The script is too large.")
-        try:
-            validate_stored_script(raw)
-            old, sha = await fetch_stored_script_with_sha()
-            await commit_stored_script(raw, sha, f"Update stored loader by {interaction.user}")
-        except Exception as e:
-            return await send_error(interaction, f"Failed to update loader: {e}")
-        await send_success(interaction, "Public loader updated.")
 
 
 async def setup(bot):

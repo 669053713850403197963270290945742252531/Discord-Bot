@@ -66,7 +66,7 @@ from .supabase_db import (
     get_license_game_ids, list_games, get_game, game_allowed, complete_successful_execution,
 )
 
-from .supabase_storage import SupabaseStorageError, fetch_game_script
+from .supabase_storage import SupabaseStorageError, fetch_game_script, upload_game_script
 
 from .users import (
     find_user_by_discord_id, find_user_by_key,

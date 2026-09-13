@@ -62,3 +62,47 @@ async def fetch_game_script(path: str) -> str:
         return data.decode("utf-8")
     except UnicodeDecodeError as exc:
         raise SupabaseStorageError("Protected game script is not valid UTF-8") from exc
+
+def _upload_sync(path: str, data: bytes) -> None:
+    path = path.lstrip("/")
+    if not path or ".." in path.split("/"):
+        raise SupabaseStorageError("Invalid Supabase Storage object path")
+    if not isinstance(data, (bytes, bytearray)) or not data:
+        raise SupabaseStorageError("Cannot upload an empty/invalid object")
+
+    try:
+        bucket = _get_client().storage.from_(config.SUPABASE_GAME_SCRIPTS_BUCKET)
+        bucket.upload(
+            path,
+            bytes(data),
+            {"content-type": "text/plain; charset=utf-8", "upsert": "true"},
+        )
+    except Exception as exc:
+        # Some supabase-py releases use update() for an existing object.
+        # Retry with update() only when upload reports an object conflict.
+        message = str(exc).lower()
+        if "already exists" not in message and "duplicate" not in message and "409" not in message:
+            raise SupabaseStorageError(
+                f"Failed to upload loader script to Supabase Storage: {path!r}"
+            ) from exc
+        try:
+            bucket.update(
+                path,
+                bytes(data),
+                {"content-type": "text/plain; charset=utf-8"},
+            )
+        except Exception as update_exc:
+            raise SupabaseStorageError(
+                f"Failed to update loader script in Supabase Storage: {path!r}"
+            ) from update_exc
+
+
+async def upload_game_script(path: str, data: bytes) -> None:
+    """Upload/replace an object in the private game-scripts bucket."""
+    try:
+        await asyncio.to_thread(_upload_sync, path, data)
+    except SupabaseStorageError:
+        raise
+    except Exception as exc:
+        raise SupabaseStorageError("Unexpected Supabase Storage upload failure") from exc
+

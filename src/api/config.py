@@ -176,16 +176,27 @@ HEADERS = {
 }
 
 
-# Public license-service settings. The client only needs the public endpoint;
-# no server secret is ever shipped to users. Game/script mappings are stored in
-# the Supabase `games` table and protected scripts live in Supabase Storage.
-LICENSE_SERVER_ENABLED = os.getenv("LICENSE_SERVER_ENABLED", "true").strip().lower() not in ("false", "0", "no", "off")
+# Public license-service settings. The License Server is always enabled.
+# Render exposes RENDER_EXTERNAL_URL automatically; local development falls
+# back to the same listener used by the Flask server.
+LICENSE_SERVER_BASE_URL = (
+    os.getenv("RENDER_EXTERNAL_URL", "").strip().rstrip("/")
+    or f"http://127.0.0.1:{os.getenv('PORT', '8080')}"
+)
 
 # Server-side execution monitoring. The webhook URL never reaches the Roblox client.
 LICENSE_EXECUTION_LOGGING_ENABLED = os.getenv("LICENSE_EXECUTION_LOGGING_ENABLED", "false").strip().lower() not in ("false", "0", "no", "off")
 LICENSE_EXECUTION_WEBHOOK_URL = os.getenv("LICENSE_EXECUTION_WEBHOOK_URL", "").strip()
 
-# Sentivel heartbeat used by the bot status page. Leave empty to disable.
+# Sentivel heartbeat used by the bot status page. By default it is enabled
+# only on Render, since local development intentionally goes offline during
+# restarts/debugging. Set SENTIVEL_ENABLED explicitly to true/false to
+# override that automatic environment detection.
+_SENTIVEL_ENABLED_ENV = os.getenv("SENTIVEL_ENABLED")
+if _SENTIVEL_ENABLED_ENV is None or not _SENTIVEL_ENABLED_ENV.strip():
+    SENTIVEL_ENABLED = bool(os.getenv("RENDER_EXTERNAL_URL", "").strip())
+else:
+    SENTIVEL_ENABLED = _SENTIVEL_ENABLED_ENV.strip().lower() not in ("false", "0", "no", "off")
 SENTIVEL_HEARTBEAT_URL = os.getenv("SENTIVEL_HEARTBEAT_URL", "").strip()
 
 # Used by api/webhook_sync.py to figure out where this process is currently

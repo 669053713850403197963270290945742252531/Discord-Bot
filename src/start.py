@@ -366,7 +366,7 @@ class Client(commands.Bot):
         if not rotate_presence_task.is_running():
             rotate_presence_task.start()
 
-        if config.SENTIVEL_HEARTBEAT_URL and not sentivel_heartbeat_task.is_running():
+        if config.SENTIVEL_ENABLED and config.SENTIVEL_HEARTBEAT_URL and not sentivel_heartbeat_task.is_running():
             sentivel_heartbeat_task.start()
 
         # Re-registers the /createpanel control panel's button handlers so
