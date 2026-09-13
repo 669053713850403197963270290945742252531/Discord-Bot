@@ -14,6 +14,7 @@ import re
 import shutil
 import signal
 import traceback
+import urllib.request
 from pathlib import Path
 
 # So `import api` / `import commands` resolve as top-level packages no
@@ -341,6 +342,9 @@ class Client(commands.Bot):
         if rotate_presence_task.is_running():
             rotate_presence_task.cancel()
 
+        if sentivel_heartbeat_task.is_running():
+            sentivel_heartbeat_task.cancel()
+
         if not self.is_closed():
             try:
                 await self.change_presence(status=discord.Status.invisible, activity=None)
@@ -361,6 +365,9 @@ class Client(commands.Bot):
         # change_presence() call needed here.
         if not rotate_presence_task.is_running():
             rotate_presence_task.start()
+
+        if config.SENTIVEL_HEARTBEAT_URL and not sentivel_heartbeat_task.is_running():
+            sentivel_heartbeat_task.start()
 
         # Re-registers the /createpanel control panel's button handlers so
         # they keep responding after a bot restart. This does NOT resend the
@@ -416,6 +423,41 @@ class Client(commands.Bot):
 
 
 bot = Client(command_prefix="!", intents=intents)
+
+# --- Sentivel heartbeat ---
+# Sentivel marks the bot down after 5 minutes without a ping. Ping every
+# 4 minutes to leave a safety margin for scheduling/network delay.
+_SENTIVEL_HEARTBEAT_INTERVAL = 4 * 60
+
+
+def _call_sentivel(url: str) -> None:
+    request = urllib.request.Request(url, method="GET")
+    with urllib.request.urlopen(request, timeout=10) as response:
+        response.read()
+
+
+@tasks.loop(seconds=_SENTIVEL_HEARTBEAT_INTERVAL)
+async def sentivel_heartbeat_task():
+    heartbeat_url = config.SENTIVEL_HEARTBEAT_URL
+    if not heartbeat_url:
+        return
+
+    try:
+        await asyncio.to_thread(_call_sentivel, heartbeat_url)
+    except Exception as exc:
+        print(f"Sentivel heartbeat failed: {exc}")
+        try:
+            await asyncio.to_thread(
+                _call_sentivel, f"{heartbeat_url.rstrip('/')}/fail"
+            )
+        except Exception as fail_exc:
+            print(f"Sentivel failure report failed: {fail_exc}")
+
+
+@sentivel_heartbeat_task.before_loop
+async def before_sentivel_heartbeat_task():
+    await bot.wait_until_ready()
+
 
 # --- Rotating status ---
 _PRESENCE_ROTATION_INTERVAL = 30
