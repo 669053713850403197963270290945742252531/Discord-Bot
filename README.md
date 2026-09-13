@@ -63,7 +63,7 @@ Discord-Bot/
 │       ├── encryption.py        # /encrypt, /decrypt -- modern authenticated encryption
 │       ├── genpass.py           # /genpass -- password/passphrase generator, single or bulk (up to 10)
 │       ├── moderation.py        # /ban, /checkban, /unban, /kick, /mute, /unmute, /purge, /ghostping, /dm, /slowmode, /togglelock, /togglelockdown
-│       ├── whitelist.py         # /whitelist, /bulkwhitelist, /register, /editwhitelist, /edituser, /viewwhitelist, /fetchuser, /fetchdupes, /unwhitelist, /clearnotes, /clearregistrations, /checkregistration, /hwidhelp
+│       ├── whitelist.py         # /whitelist, /bulkwhitelist, /register, /editwhitelist, /edituser, /viewwhitelist, /fetchuser, /unwhitelist, /clearnotes, /clearregistrations, /checkregistration, /hwidhelp
 │       ├── keys_hwid.py         # /key generate|validate|fetch|clear, /tempwhitelist, /checktemp, /extend, /forceresethwid, /resethwidcooldown
 │       ├── database.py          # /dbsearch, /export, /upload, /rollback, /commithistory, /fetchcommit, /verifydata
 │       ├── panel.py             # /createpanel + the persistent ControlPanelView
