@@ -541,23 +541,6 @@ class Whitelist(commands.Cog):
             embed.add_field(name=name, value=str(value), inline=True)
         await safe_respond(interaction, embed=embed, ephemeral=True)
 
-    @app_commands.command(name="fetchdupes", description="Find duplicate identifiers, Discord IDs, or keys.")
-    @app_commands.guilds(GUILD)
-    @has_role(config.REQUIRED_ROLE_ID)
-    @is_in_guild(config.GUILD_ID)
-    async def fetchdupes(self, interaction):
-        await safe_defer(interaction, ephemeral=True)
-        users = await fetch_users()
-        buckets = {"Identifier": {}, "Discord ID": {}, "License Key": {}}
-        for u in users:
-            for label, value in [("Identifier",u.get("Identifier")),("Discord ID",u.get("DiscordId")),("License Key",u.get("Key"))]:
-                if value: buckets[label].setdefault(str(value), []).append(u)
-        dupes=[]
-        for label, vals in buckets.items():
-            for value, entries in vals.items():
-                if len(entries)>1: dupes.append(f"**{label}:** `{value}` → {', '.join(e.get('Identifier','?') for e in entries)}")
-        await interaction.followup.send("\n".join(dupes) if dupes else "No duplicates found.", ephemeral=True)
-
     @app_commands.command(name="viewwhitelist", description="View all license entries.")
     @app_commands.guilds(GUILD)
     @has_role(config.REQUIRED_ROLE_ID)
