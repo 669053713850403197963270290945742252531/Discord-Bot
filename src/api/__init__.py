@@ -63,7 +63,7 @@ from .supabase_db import (
     fetch_users, fetch_users_with_sha, fetch_api_text_and_sha, commit_content, commit_users,
     get_license_by_key, get_license_by_discord_id, get_license_by_identifier,
     create_license, update_license, delete_license, redeem_license, set_license_games,
-    get_license_game_ids, list_games, get_game, game_allowed, complete_successful_execution,
+    get_license_game_ids, list_games, get_game, create_game, game_allowed, complete_successful_execution,
 )
 
 from .supabase_storage import SupabaseStorageError, fetch_game_script, upload_game_script

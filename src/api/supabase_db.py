@@ -587,6 +587,40 @@ async def get_game(game_id: str) -> Optional[Dict[str, Any]]:
     return await asyncio.to_thread(_get)
 
 
+def _create_game_sync(game_id: str, name: str, script_path: str) -> Dict[str, Any]:
+    game_id = str(game_id or "").strip()
+    name = str(name or "").strip()
+    script_path = str(script_path or "").strip().lstrip("/")
+    if not game_id:
+        raise ValueError("Game ID cannot be empty")
+    if not name:
+        raise ValueError("Game name cannot be empty")
+    if not script_path:
+        raise ValueError("Script path cannot be empty")
+    if ".." in script_path.split("/"):
+        raise ValueError("Script path cannot contain '..' path segments")
+
+    client = _client_sync()
+    existing = (client.table("games").select("id").eq("id", game_id).limit(1).execute()).data or []
+    if existing:
+        raise ValueError(f"Game with ID {game_id!r} already exists")
+
+    result = client.table("games").insert({
+        "id": game_id,
+        "name": name,
+        "script_path": script_path,
+        "enabled": True,
+    }).execute()
+    rows = result.data or []
+    if not rows:
+        raise RuntimeError("Supabase did not return the created game record")
+    return rows[0]
+
+
+async def create_game(game_id: str, name: str, script_path: str) -> Dict[str, Any]:
+    return await asyncio.to_thread(_create_game_sync, game_id, name, script_path)
+
+
 async def game_allowed(identifier: str, game_id: str) -> bool:
     def _check():
         client = _client_sync()
