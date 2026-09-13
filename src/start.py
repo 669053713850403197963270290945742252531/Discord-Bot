@@ -14,6 +14,7 @@ import re
 import shutil
 import signal
 import traceback
+import threading
 import urllib.request
 from pathlib import Path
 
@@ -436,22 +437,39 @@ def _call_sentivel(url: str) -> None:
         response.read()
 
 
+def _sentivel_heartbeat_worker(heartbeat_url: str) -> None:
+    """Perform the Sentivel request completely outside asyncio/discord.py.
+
+    A dedicated daemon thread is used instead of asyncio.to_thread() so the
+    heartbeat cannot consume a slot from asyncio's shared default executor.
+    This keeps Supabase/file/database work that uses asyncio.to_thread()
+    isolated from Sentivel, and the Discord event loop never waits on the
+    network request.
+    """
+    try:
+        _call_sentivel(heartbeat_url)
+    except Exception as exc:
+        print(f"Sentivel heartbeat failed: {exc}")
+        try:
+            _call_sentivel(f"{heartbeat_url.rstrip('/')}/fail")
+        except Exception as fail_exc:
+            print(f"Sentivel failure report failed: {fail_exc}")
+
+
 @tasks.loop(seconds=_SENTIVEL_HEARTBEAT_INTERVAL)
 async def sentivel_heartbeat_task():
     heartbeat_url = config.SENTIVEL_HEARTBEAT_URL
     if not heartbeat_url:
         return
 
-    try:
-        await asyncio.to_thread(_call_sentivel, heartbeat_url)
-    except Exception as exc:
-        print(f"Sentivel heartbeat failed: {exc}")
-        try:
-            await asyncio.to_thread(
-                _call_sentivel, f"{heartbeat_url.rstrip('/')}/fail"
-            )
-        except Exception as fail_exc:
-            print(f"Sentivel failure report failed: {fail_exc}")
+    # Fire-and-forget on a daemon thread. The event loop is not blocked,
+    # awaited, or made to share its default thread pool with this request.
+    threading.Thread(
+        target=_sentivel_heartbeat_worker,
+        args=(heartbeat_url,),
+        name="sentivel-heartbeat",
+        daemon=True,
+    ).start()
 
 
 @sentivel_heartbeat_task.before_loop
