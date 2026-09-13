@@ -11,7 +11,7 @@ from discord.ext import commands
 
 from api import config
 from api.discord_helpers import has_role, is_in_guild, send_error, send_success, safe_defer
-from api.supabase_db import fetch_users, fetch_api_text_and_sha, commit_content, serialize_users_json, list_games, get_game
+from api.supabase_db import fetch_users, fetch_api_text_and_sha, commit_content, serialize_users_json, list_games, get_game, create_game
 from api.supabase_storage import upload_game_script, SupabaseStorageError
 from api.users import revoke_buyer_role, find_removed_discord_ids
 
@@ -134,6 +134,79 @@ class Database(commands.Cog):
         else:
             embed.description = "No games are currently configured."
 
+        await interaction.followup.send(embed=embed, ephemeral=True)
+
+    @games_group.command(name="add", description="Adds a game and uploads its script to the private game-scripts bucket.")
+    @has_role(config.REQUIRED_ROLE_ID)
+    @is_in_guild(config.GUILD_ID)
+    @app_commands.describe(
+        game_id="The unique game ID to add to the Games database.",
+        name="The display name of the game.",
+        script_path="The private Storage object path for the game's script; this also determines the uploaded file name/path.",
+        file="The game script file to upload; it will be stored using Script Path as its name/path.",
+    )
+    async def games_add(
+        self,
+        interaction,
+        game_id: str,
+        name: str,
+        script_path: str,
+        file: discord.Attachment,
+    ):
+        await safe_defer(interaction, ephemeral=True)
+
+        game_id = game_id.strip()
+        name = name.strip()
+        script_path = script_path.strip().lstrip("/")
+
+        if not game_id:
+            return await send_error(interaction, "Game ID cannot be empty.")
+        if not name:
+            return await send_error(interaction, "Game name cannot be empty.")
+        if not script_path:
+            return await send_error(interaction, "Script Path cannot be empty.")
+        if ".." in script_path.split("/"):
+            return await send_error(interaction, "Script Path cannot contain `..` path segments.")
+
+        try:
+            existing = await get_game(game_id)
+        except Exception as exc:
+            return await send_error(interaction, f"Failed to look up game `{game_id}`: {exc}")
+
+        if existing:
+            return await send_error(interaction, f"A game with ID `{game_id}` already exists.")
+
+        try:
+            data = await file.read()
+        except Exception as exc:
+            return await send_error(interaction, f"Failed to read the uploaded script file: {exc}")
+
+        if not data:
+            return await send_error(interaction, "The uploaded script file is empty.")
+
+        try:
+            await upload_game_script(script_path, data)
+        except SupabaseStorageError as exc:
+            return await send_error(interaction, f"Failed to upload the game script: {exc}")
+
+        try:
+            game = await create_game(game_id, name, script_path)
+        except Exception as exc:
+            return await send_error(
+                interaction,
+                "The script was uploaded, but the Games database entry could not be created: "
+                f"{exc}",
+            )
+
+        embed = discord.Embed(
+            title="✅ Game Added",
+            description=f"**{name}** was added to the Games database and its script was uploaded successfully.",
+            color=discord.Color.green(),
+        )
+        embed.add_field(name="Game ID", value=f"`{game.get('id', game_id)}`", inline=True)
+        embed.add_field(name="Name", value=str(game.get("name", name)), inline=True)
+        embed.add_field(name="Script Path", value=f"`{script_path}`", inline=False)
+        embed.add_field(name="Uploaded File", value=f"`{file.filename}`", inline=False)
         await interaction.followup.send(embed=embed, ephemeral=True)
 
     @games_group.command(name="update", description="Replaces a game's script in the private game-scripts bucket.")
