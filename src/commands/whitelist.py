@@ -274,7 +274,7 @@ class DeleteUserConfirmView(LayoutView):
         await interaction.response.defer(ephemeral=True)
         view = self.whitelist_view
         if not view.users:
-            return await interaction.response.edit_message(view=view.render())
+            return await interaction.edit_original_response(view=view.render())
 
         entry = view.users[view.index]
         identifier = str(entry.get("Identifier") or "")
@@ -309,7 +309,7 @@ class DeleteUserConfirmView(LayoutView):
             view.index = max(0, len(view.users) - 1)
         view.pending_notice = f"🗑️ Deleted **{identifier}**."
         view._rebuild()
-        await interaction.response.edit_message(view=view)
+        await interaction.edit_original_response(view=view)
         view.pending_notice = None
 
     async def _cancel(self, interaction: discord.Interaction):
@@ -525,7 +525,7 @@ class Whitelist(commands.Cog):
             ("Expires At", expires_at),
         ]:
             embed.add_field(name=name, value=str(value), inline=True)
-        await interaction.response.send_message(embed=embed, ephemeral=True)
+        await interaction.followup.send(embed=embed, ephemeral=True)
 
     @app_commands.command(name="fetchdupes", description="Find duplicate identifiers, Discord IDs, or keys.")
     @app_commands.guilds(GUILD)
@@ -594,5 +594,5 @@ async def _fetchuser_impl(interaction, target):
         ("License Updated", updated), ("HWID Status", "Assigned" if entry.get("HWID") else "Unset"), ("Expires At", expires_at),
     ]:
         embed.add_field(name=name, value=str(value), inline=True)
-    await interaction.response.send_message(embed=embed, ephemeral=True)
+    await interaction.followup.send(embed=embed, ephemeral=True)
 

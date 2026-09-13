@@ -9,7 +9,7 @@ from discord.ui import Modal, TextInput, Label, LayoutView, Container, TextDispl
 
 from api import config
 from api.discord_helpers import has_role, is_in_guild, send_success, send_error, build_embed, default_ui_error, dms_enabled
-from api.supabase_db import get_license_by_discord_id, is_redeemable_key, redeem_license, reset_license_hwid
+from api.supabase_db import get_license_by_discord_id, has_license_by_discord_id, is_redeemable_key, redeem_license, reset_license_hwid
 from api.time_utils import format_discord_timestamp, hwid_reset_cooldown_remaining, humanize_timeleft
 
 GUILD = discord.Object(id=config.GUILD_ID)
@@ -88,7 +88,14 @@ class ControlPanelView(LayoutView):
         self.add_item(Container(TextDisplay(CONTROL_PANEL_TITLE), TextDisplay(CONTROL_PANEL_DESCRIPTION), ActionRow(self.redeem, self.script, self.role, self.reset_hwid, self.info), accent_color=discord.Color.green()))
 
     async def on_redeem(self, interaction):
-        # Open the modal immediately. A DB lookup here can exceed Discord's 3-second initial-response window; RedeemKeyModal validates the user's existing license after its submission has been deferred.
+        # Check whether the user already has a redeemed license before opening the modal.
+        # Keep the modal itself checking too, so the check cannot be bypassed by a race.
+        try:
+            already_redeemed = await has_license_by_discord_id(str(interaction.user.id))
+        except Exception as e:
+            return await send_error(interaction, f"Could not check your license status: {e}")
+        if already_redeemed:
+            return await send_error(interaction, "You already have a license associated with your Discord account.")
         await interaction.response.send_modal(RedeemKeyModal())
 
     async def on_script(self, interaction):
