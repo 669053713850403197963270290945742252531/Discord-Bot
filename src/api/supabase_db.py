@@ -621,6 +621,101 @@ async def create_game(game_id: str, name: str, script_path: str) -> Dict[str, An
     return await asyncio.to_thread(_create_game_sync, game_id, name, script_path)
 
 
+def _delete_game_sync(game_id: str) -> Optional[Dict[str, Any]]:
+    game_id = str(game_id or "").strip()
+    if not game_id:
+        raise ValueError("Game ID cannot be empty")
+
+    client = _client_sync()
+    existing = (client.table("games").select("*").eq("id", game_id).limit(1).execute()).data or []
+    if not existing:
+        return None
+
+    result = client.table("games").delete().eq("id", game_id).execute()
+    deleted = result.data or []
+    return deleted[0] if deleted else existing[0]
+
+
+async def delete_game(game_id: str) -> Optional[Dict[str, Any]]:
+    """Delete a supported game from the games table and return its prior record."""
+    return await asyncio.to_thread(_delete_game_sync, game_id)
+
+
+def _update_game_sync(
+    original_game_id: str,
+    game_id: str,
+    name: str,
+    script_path: str,
+    enabled: bool,
+) -> Dict[str, Any]:
+    original_game_id = str(original_game_id or "").strip()
+    game_id = str(game_id or "").strip()
+    name = str(name or "").strip()
+    script_path = str(script_path or "").strip().lstrip("/")
+
+    if not original_game_id:
+        raise ValueError("Original game ID cannot be empty")
+    if not game_id:
+        raise ValueError("Game ID cannot be empty")
+    if not name:
+        raise ValueError("Game name cannot be empty")
+    if not script_path:
+        raise ValueError("Script path cannot be empty")
+    if ".." in script_path.split("/"):
+        raise ValueError("Script path cannot contain '..' path segments")
+
+    client = _client_sync()
+    existing = (
+        client.table("games")
+        .select("*")
+        .eq("id", original_game_id)
+        .limit(1)
+        .execute()
+    ).data or []
+    if not existing:
+        raise ValueError(f"Game with ID {original_game_id!r} no longer exists")
+
+    if game_id != original_game_id:
+        duplicate = (
+            client.table("games")
+            .select("id")
+            .eq("id", game_id)
+            .limit(1)
+            .execute()
+        ).data or []
+        if duplicate:
+            raise ValueError(f"Game with ID {game_id!r} already exists")
+
+    result = (
+        client.table("games")
+        .update({
+            "id": game_id,
+            "name": name,
+            "script_path": script_path,
+            "enabled": bool(enabled),
+        })
+        .eq("id", original_game_id)
+        .execute()
+    )
+    rows = result.data or []
+    if not rows:
+        raise RuntimeError("Supabase did not return the updated game record")
+    return rows[0]
+
+
+async def update_game(
+    original_game_id: str,
+    game_id: str,
+    name: str,
+    script_path: str,
+    enabled: bool,
+) -> Dict[str, Any]:
+    """Update a supported game's database fields and return the new record."""
+    return await asyncio.to_thread(
+        _update_game_sync, original_game_id, game_id, name, script_path, enabled
+    )
+
+
 async def game_allowed(identifier: str, game_id: str) -> bool:
     def _check():
         client = _client_sync()
