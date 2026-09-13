@@ -2,6 +2,7 @@
 
 from datetime import datetime, timezone, timedelta
 import asyncio
+import io
 from typing import Optional
 
 import discord
@@ -14,7 +15,7 @@ from api.discord_helpers import has_role, is_in_guild, send_success, send_error,
 from api.alerts import send_alert, alert_embed, ALERT_COLOR_ADD, ALERT_COLOR_EDIT
 from api.keys import generate_key, parse_key_length_range, parse_game_ids
 from api.supabase_db import (
-    fetch_users, fetch_redeemable_keys, create_redeemable_key, delete_redeemable_key,
+    fetch_users, fetch_temp_whitelists, fetch_redeemable_keys, create_redeemable_key, delete_redeemable_key, delete_redeemable_keys,
     is_redeemable_key, get_license_by_key, get_license_by_discord_id, get_license_by_identifier, update_license, clear_hwid_reset_cooldown,
     create_license, delete_license,
 )
@@ -45,6 +46,7 @@ async def _redeem_pending_key(key: str, discord_id: str, identifier: str):
 
 
 async def _tempwhitelist_impl(interaction, user: discord.User, minutes: int, games_value: str = "*"):
+    await interaction.response.defer(ephemeral=True)
     if minutes <= 0:
         return await send_error(interaction, "`minutes` must be positive.")
     try:
@@ -363,6 +365,7 @@ class Keys(commands.Cog):
     )
 
     async def _set_user_enabled(self, interaction: discord.Interaction, user: discord.Member, enabled: bool):
+        await interaction.response.defer(ephemeral=True)
         if config.REQUIRED_ROLE_ID not in [r.id for r in getattr(interaction.user, "roles", [])]:
             return await send_error(interaction, "You do not have permission.")
 
@@ -408,6 +411,7 @@ class Keys(commands.Cog):
     @key_group.command(name="generate", description="Generate unredeemed license keys.")
     @app_commands.describe(amount="Number of keys", length="Fixed length or range, e.g. 25 or 25-32")
     async def key_generate(self, interaction: discord.Interaction, amount: app_commands.Range[int, 1, 100], length: str = "25-40"):
+        await interaction.response.defer(ephemeral=True)
         if config.REQUIRED_ROLE_ID not in [r.id for r in getattr(interaction.user, "roles", [])]:
             return await send_error(interaction, "You do not have permission to generate keys.")
         try:
@@ -428,20 +432,26 @@ class Keys(commands.Cog):
         except Exception as e:
             return await send_error(interaction, f"Failed to generate keys: {e}")
 
+        fields = [("Amount", f"`{len(generated)}`", True)]
+        keys_text = "```\n" + "\n".join(generated) + "\n```"
+        # Discord limits each embed field value to 1024 characters. The keys
+        # have already been generated and stored, so if their list would be
+        # too large, simply omit the list instead of failing the command.
+        if len(keys_text) <= 1024:
+            fields.append(("Keys", keys_text, False))
+
         await send_success(
             interaction,
             f"Generated {len(generated)} unredeemed license key(s).",
             title="License Keys Generated",
-            fields=[
-                ("Amount", f"`{len(generated)}`", True),
-                ("Keys", "```\n" + "\n".join(generated) + "\n```", False),
-            ],
+            fields=fields,
         )
 
 
     @key_group.command(name="validate", description="Validate a license key and show its status.")
     @app_commands.describe(key="License key to validate")
     async def key_validate(self, interaction, key: str):
+        await interaction.response.defer(ephemeral=True)
         if config.REQUIRED_ROLE_ID not in [r.id for r in getattr(interaction.user, "roles", [])]: return await send_error(interaction, "You do not have permission.")
         normalized = key.strip()
         redeemable = await is_redeemable_key(normalized)
@@ -466,6 +476,7 @@ class Keys(commands.Cog):
     @key_group.command(name="fetch", description="List unredeemed license keys.")
     @app_commands.describe(amount="Number of unredeemed license keys to fetch")
     async def key_fetch(self, interaction, amount: app_commands.Range[int, 1, 100] = 1):
+        await interaction.response.defer(ephemeral=True)
         if config.REQUIRED_ROLE_ID not in [r.id for r in getattr(interaction.user, "roles", [])]: return await send_error(interaction, "You do not have permission.")
         available_keys = await fetch_redeemable_keys()
         if len(available_keys) <= amount:
@@ -475,44 +486,80 @@ class Keys(commands.Cog):
         if not keys:
             return await send_error(interaction, "No unredeemed license keys are available.")
 
+        keys_text = "```\n" + "\n".join(keys) + "\n```"
+        if len(keys_text) <= 1024:
+            await send_success(
+                interaction,
+                f"Fetched {len(keys)} unredeemed license key(s).",
+                title="Unredeemed License Keys",
+                fields=[
+                    ("Amount", f"`{len(keys)}`", True),
+                    ("Keys", keys_text, False),
+                ],
+            )
+            return
+
+        key_file = discord.File(
+            io.BytesIO("\n".join(keys).encode("utf-8")),
+            filename="fetched-keys.txt",
+        )
         await send_success(
             interaction,
-            f"Fetched {len(keys)} unredeemed license key(s).",
+            f"Fetched {len(keys)} unredeemed license key(s). The keys exceeded Discord's embed field limit, so they are attached as a file.",
             title="Unredeemed License Keys",
-            fields=[
-                ("Amount", f"`{len(keys)}`", True),
-                ("Keys", "```\n" + "\n".join(keys) + "\n```", False),
-            ],
+            fields=[("Amount", f"`{len(keys)}`", True)],
+            file=key_file,
         )
 
-    @key_group.command(name="clear", description="Delete one or more unredeemed license keys.")
-    @app_commands.describe(key="License key(s) to delete, separated by commas")
-    async def key_clear(self, interaction, key: str):
+    @key_group.command(name="clear", description="Delete unredeemed license keys.")
+    @app_commands.describe(
+        key="License key(s) to delete, separated by commas",
+        amount="Number of random unredeemed keys to delete",
+    )
+    async def key_clear(
+        self,
+        interaction,
+        key: Optional[str] = None,
+        amount: Optional[app_commands.Range[int, 1, 100]] = None,
+    ):
+        await interaction.response.defer(ephemeral=True)
         if config.REQUIRED_ROLE_ID not in [r.id for r in getattr(interaction.user, "roles", [])]:
             return await send_error(interaction, "You do not have permission.")
 
+        if key and amount is not None:
+            return await send_error(interaction, "Provide either `key` or `amount`, not both.")
+
         keys = []
-        seen = set()
-        for raw_key in key.split(","):
-            normalized = raw_key.strip()
-            if normalized and normalized not in seen:
-                seen.add(normalized)
-                keys.append(normalized)
+        if amount is not None:
+            available_keys = await fetch_redeemable_keys()
+            if not available_keys:
+                return await send_error(interaction, "No unredeemed license keys are available.")
+            count = min(amount, len(available_keys))
+            keys = secrets.SystemRandom().sample(available_keys, count)
+        elif key:
+            seen = set()
+            for raw_key in key.split(","):
+                normalized = raw_key.strip()
+                if normalized and normalized not in seen:
+                    seen.add(normalized)
+                    keys.append(normalized)
 
         if not keys:
-            return await send_error(interaction, "Please provide at least one license key.")
+            return await send_error(interaction, "Provide `key` or `amount` to specify what should be deleted.")
 
-        removed = []
-        not_found = []
         try:
-            for normalized in keys:
-                if not await is_redeemable_key(normalized):
-                    not_found.append(normalized)
-                    continue
-                if await delete_redeemable_key(normalized):
-                    removed.append(normalized)
-                else:
-                    not_found.append(normalized)
+            redeemable_now = set(await fetch_redeemable_keys())
+            keys_to_delete = [normalized for normalized in keys if normalized in redeemable_now]
+            not_found = [normalized for normalized in keys if normalized not in redeemable_now]
+
+            if keys_to_delete:
+                removed = await delete_redeemable_keys(keys_to_delete)
+                removed_set = set(removed)
+                for normalized in keys_to_delete:
+                    if normalized not in removed_set:
+                        not_found.append(normalized)
+            else:
+                removed = []
         except Exception as e:
             return await send_error(interaction, f"Failed to delete license keys: {e}")
 
@@ -521,7 +568,11 @@ class Keys(commands.Cog):
 
         fields = [("Deleted", f"`{len(removed)}`", True)]
         if not_found:
-            fields.append(("Not Found / Already Redeemed", "\n".join(f"`{item}`" for item in not_found), False))
+            not_found_text = "\n".join(f"`{item}`" for item in not_found)
+            if len(not_found_text) <= 1024:
+                fields.append(("Not Found / Already Redeemed", not_found_text, False))
+            else:
+                fields.append(("Not Found / Already Redeemed", f"`{len(not_found)}` key(s) omitted because the list is too long for Discord's embed field limit.", False))
 
         await send_success(
             interaction,
@@ -533,6 +584,7 @@ class Keys(commands.Cog):
     @app_commands.guilds(GUILD)
     @app_commands.describe(user="The whitelisted user whose HWID reset cooldown should be cleared")
     async def resethwidcooldown(self, interaction: discord.Interaction, user: discord.Member):
+        await interaction.response.defer(ephemeral=True)
         if config.REQUIRED_ROLE_ID not in [r.id for r in getattr(interaction.user, "roles", [])]:
             return await send_error(interaction, "You do not have permission.")
         resolved = user
@@ -551,11 +603,15 @@ class Keys(commands.Cog):
 
 
 async def reconcile_temp_whitelists(bot):
-    """Remove expired temporary license rows and reschedule live expirations."""
+    """Remove expired temporary license rows and reschedule live expirations.
+
+    Startup reconciliation only needs Temp licenses and their expiry timestamps;
+    do not load every license or perform the license_games query here.
+    """
     now = datetime.now(timezone.utc)
     removed = 0
     scheduled = 0
-    for entry in await fetch_users():
+    for entry in await fetch_temp_whitelists():
         if str(entry.get("Rank") or "").strip().lower() != "temp":
             continue
         identifier = str(entry.get("Identifier") or "").strip()

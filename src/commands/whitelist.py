@@ -82,6 +82,7 @@ class WhitelistModal(Modal, title="Whitelist a User"):
         await default_ui_error(interaction, error, label="WhitelistModal")
 
     async def on_submit(self, interaction):
+        await interaction.response.defer(ephemeral=True)
         identifier = self.identifier.component.value.strip()
         discord_id = self.target_user.component.value.strip()
         rank = self.rank.component.values[0]
@@ -270,6 +271,7 @@ class DeleteUserConfirmView(LayoutView):
         ))
 
     async def _confirm(self, interaction: discord.Interaction):
+        await interaction.response.defer(ephemeral=True)
         view = self.whitelist_view
         if not view.users:
             return await interaction.response.edit_message(view=view.render())
@@ -487,6 +489,7 @@ class Whitelist(commands.Cog):
     @has_role(config.REQUIRED_ROLE_ID)
     @is_in_guild(config.GUILD_ID)
     async def edituser(self, interaction, user: discord.Member):
+        # This lookup must happen before opening the modal; keep it as fast as possible.
         entry = await get_license_by_discord_id(str(user.id))
         if not entry: return await send_error(interaction, "That user is not licensed.")
         await interaction.response.send_modal(EditUserModal(entry))
@@ -497,6 +500,7 @@ class Whitelist(commands.Cog):
     @has_role(config.REQUIRED_ROLE_ID)
     @is_in_guild(config.GUILD_ID)
     async def fetchuser(self, interaction, user: discord.Member):
+        await interaction.response.defer(ephemeral=True)
         entry = await get_license_by_discord_id(str(user.id))
         if not entry: return await send_error(interaction, "That user is not licensed.")
         embed = discord.Embed(title="License Information", color=discord.Color.green())
@@ -528,6 +532,7 @@ class Whitelist(commands.Cog):
     @has_role(config.REQUIRED_ROLE_ID)
     @is_in_guild(config.GUILD_ID)
     async def fetchdupes(self, interaction):
+        await interaction.response.defer(ephemeral=True)
         users = await fetch_users()
         buckets = {"Identifier": {}, "Discord ID": {}, "License Key": {}}
         for u in users:
@@ -537,7 +542,7 @@ class Whitelist(commands.Cog):
         for label, vals in buckets.items():
             for value, entries in vals.items():
                 if len(entries)>1: dupes.append(f"**{label}:** `{value}` → {', '.join(e.get('Identifier','?') for e in entries)}")
-        await interaction.response.send_message("\n".join(dupes) if dupes else "No duplicates found.", ephemeral=True)
+        await interaction.followup.send("\n".join(dupes) if dupes else "No duplicates found.", ephemeral=True)
 
     @app_commands.command(name="viewwhitelist", description="View all license entries.")
     @app_commands.guilds(GUILD)
@@ -570,6 +575,7 @@ async def _unwhitelist_impl(interaction, target):
     return await _unwhitelist_user_impl(interaction, target)
 
 async def _fetchuser_impl(interaction, target):
+    await interaction.response.defer(ephemeral=True)
     entry = await get_license_by_discord_id(str(target.id))
     if not entry: return await send_error(interaction, "That user is not licensed.")
     last_hwid_reset = format_discord_timestamp(entry.get("LastHwidReset"), "R") if entry.get("LastHwidReset") else "Never"

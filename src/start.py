@@ -398,7 +398,10 @@ class Client(commands.Bot):
             await reconcile_banned_users_cache(self, botstate)
             await reconcile_lockdown(self, botstate)
             await reconcile_channel_locks(self, botstate)
-            await reconcile_temp_whitelists(self)
+            try:
+                await reconcile_temp_whitelists(self)
+            except Exception as e:
+                print(f"Failed to reconcile temporary whitelists at startup: {e}")
             await reconcile_temp_access(self, botstate)
             await reconcile_reaction_role_panel(self, botstate)
             await reconcile_temp_roles(self, botstate)

@@ -140,6 +140,29 @@ async def fetch_users() -> List[Dict[str, Any]]:
     return await asyncio.to_thread(_fetch_users_sync)
 
 
+def _fetch_temp_whitelists_sync() -> List[Dict[str, Any]]:
+    """Fetch only the fields startup temp-whitelist reconciliation needs."""
+    rows = (
+        _client_sync()
+        .table("licenses")
+        .select("identifier,rank,expires_at")
+        .eq("rank", "Temp")
+        .execute()
+    ).data or []
+    return [
+        {
+            "Identifier": row.get("identifier"),
+            "Rank": row.get("rank"),
+            "ExpiresAt": _iso(row.get("expires_at")),
+        }
+        for row in rows
+    ]
+
+
+async def fetch_temp_whitelists() -> List[Dict[str, Any]]:
+    return await asyncio.to_thread(_fetch_temp_whitelists_sync)
+
+
 async def fetch_users_with_sha() -> Tuple[List[Dict[str, Any]], None]:
     return await fetch_users(), None
 
@@ -264,6 +287,51 @@ async def delete_redeemable_key(key: str) -> bool:
         )
         return bool(result.data)
     return await asyncio.to_thread(_delete)
+
+
+async def delete_redeemable_keys(keys: List[str], *, chunk_size: int = 20, retries: int = 3) -> List[str]:
+    """Delete multiple unredeemed keys in bounded batches with retry handling.
+
+    Returns the keys Supabase confirmed as deleted. Batching avoids issuing one
+    network request per key, which can cause slow commands and transient 504
+    gateway timeouts for larger amounts such as /key clear amount:50.
+    """
+    normalized_keys = []
+    seen = set()
+    for key in keys:
+        normalized = str(key).strip()
+        if normalized and normalized not in seen:
+            seen.add(normalized)
+            normalized_keys.append(normalized)
+
+    if not normalized_keys:
+        return []
+
+    async def delete_chunk(chunk: List[str]) -> List[str]:
+        def _delete():
+            result = (
+                _client_sync().table("license_keys")
+                .delete()
+                .in_("key", chunk)
+                .select("key")
+                .execute()
+            )
+            return [str(row["key"]).strip() for row in (result.data or []) if row.get("key")]
+
+        last_error = None
+        for attempt in range(retries):
+            try:
+                return await asyncio.to_thread(_delete)
+            except Exception as exc:
+                last_error = exc
+                if attempt + 1 < retries:
+                    await asyncio.sleep(0.5 * (2 ** attempt))
+        raise last_error
+
+    removed = []
+    for start in range(0, len(normalized_keys), max(1, chunk_size)):
+        removed.extend(await delete_chunk(normalized_keys[start:start + max(1, chunk_size)]))
+    return removed
 
 
 def _get_by_key_sync(key: str) -> Optional[Dict[str, Any]]:
