@@ -55,6 +55,16 @@ def _download_sync(path: str) -> bytes:
     return bytes(data)
 
 
+async def fetch_game_script_bytes(path: str) -> bytes:
+    """Download a game script object as raw bytes from the private bucket."""
+    try:
+        return await asyncio.to_thread(_download_sync, path)
+    except SupabaseStorageError:
+        raise
+    except Exception as exc:
+        raise SupabaseStorageError("Unexpected Supabase Storage failure") from exc
+
+
 async def fetch_game_script(path: str) -> str:
     """Download a UTF-8 Luau script from the private game-scripts bucket."""
     try:
@@ -68,6 +78,47 @@ async def fetch_game_script(path: str) -> str:
         return data.decode("utf-8")
     except UnicodeDecodeError as exc:
         raise SupabaseStorageError("Protected game script is not valid UTF-8") from exc
+
+
+def _list_sync(path: str = "") -> list[dict]:
+    """List objects in the private game-scripts bucket under a folder."""
+    path = str(path or "").strip().strip("/")
+    try:
+        options = {"limit": 1000, "offset": 0, "sortBy": {"column": "name", "order": "asc"}}
+        data = _get_client().storage.from_(config.SUPABASE_GAME_SCRIPTS_BUCKET).list(path, options)
+    except Exception as exc:
+        raise SupabaseStorageError(
+            f"Failed to list protected game scripts in Supabase Storage under {path or '<root>'!r}"
+        ) from exc
+
+    if not isinstance(data, list):
+        raise SupabaseStorageError("Supabase Storage returned an invalid object listing")
+    return [item for item in data if isinstance(item, dict)]
+
+
+async def get_game_script_filename(path: str) -> str:
+    """Return the filename of an object that exists at the supplied Storage path."""
+    normalized = _validate_path(path)
+    parent = str(PurePosixPath(normalized).parent)
+    if parent == ".":
+        parent = ""
+    expected_name = PurePosixPath(normalized).name
+
+    try:
+        objects = await asyncio.to_thread(_list_sync, parent)
+    except SupabaseStorageError:
+        raise
+    except Exception as exc:
+        raise SupabaseStorageError("Unexpected Supabase Storage listing failure") from exc
+
+    for item in objects:
+        name = str(item.get("name") or "")
+        if name == expected_name:
+            return name
+
+    raise SupabaseStorageError(
+        f"Game script was not found in Supabase Storage at {normalized!r}"
+    )
 
 
 def _storage_upload_url(path: str) -> str:
@@ -167,3 +218,51 @@ async def upload_game_script(path: str, data: bytes) -> None:
         raise
     except Exception as exc:
         raise SupabaseStorageError("Unexpected Supabase Storage upload failure") from exc
+
+def _delete_sync(path: str) -> None:
+    """Delete a game script object from the private Storage bucket."""
+    path = _validate_path(path)
+    url = _storage_upload_url(path)
+    headers = {
+        "Authorization": f"Bearer {config.SUPABASE_SECRET_KEY}",
+        "apikey": config.SUPABASE_SECRET_KEY,
+    }
+
+    request = Request(url, headers=headers, method="DELETE")
+    try:
+        with urlopen(request, timeout=30) as response:
+            status = getattr(response, "status", 200)
+            if 200 <= status < 300:
+                return
+            raise SupabaseStorageError(
+                f"HTTP {status} from Supabase Storage while deleting {path!r}"
+            )
+    except HTTPError as exc:
+        # DELETE is intentionally unchanged for this command:
+        # if the object is already absent, the desired end state is satisfied.
+        if exc.code in (404,):
+            return
+        raise SupabaseStorageError(
+            f"Failed to delete game script from Supabase Storage at {path!r}: {_format_http_error(exc)}"
+        ) from exc
+    except (URLError, TimeoutError) as exc:
+        raise SupabaseStorageError(
+            f"Network error while deleting game script at {path!r}: {exc}"
+        ) from exc
+    except SupabaseStorageError:
+        raise
+    except Exception as exc:
+        raise SupabaseStorageError(
+            f"Unexpected error while deleting game script at {path!r}: {exc}"
+        ) from exc
+
+
+async def delete_game_script(path: str) -> None:
+    """Delete an object from the private game-scripts bucket."""
+    try:
+        await asyncio.to_thread(_delete_sync, path)
+    except SupabaseStorageError:
+        raise
+    except Exception as exc:
+        raise SupabaseStorageError("Unexpected Supabase Storage deletion failure") from exc
+

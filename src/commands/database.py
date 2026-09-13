@@ -4,19 +4,117 @@ import csv
 import io
 import json
 from typing import List
+from pathlib import PurePosixPath
 
 import discord
 from discord import app_commands
 from discord.ext import commands
 
 from api import config
-from api.discord_helpers import has_role, is_in_guild, send_error, send_success, safe_defer
-from api.supabase_db import fetch_users, fetch_api_text_and_sha, commit_content, serialize_users_json, list_games, get_game, create_game
-from api.supabase_storage import upload_game_script, SupabaseStorageError
+from api.discord_helpers import has_role, is_in_guild, send_error, send_success, default_ui_error, safe_defer, safe_send_modal
+from api.supabase_db import fetch_users, fetch_api_text_and_sha, commit_content, serialize_users_json, list_games, get_game, create_game, delete_game, update_game
+from api.supabase_storage import fetch_game_script_bytes, upload_game_script, delete_game_script, get_game_script_filename, SupabaseStorageError
 from api.users import revoke_buyer_role, find_removed_discord_ids
 
 GUILD = discord.Object(id=config.GUILD_ID)
 
+
+class GameEditModal(discord.ui.Modal, title="Edit Game"):
+        game_id = discord.ui.Label(text="Game ID", component=discord.ui.TextInput(max_length=100))
+        name = discord.ui.Label(text="Name", component=discord.ui.TextInput(max_length=100))
+        file_name = discord.ui.Label(text="File Name", component=discord.ui.TextInput(max_length=255))
+        enabled = discord.ui.Label(
+            text="Enabled",
+            description="Whether this game is available for license checks.",
+            component=discord.ui.Checkbox(default=True),
+        )
+
+        def __init__(self, game: dict, file_name: str):
+            super().__init__(title=f"Edit {game.get('name', 'Game')}"[:45])
+            self.original_game_id = str(game.get("id") or "")
+            self.game_id.component.default = self.original_game_id
+            self.name.component.default = str(game.get("name") or "")
+            self.file_name.component.default = file_name
+            self.enabled.component.default = bool(game.get("enabled", True))
+
+        async def on_error(self, interaction: discord.Interaction, error: Exception):
+            await default_ui_error(interaction, error, label="GameEditModal")
+
+        async def on_submit(self, interaction: discord.Interaction):
+            await safe_defer(interaction, ephemeral=True)
+
+            new_game_id = self.game_id.component.value.strip()
+            new_name = self.name.component.value.strip()
+            new_file_name = self.file_name.component.value.strip().lstrip("/")
+            # The Script Path is intentionally derived from File Name on submission.
+            # This prevents the two fields from becoming mismatched.
+            new_script_path = new_file_name
+            new_enabled = bool(self.enabled.component.value)
+
+            if not new_game_id:
+                return await send_error(interaction, "Game ID cannot be empty.")
+            if not new_name:
+                return await send_error(interaction, "Name cannot be empty.")
+            if not new_file_name:
+                return await send_error(interaction, "File name cannot be empty.")
+            if ".." in new_file_name.split("/"):
+                return await send_error(interaction, "File name cannot contain `..` path segments.")
+
+            try:
+                current_game = await get_game(self.original_game_id)
+            except Exception as exc:
+                return await send_error(interaction, f"Failed to verify the current game record: {exc}")
+            if not current_game:
+                return await send_error(interaction, "This game no longer exists in the database.")
+
+            try:
+                duplicate = await get_game(new_game_id)
+            except Exception as exc:
+                return await send_error(interaction, f"Failed to validate the new Game ID: {exc}")
+            if duplicate and str(duplicate.get("id")) != self.original_game_id:
+                return await send_error(interaction, f"A game with ID `{new_game_id}` already exists.")
+
+            old_script_path = str(current_game.get("script_path") or "").strip().lstrip("/")
+            if not old_script_path:
+                return await send_error(interaction, "The existing game has no valid script path.")
+
+            storage_changed = new_script_path != old_script_path
+            new_uploaded = False
+            if storage_changed:
+                try:
+                    script_bytes = await fetch_game_script_bytes(old_script_path)
+                    await upload_game_script(new_script_path, script_bytes)
+                    new_uploaded = True
+                except SupabaseStorageError as exc:
+                    return await send_error(interaction, f"Failed to move the game script in Storage: {exc}")
+
+            try:
+                updated = await update_game(
+                    self.original_game_id,
+                    new_game_id,
+                    new_name,
+                    new_script_path,
+                    new_enabled,
+                )
+            except Exception as exc:
+                if new_uploaded:
+                    try:
+                        await delete_game_script(new_script_path)
+                    except Exception:
+                        pass
+                return await send_error(interaction, f"Failed to update the Games database: {exc}")
+
+            if storage_changed:
+                try:
+                    await delete_game_script(old_script_path)
+                except SupabaseStorageError as exc:
+                    await send_success(
+                        interaction,
+                        f"Updated **{new_name}**, but the old Storage object `{old_script_path}` could not be removed.\n\nError: {exc}",
+                    )
+                    return
+
+            await send_success(interaction, f"Updated **{new_name}** (`{new_game_id}`).")
 
 class Database(commands.Cog):
     def __init__(self, bot): self.bot = bot
@@ -136,6 +234,37 @@ class Database(commands.Cog):
 
         await interaction.followup.send(embed=embed, ephemeral=True)
 
+    @games_group.command(name="edit", description="Edits a supported game's information.")
+    @has_role(config.REQUIRED_ROLE_ID)
+    @is_in_guild(config.GUILD_ID)
+    @app_commands.describe(game_id="The unique game ID to edit.")
+    async def games_edit(self, interaction, game_id: str):
+        game_id = game_id.strip()
+        if not game_id:
+            return await send_error(interaction, "Game ID cannot be empty.")
+
+        try:
+            game = await get_game(game_id)
+        except Exception as exc:
+            return await send_error(interaction, f"Failed to look up game `{game_id}`: {exc}")
+
+        if not game:
+            return await send_error(interaction, f"No supported game with ID `{game_id}` was found.")
+
+        script_path = str(game.get("script_path") or "").strip().lstrip("/")
+        if not script_path:
+            return await send_error(interaction, f"Game `{game_id}` does not have a valid script path configured.")
+
+        try:
+            file_name = await get_game_script_filename(script_path)
+        except SupabaseStorageError as exc:
+            return await send_error(
+                interaction,
+                f"The game exists in the database, but its script could not be found in the private `game-scripts` bucket: {exc}",
+            )
+
+        await safe_send_modal(interaction, GameEditModal(game, file_name))
+
     @games_group.command(name="add", description="Adds a game and uploads its script to the private game-scripts bucket.")
     @has_role(config.REQUIRED_ROLE_ID)
     @is_in_guild(config.GUILD_ID)
@@ -207,6 +336,72 @@ class Database(commands.Cog):
         embed.add_field(name="Name", value=str(game.get("name", name)), inline=True)
         embed.add_field(name="Script Path", value=f"`{script_path}`", inline=False)
         embed.add_field(name="Uploaded File", value=f"`{file.filename}`", inline=False)
+        await interaction.followup.send(embed=embed, ephemeral=True)
+
+
+    @games_group.command(name="remove", description="Removes a supported game and its script from the private storage bucket.")
+    @has_role(config.REQUIRED_ROLE_ID)
+    @is_in_guild(config.GUILD_ID)
+    @app_commands.describe(game_id="The game ID of the supported game to remove.")
+    async def games_remove(self, interaction, game_id: str):
+        await safe_defer(interaction, ephemeral=True)
+
+        game_id = game_id.strip()
+        if not game_id:
+            return await send_error(interaction, "Game ID cannot be empty.")
+
+        try:
+            game = await get_game(game_id)
+        except Exception as exc:
+            return await send_error(interaction, f"Failed to look up game `{game_id}`: {exc}")
+
+        if not game:
+            return await send_error(interaction, f"No game with ID `{game_id}` was found in the Games database.")
+
+        script_path = str(game.get("script_path") or "").strip().lstrip("/")
+        if not script_path:
+            return await send_error(interaction, f"Game `{game_id}` does not have a configured script path; refusing to remove it.")
+
+        # Keep the database and private Storage cleanup tied to the same game
+        # record. The script_path comes exclusively from the database lookup.
+        try:
+            deleted_game = await delete_game(game_id)
+        except Exception as exc:
+            return await send_error(interaction, f"Failed to delete game `{game_id}` from the Games database: {exc}")
+
+        if not deleted_game:
+            return await send_error(interaction, f"Game `{game_id}` could not be deleted because it no longer exists.")
+
+        try:
+            await delete_game_script(script_path)
+        except SupabaseStorageError as exc:
+            # Best-effort rollback so a Storage failure does not leave the
+            # database without its supported-game record.
+            try:
+                await create_game(
+                    str(deleted_game.get("id", game_id)),
+                    str(deleted_game.get("name", "")),
+                    script_path,
+                )
+            except Exception as rollback_exc:
+                return await send_error(
+                    interaction,
+                    "The game was removed from the Games database, but its Storage script could not be deleted, "
+                    f"and the database rollback also failed: {exc} | Rollback: {rollback_exc}",
+                )
+            return await send_error(
+                interaction,
+                f"Failed to delete the game script `{script_path}` from Storage. The Games database entry was restored: {exc}",
+            )
+
+        embed = discord.Embed(
+            title="✅ Game Removed",
+            description=f"**{game.get('name', game_id)}** was removed successfully.",
+            color=discord.Color.green(),
+        )
+        embed.add_field(name="Game ID", value=f"`{game_id}`", inline=True)
+        embed.add_field(name="Script Path", value=f"`{script_path}`", inline=False)
+        embed.set_footer(text="Database entry and private Storage script deleted.")
         await interaction.followup.send(embed=embed, ephemeral=True)
 
     @games_group.command(name="update", description="Replaces a game's script in the private game-scripts bucket.")
