@@ -1,5 +1,6 @@
 import asyncio
 import platform
+import os
 from datetime import datetime, timezone
 from typing import Any, Dict, List, Optional, Tuple
 
@@ -9,7 +10,7 @@ from discord.ext import commands
 
 from api import config
 from api.discord_helpers import has_role, is_in_guild, send_error, build_embed, safe_respond
-from api.supabase_db import fetch_users, get_license_by_discord_id
+from api.supabase_db import get_license_by_discord_id
 from api.time_utils import format_discord_timestamp
 from api.users import find_user_by_discord_id
 
@@ -48,27 +49,18 @@ class Info(commands.Cog):
     def __init__(self, bot: commands.Bot):
         self.bot = bot
 
-    @app_commands.command(name="botstatus", description="Shows the bot's health and current license database status.")
+    @app_commands.command(name="botstatus", description="Shows the bot's health and current runtime status.")
     @app_commands.guilds(GUILD)
     @has_role(config.REQUIRED_ROLE_ID)
     @is_in_guild(config.GUILD_ID)
     async def botstatus(self, interaction: discord.Interaction):
         await interaction.response.defer(ephemeral=True)
-        try:
-            users = await fetch_users()
-            db_status = "✅ Connected to Supabase."
-            user_count = len(users)
-            db_color = discord.Color.green()
-        except Exception as e:
-            db_status = f"❌ Couldn't reach Supabase ({e})."
-            user_count = None
-            db_color = discord.Color.red()
 
-        embed = self._build_status_embed(db_status, user_count, db_color)
+        embed = self._build_status_embed(live=True)
         message = await interaction.followup.send(embed=embed, ephemeral=True)
         asyncio.create_task(self._botstatus_tracker(message))
 
-    def _build_status_embed(self, db_status: str, user_count: Optional[int], color: discord.Color, *, live: bool = True) -> discord.Embed:
+    def _build_status_embed(self, *, live: bool = True) -> discord.Embed:
         footer = (
             "Live status -- updates automatically for ~14 minutes" if live
             else "No longer live -- run /botstatus again for current status"
@@ -77,18 +69,19 @@ class Info(commands.Cog):
         group_count = sum(1 for c in top_level if isinstance(c, app_commands.Group))
         command_count = len(top_level) - group_count
 
+        environment = "Hosted" if os.getenv("RENDER_EXTERNAL_URL", "").strip() else "Local"
         fields = [
+            # Runtime
             ("🏓 Latency", f"{round(self.bot.latency * 1000)}ms", True),
             ("⏱️ Uptime", f"<t:{int(_PROCESS_STARTED_AT.timestamp())}:R>", True),
-            ("🌐 Guilds", str(len(self.bot.guilds)), True),
-            ("🗄️ License Database", db_status, False),
-            ("👥 Licensed Users", str(user_count) if user_count is not None else "Unavailable", True),
+            ("🖥️ Environment", environment, True),
+            # Bot information
             ("🧩 Commands Registered", str(command_count), True),
             ("🗂️ Groups Registered", str(group_count), True),
             ("📚 discord.py", discord.__version__, True),
             ("🐍 Python", platform.python_version(), True),
         ]
-        return build_embed(title="🤖 Bot Status", color=color, footer=footer, fields=fields)
+        return build_embed(title="🤖 Bot Status", color=discord.Color.green(), footer=footer, fields=fields)
 
     async def _botstatus_tracker(self, message: discord.WebhookMessage):
         loop_clock = asyncio.get_running_loop()
@@ -100,25 +93,17 @@ class Info(commands.Cog):
                 await asyncio.sleep(max(0, next_tick - loop_clock.time()))
                 elapsed += BOTSTATUS_TRACKER_TICK
                 try:
-                    users = await fetch_users()
-                    db_status = "✅ Connected to Supabase."
-                    user_count = len(users)
-                    color = discord.Color.green()
-                except Exception as e:
-                    db_status = f"❌ Couldn't reach Supabase ({e})."
-                    user_count = None
-                    color = discord.Color.red()
-                try:
-                    await message.edit(embed=self._build_status_embed(db_status, user_count, color))
+                    await message.edit(embed=self._build_status_embed())
                 except discord.NotFound:
                     return
                 except discord.HTTPException:
                     pass
             try:
-                users = await fetch_users()
-                await message.edit(embed=self._build_status_embed("✅ Connected to Supabase.", len(users), discord.Color.green(), live=False))
-            except Exception as e:
-                await message.edit(embed=self._build_status_embed(f"❌ Couldn't reach Supabase ({e}).", None, discord.Color.red(), live=False))
+                await message.edit(embed=self._build_status_embed(live=False))
+            except discord.NotFound:
+                return
+            except discord.HTTPException:
+                pass
         except (asyncio.CancelledError, discord.NotFound, discord.HTTPException):
             pass
 
