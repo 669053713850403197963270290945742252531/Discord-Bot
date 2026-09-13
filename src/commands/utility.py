@@ -9,6 +9,7 @@ from discord.ext import commands
 
 from api import config
 from api.discord_helpers import (
+    safe_defer,
     has_role, is_in_guild, safe_respond, send_error, build_embed,
     build_unified_diff, send_diff_result,
 )
@@ -293,7 +294,7 @@ class Utility(commands.Cog):
     @has_role(config.REQUIRED_ROLE_ID)
     @is_in_guild(config.GUILD_ID)
     async def diff_cmd(self, interaction: discord.Interaction, original: discord.Attachment, new: discord.Attachment):
-        await interaction.response.defer(ephemeral=True)
+        await safe_defer(interaction, ephemeral=True)
 
         for attachment in (original, new):
             if attachment.size > MAX_DIFF_ATTACHMENT_SIZE:

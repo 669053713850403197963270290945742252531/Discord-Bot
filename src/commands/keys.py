@@ -11,7 +11,7 @@ from discord import app_commands
 from discord.ext import commands
 
 from api import config
-from api.discord_helpers import has_role, is_in_guild, send_success, send_error, resolve_user_option
+from api.discord_helpers import has_role, is_in_guild, send_success, send_error, resolve_user_option, safe_defer
 from api.alerts import send_alert, alert_embed, ALERT_COLOR_ADD, ALERT_COLOR_EDIT
 from api.keys import generate_key, parse_key_length_range, parse_game_ids
 from api.supabase_db import (
@@ -46,7 +46,7 @@ async def _redeem_pending_key(key: str, discord_id: str, identifier: str):
 
 
 async def _tempwhitelist_impl(interaction, user: discord.User, minutes: int, games_value: str = "*"):
-    await interaction.response.defer(ephemeral=True)
+    await safe_defer(interaction, ephemeral=True)
     if minutes <= 0:
         return await send_error(interaction, "`minutes` must be positive.")
     try:
@@ -104,7 +104,7 @@ async def _expire_temp_license_after_delay(identifier: str, expiry: datetime):
 
 async def _checktemp_impl(interaction, user):
     """Show a live temporary-whitelist tracker in the invoker's DMs."""
-    await interaction.response.defer(ephemeral=True)
+    await safe_defer(interaction, ephemeral=True)
 
     entry = await get_license_by_discord_id(str(user.id))
     if not entry:
@@ -365,7 +365,7 @@ class Keys(commands.Cog):
     )
 
     async def _set_user_enabled(self, interaction: discord.Interaction, user: discord.Member, enabled: bool):
-        await interaction.response.defer(ephemeral=True)
+        await safe_defer(interaction, ephemeral=True)
         if config.REQUIRED_ROLE_ID not in [r.id for r in getattr(interaction.user, "roles", [])]:
             return await send_error(interaction, "You do not have permission.")
 
@@ -411,7 +411,7 @@ class Keys(commands.Cog):
     @key_group.command(name="generate", description="Generate unredeemed license keys.")
     @app_commands.describe(amount="Number of keys", length="Fixed length or range, e.g. 25 or 25-32")
     async def key_generate(self, interaction: discord.Interaction, amount: app_commands.Range[int, 1, 100], length: str = "25-40"):
-        await interaction.response.defer(ephemeral=True)
+        await safe_defer(interaction, ephemeral=True)
         if config.REQUIRED_ROLE_ID not in [r.id for r in getattr(interaction.user, "roles", [])]:
             return await send_error(interaction, "You do not have permission to generate keys.")
         try:
@@ -451,7 +451,7 @@ class Keys(commands.Cog):
     @key_group.command(name="validate", description="Validate a license key and show its status.")
     @app_commands.describe(key="License key to validate")
     async def key_validate(self, interaction, key: str):
-        await interaction.response.defer(ephemeral=True)
+        await safe_defer(interaction, ephemeral=True)
         if config.REQUIRED_ROLE_ID not in [r.id for r in getattr(interaction.user, "roles", [])]: return await send_error(interaction, "You do not have permission.")
         normalized = key.strip()
         redeemable = await is_redeemable_key(normalized)
@@ -476,7 +476,7 @@ class Keys(commands.Cog):
     @key_group.command(name="fetch", description="List unredeemed license keys.")
     @app_commands.describe(amount="Number of unredeemed license keys to fetch")
     async def key_fetch(self, interaction, amount: app_commands.Range[int, 1, 100] = 1):
-        await interaction.response.defer(ephemeral=True)
+        await safe_defer(interaction, ephemeral=True)
         if config.REQUIRED_ROLE_ID not in [r.id for r in getattr(interaction.user, "roles", [])]: return await send_error(interaction, "You do not have permission.")
         available_keys = await fetch_redeemable_keys()
         if len(available_keys) <= amount:
@@ -522,7 +522,7 @@ class Keys(commands.Cog):
         key: Optional[str] = None,
         amount: Optional[app_commands.Range[int, 1, 100]] = None,
     ):
-        await interaction.response.defer(ephemeral=True)
+        await safe_defer(interaction, ephemeral=True)
         if config.REQUIRED_ROLE_ID not in [r.id for r in getattr(interaction.user, "roles", [])]:
             return await send_error(interaction, "You do not have permission.")
 
@@ -584,7 +584,7 @@ class Keys(commands.Cog):
     @app_commands.guilds(GUILD)
     @app_commands.describe(user="The whitelisted user whose HWID reset cooldown should be cleared")
     async def resethwidcooldown(self, interaction: discord.Interaction, user: discord.Member):
-        await interaction.response.defer(ephemeral=True)
+        await safe_defer(interaction, ephemeral=True)
         if config.REQUIRED_ROLE_ID not in [r.id for r in getattr(interaction.user, "roles", [])]:
             return await send_error(interaction, "You do not have permission.")
         resolved = user

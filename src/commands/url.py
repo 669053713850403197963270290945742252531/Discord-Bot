@@ -27,7 +27,7 @@ from discord.ui import ActionRow, Button, Container, LayoutView, TextDisplay
 from api import config
 from api.discord_helpers import (
     has_role, is_in_guild, send_success, send_error,
-    status_layout, default_ui_error, PaginatedListView,
+    status_layout, safe_edit_message, safe_defer, default_ui_error, PaginatedListView,
 )
 from api.alerts import send_alert, alert_embed, ALERT_COLOR_REMOVE
 from api.keys import is_valid_url
@@ -290,7 +290,7 @@ async def _url_shorten_impl(
     # so defer before either one. Ephemeral, matching the ephemeral
     # success reply below -- a deferral's ephemeral flag can't be
     # loosened by a later followup, so it has to be decided here.
-    await interaction.response.defer(ephemeral=True)
+    await safe_defer(interaction, ephemeral=True)
 
     kwargs: Dict[str, Any] = {}
     if alias:
@@ -492,7 +492,7 @@ async def _url_paste_impl(
         expires_at = format_iso(parsed_expiry)
 
     # Same defer-first, ephemeral-from-the-start reasoning as /url shorten.
-    await interaction.response.defer(ephemeral=True)
+    await safe_defer(interaction, ephemeral=True)
 
     # Downloading from Discord's CDN is itself a network round trip --
     # same reasoning as /url file's own `content = await file.read()` --
@@ -775,7 +775,7 @@ async def _url_file_impl(
     # round trip, on top of the provider upload and GitHub commit that
     # follow -- defer before any of them, same ephemeral-from-the-start
     # reasoning as /url shorten and /paste.
-    await interaction.response.defer(ephemeral=True)
+    await safe_defer(interaction, ephemeral=True)
 
     try:
         content = await file.read()
@@ -880,7 +880,7 @@ async def _url_unshorten_impl(interaction: discord.Interaction, url: str):
     # fallback further down can be several sequential HTTP round trips
     # (one per hop) -- defer before either path, same ephemeral-from-
     # the-start reasoning as /url shorten, /paste, and /file.
-    await interaction.response.defer(ephemeral=True)
+    await safe_defer(interaction, ephemeral=True)
 
     # Fast path: this bot's own record of what it created, if it created
     # it -- across every provider, not just one. extract_short_code() is
@@ -1066,7 +1066,7 @@ class ConfirmUrlClearLayout(LayoutView):
             return await send_error(interaction, "You cannot confirm this action.")
         self.confirmed = True
         self.stop()
-        await interaction.response.edit_message(
+        await safe_edit_message(interaction,
             view=status_layout("Clearing Entries", "Clearing `shortened-urls.json` entries...", discord.Color.blurple())
         )
 
@@ -1075,7 +1075,7 @@ class ConfirmUrlClearLayout(LayoutView):
             return await send_error(interaction, "You cannot cancel this action.")
         self.confirmed = False
         self.stop()
-        await interaction.response.defer()
+        await safe_defer(interaction, )
         await interaction.delete_original_response()
 
 
@@ -1120,7 +1120,7 @@ async def _url_clear_impl(
     # Deferred first: the preview fetch just below, and the confirmation
     # round trip that follows it, both easily blow Discord's ~3s ack
     # window -- same reasoning as every other /url subcommand.
-    await interaction.response.defer(ephemeral=True)
+    await safe_defer(interaction, ephemeral=True)
 
     try:
         matches = await find_matching_shortened_urls(predicate)

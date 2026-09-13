@@ -53,7 +53,7 @@ from discord.ext import commands
 from discord.ui import ActionRow, Button, Container, LayoutView, TextDisplay
 
 from api import config
-from api.discord_helpers import has_role, is_in_guild, safe_respond, send_error, default_ui_error
+from api.discord_helpers import has_role, is_in_guild, safe_respond, send_error, default_ui_error, safe_edit_message
 from api.entropy import analyze_entropy, crack_times_for_bits, rating_for
 from api.passwords import (
     generate_random_password, generate_passphrase, passphrase_entropy_bits,
@@ -275,7 +275,7 @@ class GenPassLayout(LayoutView):
         self.values = values
         self.stats = stats
         self.build()
-        await interaction.response.edit_message(view=self)
+        await safe_edit_message(interaction, view=self)
 
 
 class GenPass(commands.Cog):

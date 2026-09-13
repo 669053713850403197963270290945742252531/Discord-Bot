@@ -222,40 +222,111 @@ async def reconcile_dms_enabled(bot: commands.Bot, state: Optional[Dict[str, Any
 # Discord interaction helpers
 # =========================================================================
 
+async def safe_defer(interaction: discord.Interaction, *, ephemeral: bool = True) -> bool:
+    """Best-effort initial acknowledgement. Returns True when the interaction
+    is already acknowledged or the defer succeeded, False when Discord has
+    already invalidated the interaction token."""
+    try:
+        if not interaction.response.is_done():
+            await interaction.response.defer(ephemeral=ephemeral)
+        return True
+    except discord.InteractionResponded:
+        return True
+    except discord.NotFound:
+        return False
+    except discord.HTTPException as e:
+        # 40060 means another response won the race.  Treat it as already
+        # acknowledged; callers can safely use followups from this point.
+        if getattr(e, "code", None) == 40060:
+            return True
+        return False
+
+
 async def safe_respond(interaction: discord.Interaction, content: Optional[str] = None, **kwargs):
+    """Send exactly one response, falling back to the interaction webhook.
+
+    Interaction expiry/duplicate-acknowledgement failures are intentionally
+    swallowed here: once Discord has invalidated an interaction token there is
+    no legal API operation that can revive it, and printing the same warning
+    repeatedly only obscures the real application error."""
     try:
         if not interaction.response.is_done():
             await interaction.response.send_message(content=content, **kwargs)
-        else:
-            await interaction.followup.send(content=content, **kwargs)
-    except discord.NotFound:
-        print("Interaction expired before it could be responded to.")
+            return
+        await interaction.followup.send(content=content, **kwargs)
     except discord.InteractionResponded:
-        # The interaction was acknowledged by another code path between the
-        # is_done() check and the initial response attempt. Use the follow-up
-        # webhook instead of surfacing an InteractionResponded exception.
         try:
             await interaction.followup.send(content=content, **kwargs)
-        except Exception as e2:
-            print(f"Failed to respond via followup after InteractionResponded: {e2}")
+        except (discord.NotFound, discord.HTTPException):
+            pass
+    except discord.NotFound:
+        pass
     except discord.HTTPException as e:
-        # interaction.response.is_done() only reflects *this* Interaction
-        # object's local state, which can be wrong if some other response
-        # already reached Discord for the same underlying interaction --
-        # Discord then rejects the "initial response" slot as already used
-        # (error code 40060), even though this object never saw that
-        # happen. The followup webhook still works regardless of who used
-        # the initial response, so retry through that instead of just
-        # dropping the message.
         if getattr(e, "code", None) == 40060:
             try:
                 await interaction.followup.send(content=content, **kwargs)
-            except Exception as e2:
-                print(f"Failed to respond via followup after an already-acknowledged error: {e2}")
-        else:
-            print(f"Failed to respond: {e}")
-    except Exception as e:
-        print(f"Failed to respond: {e}")
+            except (discord.NotFound, discord.HTTPException):
+                pass
+            return
+        # A failed interaction response must never become a second exception
+        # from the error handler itself.
+        pass
+    except Exception:
+        pass
+
+
+async def safe_edit_message(interaction: discord.Interaction, **kwargs):
+    """Safely acknowledge/edit a component interaction.
+
+    If the interaction has not been acknowledged yet, response.edit_message()
+    is the correct initial acknowledgement. If it has already been deferred
+    or otherwise acknowledged, edit_original_response() is used instead.
+    Invalidated interaction tokens are silently ignored."""
+    try:
+        if not interaction.response.is_done():
+            await interaction.response.edit_message(**kwargs)
+            return
+        await interaction.edit_original_response(**kwargs)
+    except discord.InteractionResponded:
+        try:
+            await interaction.edit_original_response(**kwargs)
+        except (discord.NotFound, discord.HTTPException):
+            pass
+    except discord.NotFound:
+        pass
+    except discord.HTTPException:
+        pass
+    except Exception:
+        pass
+
+
+async def safe_send_modal(interaction: discord.Interaction, modal: discord.ui.Modal) -> bool:
+    """Open a modal when the interaction is still on its initial response.
+    Returns False when the token has already been consumed/expired."""
+    try:
+        if interaction.response.is_done():
+            # A modal cannot be sent as a followup.  We can still tell the user
+            # why the action could not continue when the webhook is alive.
+            await interaction.followup.send(
+                "This interaction has already been processed. Please try again.",
+                ephemeral=True,
+            )
+            return False
+        await interaction.response.send_modal(modal)
+        return True
+    except discord.InteractionResponded:
+        try:
+            await interaction.followup.send(
+                "This interaction has already been processed. Please try again.",
+                ephemeral=True,
+            )
+        except (discord.NotFound, discord.HTTPException):
+            pass
+        return False
+    except (discord.NotFound, discord.HTTPException):
+        return False
+    except Exception:
+        return False
 
 
 async def send_success(
@@ -353,11 +424,10 @@ async def default_ui_error(
             await default_ui_error(interaction, error, item, label="MyView")
     (Modal.on_error has the same shape minus `item`.)
     """
-    print(f"Error in {label} for item {item!r}: {error}")
     try:
         await send_error(interaction, "Something went wrong. Please try again, and let a moderator know if it keeps happening.")
-    except Exception as e:
-        print(f"Failed to notify user of {label} error: {e}")
+    except Exception:
+        pass
 
 
 async def resolve_user_option(interaction: discord.Interaction, raw_user: str) -> Optional[discord.User]:
@@ -646,12 +716,12 @@ class PaginatedListView(LayoutView):
     async def on_prev(self, interaction: discord.Interaction):
         self.current_page = max(0, self.current_page - 1)
         self.refresh_content()
-        await interaction.response.edit_message(view=self)
+        await safe_edit_message(interaction, view=self)
 
     async def on_next(self, interaction: discord.Interaction):
         self.current_page = min(len(self.pages) - 1, self.current_page + 1)
         self.refresh_content()
-        await interaction.response.edit_message(view=self)
+        await safe_edit_message(interaction, view=self)
 
 
 # =========================================================================

@@ -10,7 +10,7 @@ from discord import app_commands
 from discord.ext import commands
 
 from api import config
-from api.discord_helpers import has_role, is_in_guild, send_error, send_success
+from api.discord_helpers import has_role, is_in_guild, send_error, send_success, safe_defer
 from api.supabase_db import fetch_users, fetch_api_text_and_sha, commit_content, serialize_users_json, list_games
 from api.users import revoke_buyer_role, find_removed_discord_ids
 
@@ -27,7 +27,7 @@ class Database(commands.Cog):
     @has_role(config.REQUIRED_ROLE_ID)
     @is_in_guild(config.GUILD_ID)
     async def export(self, interaction, format: app_commands.Choice[str] = None):
-        await interaction.response.defer(ephemeral=True)
+        await safe_defer(interaction, ephemeral=True)
         users = await fetch_users()
         selected = format.value if format else "json"
         if selected == "csv":
@@ -47,7 +47,7 @@ class Database(commands.Cog):
     @has_role(config.REQUIRED_ROLE_ID)
     @is_in_guild(config.GUILD_ID)
     async def upload(self, interaction, file: discord.Attachment):
-        await interaction.response.defer(ephemeral=True)
+        await safe_defer(interaction, ephemeral=True)
         raw = await file.read()
         try:
             data = json.loads(raw.decode("utf-8-sig"))
@@ -67,7 +67,7 @@ class Database(commands.Cog):
     @has_role(config.REQUIRED_ROLE_ID)
     @is_in_guild(config.GUILD_ID)
     async def dbsearch(self, interaction, query: str):
-        await interaction.response.defer(ephemeral=True)
+        await safe_defer(interaction, ephemeral=True)
         q = query.lower().strip(); users = await fetch_users(); matches=[]
         for u in users:
             hay = " ".join(str(u.get(k,"")) for k in ("Identifier","DiscordId","Key","Rank","Notes","Games")).lower()
@@ -83,7 +83,7 @@ class Database(commands.Cog):
     @has_role(config.REQUIRED_ROLE_ID)
     @is_in_guild(config.GUILD_ID)
     async def games(self, interaction):
-        await interaction.response.defer(ephemeral=True)
+        await safe_defer(interaction, ephemeral=True)
         games = await list_games()
         lines=[f"`{g.get('id')}` — {g.get('name')} — `{g.get('script_path')}` — {'enabled' if g.get('enabled',True) else 'disabled'}" for g in games if g.get('id') != '*']
         await interaction.followup.send("\n".join(lines) if lines else "No games configured.", ephemeral=True)

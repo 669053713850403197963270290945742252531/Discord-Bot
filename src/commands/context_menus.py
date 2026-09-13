@@ -27,7 +27,7 @@ from discord.ext import commands
 from discord.ui import Modal, TextInput, Label, Checkbox
 
 from api import config
-from api.discord_helpers import has_role, is_in_guild, send_error, default_ui_error
+from api.discord_helpers import has_role, is_in_guild, send_error, default_ui_error, safe_send_modal
 from commands.moderation import _ban_impl, _kick_impl, _mute_impl, _unmute_impl
 from commands.whitelist import (
     WhitelistModal, _edituser_impl, _unwhitelist_impl, _fetchuser_impl,
@@ -88,7 +88,7 @@ class BanContextModal(Modal):
 @has_role(config.REQUIRED_ROLE_ID)
 @is_in_guild(config.GUILD_ID)
 async def ctx_ban_user(interaction: discord.Interaction, target: discord.Member):
-    await interaction.response.send_modal(BanContextModal(target))
+    await safe_send_modal(interaction, BanContextModal(target))
 
 
 # // Kick User //
@@ -113,7 +113,7 @@ class KickContextModal(Modal):
 @has_role(config.REQUIRED_ROLE_ID)
 @is_in_guild(config.GUILD_ID)
 async def ctx_kick_user(interaction: discord.Interaction, target: discord.Member):
-    await interaction.response.send_modal(KickContextModal(target))
+    await safe_send_modal(interaction, KickContextModal(target))
 
 
 # // Mute User //
@@ -138,7 +138,7 @@ class MuteContextModal(Modal):
 @has_role(config.REQUIRED_ROLE_ID)
 @is_in_guild(config.GUILD_ID)
 async def ctx_mute_user(interaction: discord.Interaction, target: discord.Member):
-    await interaction.response.send_modal(MuteContextModal(target))
+    await safe_send_modal(interaction, MuteContextModal(target))
 
 
 # // Unmute User //
@@ -158,7 +158,7 @@ async def ctx_unmute_user(interaction: discord.Interaction, target: discord.Memb
 @has_role(config.REQUIRED_ROLE_ID)
 @is_in_guild(config.GUILD_ID)
 async def ctx_whitelist_user(interaction: discord.Interaction, target: discord.Member):
-    await interaction.response.send_modal(WhitelistModal(target=target))
+    await safe_send_modal(interaction, WhitelistModal(target=target))
 
 
 # // Edit User //
@@ -239,7 +239,7 @@ class TempAccessContextModal(Modal):
 @has_role(config.REQUIRED_ROLE_ID)
 @is_in_guild(config.GUILD_ID)
 async def ctx_temp_access(interaction: discord.Interaction, target: discord.Member):
-    await interaction.response.send_modal(TempAccessContextModal(target))
+    await safe_send_modal(interaction, TempAccessContextModal(target))
 
 
 # // Temp Whitelist User //
@@ -268,7 +268,7 @@ class TempWhitelistContextModal(Modal):
 @has_role(config.REQUIRED_ROLE_ID)
 @is_in_guild(config.GUILD_ID)
 async def ctx_temp_whitelist(interaction: discord.Interaction, target: discord.Member):
-    await interaction.response.send_modal(TempWhitelistContextModal(target))
+    await safe_send_modal(interaction, TempWhitelistContextModal(target))
 
 
 # All 15, in the same order as they're defined above.

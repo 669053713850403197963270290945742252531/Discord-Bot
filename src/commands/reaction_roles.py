@@ -7,7 +7,7 @@ from discord import app_commands
 from discord.ext import commands
 
 from api import config
-from api.discord_helpers import has_role, is_in_guild, send_success, send_error, dms_enabled
+from api.discord_helpers import has_role, is_in_guild, send_success, send_error, dms_enabled, safe_defer
 from api.github import GitHubAPIError, fetch_botstate_with_sha, update_botstate
 
 GUILD = discord.Object(id=config.GUILD_ID)
@@ -138,7 +138,7 @@ class ReactionRoles(commands.Cog):
         role: discord.Role,
         note: Optional[str] = None,
     ):
-        await interaction.response.defer(ephemeral=True)
+        await safe_defer(interaction, ephemeral=True)
 
         channel = self.bot.get_channel(config.REACTION_ROLE_CHANNEL_ID)
 
@@ -190,7 +190,7 @@ class ReactionRoles(commands.Cog):
         emoji: Optional[str] = None,
         role: Optional[discord.Role] = None,
     ):
-        await interaction.response.defer(ephemeral=True)
+        await safe_defer(interaction, ephemeral=True)
 
         if emoji is None and role is None:
             return await send_error(interaction, "Provide an emoji and/or a role to identify which reaction role to remove.")
