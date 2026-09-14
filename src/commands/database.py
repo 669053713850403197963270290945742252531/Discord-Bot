@@ -150,15 +150,68 @@ class Database(commands.Cog):
         raw = await file.read()
         try:
             data = json.loads(raw.decode("utf-8-sig"))
-            if not isinstance(data, list): raise ValueError("root must be an array")
+            if not isinstance(data, list):
+                raise ValueError("root must be an array")
+            if any(not isinstance(record, dict) for record in data):
+                raise ValueError("every license record must be an object")
             old = await fetch_users()
             await commit_content(json.dumps(data, ensure_ascii=False), None, f"Import license database by {interaction.user}")
         except Exception as e:
             return await send_error(interaction, f"Failed to import license database: {e}")
-        removed = find_removed_discord_ids(old, data)
-        for discord_id in removed:
-            await revoke_buyer_role(interaction.guild, discord_id)
-        await send_success(interaction, f"Imported {len(data)} license record(s) into Supabase.")
+
+        def _identifier(record):
+            return str(record.get("Identifier") or "").strip()
+
+        def _signature(record):
+            # Ignore metadata that is regenerated/maintained by the database.
+            return (
+                _identifier(record),
+                str(record.get("DiscordId") or "").strip(),
+                str(record.get("Key") or "").strip(),
+                str(record.get("Activated") or "").strip(),
+                int(record.get("Executions") or 0),
+                str(record.get("Rank") or "User").strip(),
+                str(record.get("Notes") or "").strip(),
+                bool(record.get("Enabled", True)),
+                str(record.get("ExpiresAt") or "").strip(),
+                tuple(str(game).strip() for game in (record.get("Games") or [])),
+            )
+
+        old_by_identifier = {_identifier(record): record for record in old if _identifier(record)}
+        new_by_identifier = {_identifier(record): record for record in data if _identifier(record)}
+
+        added_ids = [identifier for identifier in new_by_identifier if identifier not in old_by_identifier]
+        removed_ids = [identifier for identifier in old_by_identifier if identifier not in new_by_identifier]
+        changed_ids = [
+            identifier
+            for identifier in new_by_identifier
+            if identifier in old_by_identifier
+            and _signature(old_by_identifier[identifier]) != _signature(new_by_identifier[identifier])
+        ]
+
+        # Preserve the existing role cleanup for licenses that disappeared.
+        for identifier in removed_ids:
+            discord_id = old_by_identifier[identifier].get("DiscordId")
+            if discord_id:
+                await revoke_buyer_role(interaction.guild, discord_id)
+
+        def _format_names(identifiers, source):
+            values = []
+            for identifier in identifiers[:15]:
+                record = source.get(identifier, {})
+                discord_id = str(record.get("DiscordId") or "").strip()
+                mention = f"<@{discord_id}>" if discord_id else "no Discord ID"
+                values.append(f"`{identifier}` ({mention})")
+            suffix = "" if len(identifiers) <= 15 else f" + {len(identifiers) - 15} more"
+            return ", ".join(values) + suffix
+
+        details = [
+            f"**Total:** {len(data)}",
+            f"**Added:** {len(added_ids)}" + (f" — {_format_names(added_ids, new_by_identifier)}" if added_ids else ""),
+            f"**Removed:** {len(removed_ids)}" + (f" — {_format_names(removed_ids, old_by_identifier)}" if removed_ids else ""),
+            f"**Changed:** {len(changed_ids)}" + (f" — {_format_names(changed_ids, new_by_identifier)}" if changed_ids else ""),
+        ]
+        await send_success(interaction, "Imported license database into Supabase.\n\n" + "\n".join(details))
 
     @app_commands.command(name="dbsearch", description="Searches the license database for a value.")
     @app_commands.guilds(GUILD)

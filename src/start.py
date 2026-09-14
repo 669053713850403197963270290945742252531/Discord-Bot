@@ -520,6 +520,51 @@ async def before_rotate_presence_task():
 
 # --- Error Handlers ---
 
+def _supabase_error_info(error: BaseException):
+    """Identify Supabase/PostgREST errors without importing version-specific internals."""
+    original = getattr(error, "original", error)
+    current = original
+    # Some wrappers expose the underlying exception one level deeper.
+    for _ in range(3):
+        nested = getattr(current, "original", None)
+        if nested is None or nested is current:
+            break
+        current = nested
+
+    exc_name = type(current).__name__
+    module = type(current).__module__.lower()
+    text = str(current)
+    lower = text.lower()
+    code = str(getattr(current, "code", "") or "")
+
+    # Do not rely only on the concrete exception class/module. Supabase errors
+    # can arrive wrapped by discord.py or another client layer, and some
+    # versions expose a generic exception class while preserving the API
+    # payload in the message. The message itself is therefore an authoritative
+    # fallback for classification.
+    is_supabase = (
+        exc_name == "APIError"
+        or "postgrest" in module
+        or "supabase" in module
+        or "json could not be generated" in lower
+        or "gateway timeout" in lower
+        or "supabase" in lower
+        or "apierror:" in lower
+    )
+    transient = (
+        code in {"408", "425", "429", "500", "502", "503", "504"}
+        or "gateway timeout" in lower
+        or "json could not be generated" in lower
+        or "timed out" in lower
+        or "timeout" in lower
+        or '"code": 504' in lower
+        or "'code': 504" in lower
+        or '"code": 503' in lower
+        or "'code': 503" in lower
+    )
+    return is_supabase, transient, current
+
+
 @bot.tree.error
 async def on_app_command_error(interaction: discord.Interaction, error: app_commands.AppCommandError):
     # Unwrap CommandInvokeError/TransformerError to get at the underlying exception
@@ -533,6 +578,35 @@ async def on_app_command_error(interaction: discord.Interaction, error: app_comm
 
     if isinstance(error, app_commands.CheckFailure):
         await send_error(interaction, str(error))
+        return
+
+    # Supabase/PostgREST errors must never escape as an unhandled command
+    # exception. Transient gateway failures have already been retried by the
+    # shared read layer where possible; this is the final safety net for any
+    # direct query or write that still receives one (or any non-transient
+    # Supabase error).
+    is_supabase, transient_supabase, supabase_error = _supabase_error_info(original)
+    if is_supabase:
+        if transient_supabase:
+            message = (
+                "Supabase temporarily timed out while processing this command. "
+                "The request could not be confirmed. Please try again in a moment."
+            )
+        else:
+            message = (
+                "Supabase returned an error while processing this command. "
+                "No further action was taken after the failed request. Please try again, and "
+                "contact a developer if it continues."
+            )
+        print(
+            f"Supabase command error ({'transient' if transient_supabase else 'non-transient'}): "
+            f"{type(supabase_error).__name__}: {supabase_error}"
+        )
+        await safe_respond(
+            interaction,
+            embed=error_embed(message, title="Database Error"),
+            ephemeral=True,
+        )
         return
 
     # Recover from a duplicate initial-response race. Some callbacks
@@ -604,7 +678,53 @@ async def on_app_command_error(interaction: discord.Interaction, error: app_comm
             print(f"Failed to notify user of HTTPException: {e}")
         return
 
+    # Last-resort Supabase payload detection. This intentionally runs before
+    # the generic command-error path so a provider error that is wrapped in an
+    # unexpected exception type can never be emitted as "Unhandled error".
+    error_text = str(original).lower()
+    if (
+        "apierror:" in error_text
+        or "json could not be generated" in error_text
+        or "gateway timeout" in error_text
+        or "supabase" in error_text
+    ):
+        transient = (
+            "gateway timeout" in error_text
+            or "json could not be generated" in error_text
+            or '"code": 504' in error_text
+            or "'code': 504" in error_text
+            or "timed out" in error_text
+        )
+        print(
+            f"Supabase command error ({'transient' if transient else 'non-transient'}): "
+            f"{type(original).__name__}: {original}"
+        )
+        try:
+            await safe_respond(
+                interaction,
+                embed=error_embed(
+                    "Supabase temporarily failed while processing this command. "
+                    "No confirmed database change was made. Please try again.",
+                    title="Database Error",
+                ),
+                ephemeral=True,
+            )
+        except Exception as response_error:
+            print(f"Failed to notify user of fallback Supabase error: {response_error}")
+        return
+
     print(f"Unhandled error: {error}")
+    try:
+        await safe_respond(
+            interaction,
+            embed=error_embed(
+                "An unexpected error occurred while processing this command. Please try again.",
+                title="Command Error",
+            ),
+            ephemeral=True,
+        )
+    except Exception as response_error:
+        print(f"Failed to send generic command error response: {response_error}")
 
 
 # on_app_command_error above only covers slash commands (it's registered on

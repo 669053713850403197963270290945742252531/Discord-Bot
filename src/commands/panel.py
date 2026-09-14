@@ -108,7 +108,10 @@ class ControlPanelView(LayoutView):
 
     async def on_script(self, interaction):
         await safe_defer(interaction, ephemeral=True)
-        entry = await get_license_by_discord_id(str(interaction.user.id))
+        try:
+            entry = await get_license_by_discord_id(str(interaction.user.id))
+        except Exception as exc:
+            return await send_error(interaction, f"Failed to load your license information: {exc}")
         if not entry or not entry.get("Key"):
             return await send_error(interaction, "You do not have a redeemed license.")
 
@@ -122,7 +125,10 @@ class ControlPanelView(LayoutView):
 
     async def on_role(self, interaction):
         await safe_defer(interaction, ephemeral=True)
-        entry = await get_license_by_discord_id(str(interaction.user.id))
+        try:
+            entry = await get_license_by_discord_id(str(interaction.user.id))
+        except Exception as exc:
+            return await send_error(interaction, f"Failed to load your license information: {exc}")
         if not entry:
             return await send_error(interaction, "You do not have a redeemed license.")
         guild = interaction.guild

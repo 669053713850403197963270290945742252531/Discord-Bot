@@ -111,22 +111,61 @@ class WhitelistModal(Modal, title="Whitelist a User"):
 
 
 def _parse_bulk_row(row):
-    def cell(name):
-        value = row.get(name)
-        return value.strip() if isinstance(value, str) else ""
+    def cell(name, *aliases):
+        for key in (name, *aliases):
+            value = row.get(key)
+            if isinstance(value, str):
+                return value.strip()
+            if value is not None:
+                return str(value).strip()
+        return ""
+
     identifier = cell("identifier")
     discord_id = cell("discord_id")
-    rank = _RANK_LOOKUP.get(cell("rank").lower(), "User") or "User"
+    rank_value = cell("rank")
+    rank = _RANK_LOOKUP.get(rank_value.lower(), "User") if rank_value else "User"
     notes = cell("notes") or None
-    key = cell("key")
+    key = cell("license_key", "key")
+    activated = cell("activated") or None
+    expires_at = cell("expires_at") or None
+    executions_value = cell("executions")
+    enabled_value = cell("enabled")
     games_value = cell("games") or "*"
+
     if not identifier or not is_valid_discord_id(discord_id):
         return None, "identifier and a valid discord_id are required"
     try:
         games = parse_game_ids(games_value)
     except ValueError as e:
         return None, str(e)
-    return {"Identifier": identifier, "DiscordId": discord_id, "Rank": rank, "Notes": notes, "Key": key, "Games": games}, None
+
+    try:
+        executions = int(executions_value) if executions_value else 0
+    except ValueError:
+        return None, "executions must be an integer"
+    if executions < 0:
+        return None, "executions cannot be negative"
+
+    if enabled_value == "":
+        enabled = True
+    else:
+        normalized_enabled = enabled_value.lower()
+        if normalized_enabled not in {"true", "false"}:
+            return None, "enabled must be True or False"
+        enabled = normalized_enabled == "true"
+
+    return {
+        "Identifier": identifier,
+        "DiscordId": discord_id,
+        "Rank": rank,
+        "Notes": notes,
+        "Key": key,
+        "Activated": activated,
+        "Executions": executions,
+        "Enabled": enabled,
+        "ExpiresAt": expires_at,
+        "Games": games,
+    }, None
 
 
 async def _bulkwhitelist_impl(interaction, attachment):
