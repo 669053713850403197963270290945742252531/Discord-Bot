@@ -478,7 +478,10 @@ class Keys(commands.Cog):
     async def key_fetch(self, interaction, amount: app_commands.Range[int, 1, 100] = 1):
         await safe_defer(interaction, ephemeral=True)
         if config.REQUIRED_ROLE_ID not in [r.id for r in getattr(interaction.user, "roles", [])]: return await send_error(interaction, "You do not have permission.")
-        available_keys = await fetch_redeemable_keys()
+        try:
+            available_keys = await fetch_redeemable_keys()
+        except Exception as exc:
+            return await send_error(interaction, f"Failed to fetch unredeemed license keys: {exc}")
         if len(available_keys) <= amount:
             keys = available_keys
         else:

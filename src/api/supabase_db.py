@@ -16,6 +16,41 @@ from . import config
 _client = None
 _client_lock = asyncio.Lock()
 
+_TRANSIENT_SUPABASE_CODES = {"408", "425", "429", "500", "502", "503", "504"}
+_TRANSIENT_SUPABASE_RETRIES = 3
+
+
+def _is_transient_supabase_error(exc: BaseException) -> bool:
+    """Return True for temporary Supabase/PostgREST gateway failures."""
+    code = str(getattr(exc, "code", "") or "")
+    text = str(exc).lower()
+    return (
+        code in _TRANSIENT_SUPABASE_CODES
+        or "gateway timeout" in text
+        or "json could not be generated" in text
+        or "timed out" in text
+        or "timeout" in text
+    )
+
+
+async def _retry_supabase_read(operation, operation_name: str):
+    """Retry a read-only Supabase operation on transient failures.
+
+    Reads are safe to repeat. Writes intentionally do not use this helper so
+    an ambiguous timeout cannot accidentally duplicate a side effect.
+    """
+    last_error = None
+    for attempt in range(_TRANSIENT_SUPABASE_RETRIES):
+        try:
+            return await operation()
+        except Exception as exc:
+            last_error = exc
+            if not _is_transient_supabase_error(exc) or attempt + 1 >= _TRANSIENT_SUPABASE_RETRIES:
+                raise
+            await asyncio.sleep(0.75 * (2 ** attempt))
+    raise last_error
+
+
 
 def _client_sync():
     global _client
@@ -137,7 +172,7 @@ def _fetch_users_sync() -> List[Dict[str, Any]]:
 
 
 async def fetch_users() -> List[Dict[str, Any]]:
-    return await asyncio.to_thread(_fetch_users_sync)
+    return await _retry_supabase_read(lambda: asyncio.to_thread(_fetch_users_sync), "fetch users")
 
 
 def _fetch_temp_whitelists_sync() -> List[Dict[str, Any]]:
@@ -160,7 +195,7 @@ def _fetch_temp_whitelists_sync() -> List[Dict[str, Any]]:
 
 
 async def fetch_temp_whitelists() -> List[Dict[str, Any]]:
-    return await asyncio.to_thread(_fetch_temp_whitelists_sync)
+    return await _retry_supabase_read(lambda: asyncio.to_thread(_fetch_temp_whitelists_sync), "fetch temporary whitelists")
 
 
 async def fetch_users_with_sha() -> Tuple[List[Dict[str, Any]], None]:
@@ -238,6 +273,10 @@ async def set_license_games(identifier: str, games: List[str]) -> None:
 
 
 async def get_license_game_ids(identifier: str) -> List[str]:
+    return await _retry_supabase_read(lambda: _get_license_game_ids_once(identifier), "get license games")
+
+
+def _get_license_game_ids_once(identifier: str) -> List[str]:
     rows = (_client_sync().table("license_games").select("game_id").eq("identifier", identifier).execute()).data or []
     result: List[str] = []
     seen = set()
@@ -253,14 +292,14 @@ async def fetch_redeemable_keys() -> List[str]:
     def _fetch():
         rows = (_client_sync().table("license_keys").select("key").order("key").execute()).data or []
         return [str(row["key"]).strip() for row in rows if row.get("key") not in (None, "")]
-    return await asyncio.to_thread(_fetch)
+    return await _retry_supabase_read(lambda: asyncio.to_thread(_fetch), "fetch redeemable keys")
 
 
 async def is_redeemable_key(key: str) -> bool:
     def _exists():
         rows = (_client_sync().table("license_keys").select("key").eq("key", str(key).strip()).limit(1).execute()).data or []
         return bool(rows)
-    return await asyncio.to_thread(_exists)
+    return await _retry_supabase_read(lambda: asyncio.to_thread(_exists), "check redeemable key")
 
 
 async def create_redeemable_key(key: str) -> bool:
@@ -344,7 +383,7 @@ def _get_by_key_sync(key: str) -> Optional[Dict[str, Any]]:
 
 
 async def get_license_by_key(key: str) -> Optional[Dict[str, Any]]:
-    return await asyncio.to_thread(_get_by_key_sync, str(key).strip())
+    return await _retry_supabase_read(lambda: asyncio.to_thread(_get_by_key_sync, str(key).strip()), "get license by key")
 
 
 def _get_by_discord_sync(discord_id: str) -> Optional[Dict[str, Any]]:
@@ -357,7 +396,7 @@ def _get_by_discord_sync(discord_id: str) -> Optional[Dict[str, Any]]:
 
 
 async def get_license_by_discord_id(discord_id: str) -> Optional[Dict[str, Any]]:
-    return await asyncio.to_thread(_get_by_discord_sync, str(discord_id))
+    return await _retry_supabase_read(lambda: asyncio.to_thread(_get_by_discord_sync, str(discord_id)), "get license by Discord ID")
 
 
 def _has_license_by_discord_id_sync(discord_id: str) -> bool:
@@ -374,7 +413,7 @@ def _has_license_by_discord_id_sync(discord_id: str) -> bool:
 
 async def has_license_by_discord_id(discord_id: str) -> bool:
     """Fast preflight used by the control-panel Redeem Key button."""
-    return await asyncio.to_thread(_has_license_by_discord_id_sync, str(discord_id))
+    return await _retry_supabase_read(lambda: asyncio.to_thread(_has_license_by_discord_id_sync, str(discord_id)), "check license by Discord ID")
 
 
 
@@ -388,7 +427,7 @@ def _get_by_identifier_sync(identifier: str) -> Optional[Dict[str, Any]]:
 
 
 async def get_license_by_identifier(identifier: str) -> Optional[Dict[str, Any]]:
-    return await asyncio.to_thread(_get_by_identifier_sync, str(identifier))
+    return await _retry_supabase_read(lambda: asyncio.to_thread(_get_by_identifier_sync, str(identifier)), "get license by identifier")
 
 
 def _upsert_sync(record: Dict[str, Any]) -> Dict[str, Any]:
@@ -577,14 +616,17 @@ async def fetch_users_for_export() -> List[Dict[str, Any]]:
 
 
 async def list_games() -> List[Dict[str, Any]]:
-    return await asyncio.to_thread(lambda: (_client_sync().table("games").select("*").order("id").execute()).data or [])
+    return await _retry_supabase_read(
+        lambda: asyncio.to_thread(lambda: (_client_sync().table("games").select("*").order("id").execute()).data or []),
+        "list games",
+    )
 
 
 async def get_game(game_id: str) -> Optional[Dict[str, Any]]:
     def _get():
         rows = (_client_sync().table("games").select("*").eq("id", str(game_id)).limit(1).execute()).data or []
         return rows[0] if rows else None
-    return await asyncio.to_thread(_get)
+    return await _retry_supabase_read(lambda: asyncio.to_thread(_get), "get game")
 
 
 def _create_game_sync(game_id: str, name: str, script_path: str) -> Dict[str, Any]:
@@ -716,6 +758,8 @@ async def update_game(
     )
 
 
+
+
 async def game_allowed(identifier: str, game_id: str) -> bool:
     def _check():
         client = _client_sync()
@@ -727,7 +771,7 @@ async def game_allowed(identifier: str, game_id: str) -> bool:
         for row in rows:
             allowed_games.update(_parse_stored_game_ids(row.get("game_id")))
         return str(game_id) in allowed_games or "*" in allowed_games
-    return await asyncio.to_thread(_check)
+    return await _retry_supabase_read(lambda: asyncio.to_thread(_check), "check game access")
 
 
 async def get_license_for_user(discord_id: str) -> Optional[Dict[str, Any]]:
