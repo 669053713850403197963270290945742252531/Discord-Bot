@@ -197,27 +197,28 @@ class ControlPanelView(LayoutView):
         if not entry:
             return await send_error(interaction, "You do not have a redeemed license.")
 
-        enabled = bool(entry.get("Enabled", True))
         hwid = entry.get("HWID")
         key = entry.get("Key") or "N/A"
         last_reset = format_discord_timestamp(entry.get("LastHwidReset"), "R") if entry.get("LastHwidReset") else "Never"
         expires_at = format_discord_timestamp(entry.get("ExpiresAt"), "R") if entry.get("ExpiresAt") else "Never"
-        updated_at = format_discord_timestamp(entry.get("UpdatedAt"), "R") if entry.get("UpdatedAt") else "Never"
 
         embed = discord.Embed(
             title="License Stats",
             color=discord.Color.green(),
             description=f"**{entry.get('Identifier') or 'Unknown'}** — license information",
         )
-        embed.add_field(name="Identifier", value=f"`{entry.get('Identifier') or 'N/A'}`", inline=False)
-        embed.add_field(name="Discord ID", value=f"`{entry.get('DiscordId') or 'N/A'}`", inline=False)
+        # Sort the public License Stats embed organized into logical groups:
+        # identity/access, license scope, usage/device status, then expiration.
+        embed.add_field(name="Identifier", value=f"`{entry.get('Identifier') or 'N/A'}`", inline=True)
+        embed.add_field(name="Discord ID", value=f"`{entry.get('DiscordId') or 'N/A'}`", inline=True)
+        embed.add_field(name="Key", value=f"||`{key}`|| 🔒", inline=True)
+
         embed.add_field(name="Games", value=_games_links_text(entry.get("Games")), inline=False)
-        embed.add_field(name="License Enabled", value="Yes ✅" if enabled else "No ❌", inline=True)
-        embed.add_field(name="License Updated", value=updated_at, inline=True)
+
         embed.add_field(name="Total Executions", value=f"`{int(entry.get('Executions') or 0)}` 🧠", inline=True)
         embed.add_field(name="HWID Status", value="Assigned ✅" if hwid else "Unset ❌", inline=True)
-        embed.add_field(name="Key", value=f"||`{key}`|| 🔒", inline=False)
         embed.add_field(name="Total HWID Resets", value=f"`{int(entry.get('totalHwidResets') or 0)}` ⚙️", inline=True)
+
         embed.add_field(name="Last Reset", value=f"{last_reset} 📅", inline=True)
         embed.add_field(name="Expires At", value=f"{expires_at} 📅", inline=True)
 
