@@ -116,6 +116,17 @@ class GameEditModal(discord.ui.Modal, title="Edit Game"):
 
             await send_success(interaction, f"Updated **{new_name}** (`{new_game_id}`).")
 
+def _parse_bool_text(value, default=True):
+    text = str(value or "").strip().lower()
+    if not text:
+        return default
+    if text in {"true", "1", "yes", "y", "on"}:
+        return True
+    if text in {"false", "0", "no", "n", "off"}:
+        return False
+    raise ValueError("enabled must be True or False")
+
+
 class Database(commands.Cog):
     def __init__(self, bot): self.bot = bot
 
@@ -131,39 +142,78 @@ class Database(commands.Cog):
         selected = format.value if format else "json"
         if selected == "csv":
             buf = io.StringIO(); writer = csv.writer(buf)
-            writer.writerow(["identifier","discord_id","license_key","activated","executions","rank","notes","enabled","expires_at","games"])
+            writer.writerow([
+                "identifier","discord_id","license_key","activated","executions","rank","notes",
+                "enabled","expires_at","games","hwid","last_hwid_reset","hwid_resets","created_at","updated_at"
+            ])
             for u in users:
-                writer.writerow([u.get("Identifier"),u.get("DiscordId"),u.get("Key"),u.get("Activated"),u.get("Executions",0),u.get("Rank"),u.get("Notes"),u.get("Enabled",True),u.get("ExpiresAt"),",".join(u.get("Games") or [])])
+                writer.writerow([
+                    u.get("Identifier"), u.get("DiscordId"), u.get("Key"), u.get("Activated"),
+                    u.get("Executions", 0), u.get("Rank"), u.get("Notes"), u.get("Enabled", True),
+                    u.get("ExpiresAt"), ",".join(u.get("Games") or []), u.get("HWID"),
+                    u.get("LastHwidReset"), u.get("totalHwidResets", 0), u.get("CreatedAt"), u.get("UpdatedAt"),
+                ])
             data = buf.getvalue().encode()
             await interaction.followup.send(file=discord.File(io.BytesIO(data), filename="licenses.csv"), ephemeral=True)
             return
         data = serialize_users_json(users).encode()
         await interaction.followup.send(file=discord.File(io.BytesIO(data), filename="licenses.json"), ephemeral=True)
 
-    @app_commands.command(name="upload", description="Replaces the Supabase license database using an exported JSON file.")
+    @app_commands.command(name="upload", description="Replaces the Supabase license database using an exported JSON or CSV file.")
     @app_commands.guilds(GUILD)
-    @app_commands.describe(file="JSON export containing an array of license records")
+    @app_commands.describe(file="JSON or CSV export containing license records")
     @has_role(config.REQUIRED_ROLE_ID)
     @is_in_guild(config.GUILD_ID)
     async def upload(self, interaction, file: discord.Attachment):
         await safe_defer(interaction, ephemeral=True)
         raw = await file.read()
         try:
-            data = json.loads(raw.decode("utf-8-sig"))
-            if not isinstance(data, list):
-                raise ValueError("root must be an array")
-            if any(not isinstance(record, dict) for record in data):
-                raise ValueError("every license record must be an object")
+            text = raw.decode("utf-8-sig")
+            stripped = text.lstrip()
+            if stripped.startswith("["):
+                data = json.loads(text)
+                if not isinstance(data, list):
+                    raise ValueError("JSON root must be an array")
+            else:
+                reader = csv.DictReader(io.StringIO(text))
+                rows = list(reader)
+                if not rows:
+                    raise ValueError("CSV contains no license records")
+                data = []
+                for row in rows:
+                    normalized = {str(k).strip().lower(): v for k, v in row.items()}
+                    data.append({
+                        "Identifier": normalized.get("identifier", "").strip(),
+                        "DiscordId": normalized.get("discord_id", "").strip() or None,
+                        "Key": normalized.get("license_key", normalized.get("key", "")).strip() or None,
+                        "Activated": normalized.get("activated", "").strip() or None,
+                        "Executions": int(normalized.get("executions") or 0),
+                        "Rank": normalized.get("rank", "User").strip() or "User",
+                        "Notes": normalized.get("notes", "").strip() or None,
+                        "Enabled": _parse_bool_text(normalized.get("enabled"), True),
+                        "ExpiresAt": normalized.get("expires_at", "").strip() or None,
+                        "Games": [x.strip() for x in normalized.get("games", "*").split(",") if x.strip()] or ["*"],
+                        "HWID": normalized.get("hwid", "").strip() or None,
+                        "LastHwidReset": normalized.get("last_hwid_reset", "").strip() or None,
+                        "totalHwidResets": int(normalized.get("hwid_resets") or 0),
+                        "CreatedAt": normalized.get("created_at", "").strip() or None,
+                        "UpdatedAt": normalized.get("updated_at", "").strip() or None,
+                    })
             old = await fetch_users()
             await commit_content(json.dumps(data, ensure_ascii=False), None, f"Import license database by {interaction.user}")
         except Exception as e:
             return await send_error(interaction, f"Failed to import license database: {e}")
-
         def _identifier(record):
             return str(record.get("Identifier") or "").strip()
 
+        def _normalize_games(value):
+            if isinstance(value, (list, tuple, set)):
+                return tuple(str(game).strip() for game in value)
+            if value in (None, ""):
+                return tuple()
+            return tuple(part.strip() for part in str(value).split(",") if part.strip())
+
         def _signature(record):
-            # Ignore metadata that is regenerated/maintained by the database.
             return (
                 _identifier(record),
                 str(record.get("DiscordId") or "").strip(),
@@ -174,7 +224,12 @@ class Database(commands.Cog):
                 str(record.get("Notes") or "").strip(),
                 bool(record.get("Enabled", True)),
                 str(record.get("ExpiresAt") or "").strip(),
-                tuple(str(game).strip() for game in (record.get("Games") or [])),
+                _normalize_games(record.get("Games") or []),
+                str(record.get("HWID") or "").strip(),
+                str(record.get("LastHwidReset") or record.get("LastHWIDReset") or "").strip(),
+                int(record.get("totalHwidResets", record.get("HwidResets", record.get("HWIDResets", 0))) or 0),
+                str(record.get("CreatedAt") or "").strip(),
+                str(record.get("UpdatedAt") or "").strip(),
             )
 
         old_by_identifier = {_identifier(record): record for record in old if _identifier(record)}

@@ -18,7 +18,7 @@ from api.alerts import send_alert, alert_embed, ALERT_COLOR_ADD, ALERT_COLOR_REM
 from api.supabase_db import (
     fetch_users, fetch_users_with_sha, fetch_api_text_and_sha, commit_content,
     commit_users, get_license_by_discord_id, get_license_by_key, get_license_by_identifier, update_license,
-    delete_license, set_license_games, get_license_game_ids,
+    delete_license, set_license_games, get_license_game_ids, record_from_import_row,
 )
 from api.users import find_user_by_discord_id, find_user_by_key, remove_user_by_discord_id, build_user_entry, revoke_buyer_role, find_removed_discord_ids
 from api.keys import generate_unique_key, is_valid_discord_id, parse_game_ids
@@ -111,61 +111,19 @@ class WhitelistModal(Modal, title="Whitelist a User"):
 
 
 def _parse_bulk_row(row):
-    def cell(name, *aliases):
-        for key in (name, *aliases):
-            value = row.get(key)
-            if isinstance(value, str):
-                return value.strip()
-            if value is not None:
-                return str(value).strip()
-        return ""
+    try:
+        record = record_from_import_row(row)
+    except ValueError as exc:
+        return None, str(exc)
 
-    identifier = cell("identifier")
-    discord_id = cell("discord_id")
-    rank_value = cell("rank")
-    rank = _RANK_LOOKUP.get(rank_value.lower(), "User") if rank_value else "User"
-    notes = cell("notes") or None
-    key = cell("license_key", "key")
-    activated = cell("activated") or None
-    expires_at = cell("expires_at") or None
-    executions_value = cell("executions")
-    enabled_value = cell("enabled")
-    games_value = cell("games") or "*"
-
+    identifier = str(record.get("Identifier") or "").strip()
+    discord_id = str(record.get("DiscordId") or "").strip()
     if not identifier or not is_valid_discord_id(discord_id):
         return None, "identifier and a valid discord_id are required"
-    try:
-        games = parse_game_ids(games_value)
-    except ValueError as e:
-        return None, str(e)
-
-    try:
-        executions = int(executions_value) if executions_value else 0
-    except ValueError:
-        return None, "executions must be an integer"
-    if executions < 0:
-        return None, "executions cannot be negative"
-
-    if enabled_value == "":
-        enabled = True
-    else:
-        normalized_enabled = enabled_value.lower()
-        if normalized_enabled not in {"true", "false"}:
-            return None, "enabled must be True or False"
-        enabled = normalized_enabled == "true"
-
-    return {
-        "Identifier": identifier,
-        "DiscordId": discord_id,
-        "Rank": rank,
-        "Notes": notes,
-        "Key": key,
-        "Activated": activated,
-        "Executions": executions,
-        "Enabled": enabled,
-        "ExpiresAt": expires_at,
-        "Games": games,
-    }, None
+    record["DiscordId"] = discord_id
+    key = str(record.get("Key") or "").strip()
+    record["Key"] = key or None
+    return record, None
 
 
 async def _bulkwhitelist_impl(interaction, attachment):
@@ -487,7 +445,7 @@ class Whitelist(commands.Cog):
     async def whitelist(self, interaction):
         await safe_send_modal(interaction, WhitelistModal())
 
-    @app_commands.command(name="bulkwhitelist", description="Bulk-add licenses from a CSV (identifier,discord_id,rank,notes,key,games).")
+    @app_commands.command(name="bulkwhitelist", description="Bulk-add licenses from an exported or compatible license CSV.")
     @app_commands.guilds(GUILD)
     @app_commands.describe(file="CSV file to import")
     @has_role(config.REQUIRED_ROLE_ID)

@@ -82,6 +82,19 @@ def _parse_dt(value: Any) -> Optional[datetime]:
         return None
 
 
+def _parse_bool(value: Any, default: bool = False) -> bool:
+    if value is None or value == "":
+        return default
+    if isinstance(value, bool):
+        return value
+    text = str(value).strip().lower()
+    if text in {"true", "1", "yes", "y", "on"}:
+        return True
+    if text in {"false", "0", "no", "n", "off"}:
+        return False
+    return default
+
+
 def _record_from_db(row: Dict[str, Any], game_ids: Optional[List[str]] = None) -> Dict[str, Any]:
     games = [str(x) for x in (game_ids or [])]
     return {
@@ -107,6 +120,12 @@ def _db_row_from_record(record: Dict[str, Any], identifier_fallback: Optional[st
     identifier = str(record.get("Identifier") or identifier_fallback or "").strip()
     if not identifier:
         raise ValueError("License record is missing Identifier")
+
+    # `licenses.created_at` is NOT NULL. Preserve exported timestamps when
+    # present; otherwise initialize a new record with the current UTC time.
+    created_at = _iso(record.get("CreatedAt")) or datetime.now(timezone.utc).isoformat()
+    updated_at = _iso(record.get("UpdatedAt")) or created_at
+
     out = {
         "identifier": identifier,
         "discord_id": (str(record.get("DiscordId")).strip() if record.get("DiscordId") not in (None, "") else None),
@@ -115,10 +134,100 @@ def _db_row_from_record(record: Dict[str, Any], identifier_fallback: Optional[st
         "executions": int(record.get("Executions") or 0),
         "rank": str(record.get("Rank") or "User"),
         "notes": record.get("Notes"),
-        "enabled": bool(record.get("Enabled", True)),
+        "enabled": _parse_bool(record.get("Enabled", True), default=True),
         "expires_at": _iso(record.get("ExpiresAt")),
+        "created_at": created_at,
+        "updated_at": updated_at,
+        "hwid": (str(record.get("HWID")).strip().lower() if record.get("HWID") not in (None, "") else None),
+        "last_hwid_reset": _iso(record.get("LastHwidReset", record.get("LastHWIDReset"))),
+        "hwid_resets": int(record.get("totalHwidResets", record.get("HwidResets", record.get("HWIDResets", 0))) or 0),
     }
     return out
+
+
+def record_from_import_row(row: Dict[str, Any]) -> Dict[str, Any]:
+    """Convert an exported CSV row into the internal license-record shape.
+
+    CSV column names are case-insensitive and may use either the current export
+    names or the legacy ``key`` alias. Empty values are converted to ``None``
+    where appropriate so /bulkwhitelist can pass records directly to the
+    normal Supabase replacement path without losing fields.
+    """
+    if not isinstance(row, dict):
+        raise ValueError("Imported row must be an object")
+
+    normalized = {str(k).strip().lower(): v for k, v in row.items() if k is not None}
+
+    def cell(*names: str, default: Any = "") -> Any:
+        for name in names:
+            if name in normalized:
+                value = normalized[name]
+                if value is None:
+                    return default
+                if isinstance(value, str):
+                    return value.strip()
+                return value
+        return default
+
+    def nullable(*names: str) -> Optional[str]:
+        value = cell(*names)
+        return str(value).strip() if value not in (None, "") else None
+
+    identifier = nullable("identifier")
+    if not identifier:
+        raise ValueError("identifier is required")
+
+    discord_id = nullable("discord_id")
+    key = nullable("license_key", "key")
+    rank = str(cell("rank", default="User") or "User").strip() or "User"
+    notes = nullable("notes")
+    activated = nullable("activated")
+    expires_at = nullable("expires_at")
+    created_at = nullable("created_at")
+    updated_at = nullable("updated_at")
+    hwid = nullable("hwid")
+    last_hwid_reset = nullable("last_hwid_reset", "last_hwidreset", "lasthwidreset")
+
+    executions_raw = cell("executions", default=0)
+    try:
+        executions = int(executions_raw or 0)
+    except (TypeError, ValueError):
+        raise ValueError("executions must be an integer")
+
+    resets_raw = cell("hwid_resets", "total_hwid_resets", default=0)
+    try:
+        hwid_resets = int(resets_raw or 0)
+    except (TypeError, ValueError):
+        raise ValueError("hwid_resets must be an integer")
+
+    enabled_raw = cell("enabled", default=True)
+    enabled = _parse_bool(enabled_raw, default=True)
+
+    games_raw = cell("games", default="*")
+    if isinstance(games_raw, list):
+        games = [str(x).strip() for x in games_raw if str(x).strip()]
+    else:
+        games = [part.strip() for part in str(games_raw or "").split(",") if part.strip()]
+    if not games:
+        games = ["*"]
+
+    return {
+        "Identifier": identifier,
+        "DiscordId": discord_id,
+        "Key": key,
+        "Activated": activated,
+        "Executions": executions,
+        "Rank": rank,
+        "Notes": notes,
+        "Enabled": enabled,
+        "ExpiresAt": expires_at,
+        "Games": games,
+        "HWID": hwid,
+        "LastHwidReset": last_hwid_reset,
+        "totalHwidResets": hwid_resets,
+        "CreatedAt": created_at,
+        "UpdatedAt": updated_at,
+    }
 
 
 def _parse_stored_game_ids(value: Any) -> List[str]:

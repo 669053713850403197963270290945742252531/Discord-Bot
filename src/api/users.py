@@ -48,6 +48,9 @@ def build_user_entry(
         "ExpiresAt": None,
         "CreatedAt": None,
         "UpdatedAt": None,
+        "HWID": None,
+        "LastHwidReset": None,
+        "totalHwidResets": 0,
     }
 
 
