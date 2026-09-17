@@ -145,91 +145,6 @@ def _db_row_from_record(record: Dict[str, Any], identifier_fallback: Optional[st
     return out
 
 
-def record_from_import_row(row: Dict[str, Any]) -> Dict[str, Any]:
-    """Convert an exported CSV row into the internal license-record shape.
-
-    CSV column names are case-insensitive and may use either the current export
-    names or the legacy ``key`` alias. Empty values are converted to ``None``
-    where appropriate so /bulkwhitelist can pass records directly to the
-    normal Supabase replacement path without losing fields.
-    """
-    if not isinstance(row, dict):
-        raise ValueError("Imported row must be an object")
-
-    normalized = {str(k).strip().lower(): v for k, v in row.items() if k is not None}
-
-    def cell(*names: str, default: Any = "") -> Any:
-        for name in names:
-            if name in normalized:
-                value = normalized[name]
-                if value is None:
-                    return default
-                if isinstance(value, str):
-                    return value.strip()
-                return value
-        return default
-
-    def nullable(*names: str) -> Optional[str]:
-        value = cell(*names)
-        return str(value).strip() if value not in (None, "") else None
-
-    identifier = nullable("identifier")
-    if not identifier:
-        raise ValueError("identifier is required")
-
-    discord_id = nullable("discord_id")
-    key = nullable("license_key", "key")
-    rank = str(cell("rank", default="User") or "User").strip() or "User"
-    notes = nullable("notes")
-    activated = nullable("activated")
-    expires_at = nullable("expires_at")
-    created_at = nullable("created_at")
-    updated_at = nullable("updated_at")
-    hwid = nullable("hwid")
-    last_hwid_reset = nullable("last_hwid_reset", "last_hwidreset", "lasthwidreset")
-
-    executions_raw = cell("executions", default=0)
-    try:
-        executions = int(executions_raw or 0)
-    except (TypeError, ValueError):
-        raise ValueError("executions must be an integer")
-
-    resets_raw = cell("hwid_resets", "total_hwid_resets", default=0)
-    try:
-        hwid_resets = int(resets_raw or 0)
-    except (TypeError, ValueError):
-        raise ValueError("hwid_resets must be an integer")
-
-    enabled_raw = cell("enabled", default=True)
-    enabled = _parse_bool(enabled_raw, default=True)
-
-    games_raw = cell("games", default="*")
-    if isinstance(games_raw, list):
-        games = [str(x).strip() for x in games_raw if str(x).strip()]
-    else:
-        games = [part.strip() for part in str(games_raw or "").split(",") if part.strip()]
-    if not games:
-        games = ["*"]
-
-    return {
-        "Identifier": identifier,
-        "DiscordId": discord_id,
-        "Key": key,
-        "Activated": activated,
-        "Executions": executions,
-        "Rank": rank,
-        "Notes": notes,
-        "Enabled": enabled,
-        "ExpiresAt": expires_at,
-        "Games": games,
-        "HWID": hwid,
-        "LastHwidReset": last_hwid_reset,
-        "totalHwidResets": hwid_resets,
-        "CreatedAt": created_at,
-        "UpdatedAt": updated_at,
-    }
-
-
 def _parse_stored_game_ids(value: Any) -> List[str]:
     """Parse the single license_games.game_id field into normalized game IDs.
 
@@ -314,6 +229,62 @@ async def fetch_users_with_sha() -> Tuple[List[Dict[str, Any]], None]:
 async def fetch_api_text_and_sha() -> Tuple[str, None]:
     users = await fetch_users()
     return serialize_users_json(users), None
+
+
+def record_from_import_row(row: Dict[str, Any]) -> Dict[str, Any]:
+    """Normalize an exported JSON/CSV license row into the DB record shape.
+
+    This is intentionally shared by /bulkwhitelist and /editwhitelist so an
+    exported record can make a lossless round trip through the import paths.
+    """
+    if not isinstance(row, dict):
+        raise ValueError("License record must be an object")
+
+    def first(*keys):
+        for key in keys:
+            if key in row:
+                return row.get(key)
+        return None
+
+    games = first("Games", "games")
+    if isinstance(games, str):
+        games = [part.strip() for part in games.split(",") if part.strip()]
+    elif games is None:
+        games = ["*"]
+    else:
+        games = [str(part).strip() for part in games if str(part).strip()] or ["*"]
+
+    identifier = str(first("Identifier", "identifier") or "").strip()
+    if not identifier:
+        raise ValueError("License record is missing Identifier")
+
+    try:
+        executions = int(first("Executions", "executions") or 0)
+    except (TypeError, ValueError) as exc:
+        raise ValueError("Executions must be an integer") from exc
+
+    try:
+        hwid_resets = int(first("totalHwidResets", "HwidResets", "HWIDResets", "hwid_resets") or 0)
+    except (TypeError, ValueError) as exc:
+        raise ValueError("HWID reset count must be an integer") from exc
+
+    return {
+        "Identifier": identifier,
+        "DiscordId": (str(first("DiscordId", "discord_id") or "").strip() or None),
+        "Key": (str(first("Key", "LicenseKey", "license_key", "key") or "").strip() or None),
+        "Activated": first("Activated", "activated") or None,
+        "Executions": executions,
+        "Rank": str(first("Rank", "rank") or "User"),
+        "Notes": first("Notes", "notes") or None,
+        "Games": games,
+        "Enabled": _parse_bool(first("Enabled", "enabled"), default=True),
+        "ExpiresAt": first("ExpiresAt", "expires_at") or None,
+        "CreatedAt": first("CreatedAt", "created_at") or None,
+        "UpdatedAt": first("UpdatedAt", "updated_at") or None,
+        "HWID": (str(first("HWID", "hwid") or "").strip().lower() or None),
+        "LastHwidReset": first("LastHwidReset", "LastHWIDReset", "last_hwid_reset") or None,
+        "totalHwidResets": hwid_resets,
+    }
 
 
 def serialize_users_json(users: List[Dict[str, Any]]) -> str:
@@ -558,6 +529,71 @@ async def create_license(record: Dict[str, Any]) -> Dict[str, Any]:
     return await upsert_license(record)
 
 
+def _rename_license_identifier_sync(original_identifier: str, new_identifier: str) -> Dict[str, Any]:
+    original_identifier = str(original_identifier or "").strip()
+    new_identifier = str(new_identifier or "").strip()
+    if not original_identifier or not new_identifier:
+        raise ValueError("Identifier cannot be empty")
+    if original_identifier == new_identifier:
+        existing = _get_by_identifier_sync(original_identifier)
+        if not existing:
+            raise ValueError("License no longer exists")
+        return existing
+
+    client = _client_sync()
+    old_rows = (client.table("licenses").select("*").eq("identifier", original_identifier).limit(1).execute()).data or []
+    if not old_rows:
+        raise ValueError("License no longer exists")
+    duplicate = (client.table("licenses").select("identifier").eq("identifier", new_identifier).limit(1).execute()).data or []
+    if duplicate:
+        raise ValueError("identifier_already_exists")
+
+    old_row = old_rows[0]
+    games = _fetch_games_for_identifiers_sync([original_identifier]).get(original_identifier, []) or ["*"]
+    old_record = _record_from_db(old_row, games)
+    new_record = dict(old_record)
+    new_record["Identifier"] = new_identifier
+    new_row = _db_row_from_record(new_record)
+
+    inserted_new = False
+    try:
+        inserted = client.table("licenses").insert(new_row).execute().data or []
+        if not inserted:
+            raise RuntimeError("Supabase did not return the renamed license record")
+        inserted_new = True
+
+        # Move the child game mapping before deleting the old parent row.
+        _set_games_sync(new_identifier, games)
+        client.table("license_games").delete().eq("identifier", original_identifier).execute()
+
+        deleted = (
+            client.table("licenses")
+            .delete()
+            .eq("identifier", original_identifier)
+            .select("identifier")
+            .execute()
+        ).data or []
+        if not deleted:
+            raise RuntimeError("Supabase did not delete the original license record")
+
+        return _record_from_db(inserted[0], games)
+    except Exception:
+        if inserted_new:
+            try:
+                client.table("license_games").delete().eq("identifier", new_identifier).execute()
+            except Exception:
+                pass
+            try:
+                client.table("licenses").delete().eq("identifier", new_identifier).execute()
+            except Exception:
+                pass
+        raise
+
+
+async def rename_license_identifier(original_identifier: str, new_identifier: str) -> Dict[str, Any]:
+    return await asyncio.to_thread(_rename_license_identifier_sync, original_identifier, new_identifier)
+
+
 async def update_license(identifier: str, **updates: Any) -> Optional[Dict[str, Any]]:
     def _update():
         client = _client_sync()
@@ -673,23 +709,138 @@ async def redeem_license(key: str, discord_id: str, identifier: str, rank: str =
 
 
 def _replace_users_sync(users: List[Dict[str, Any]]) -> List[Dict[str, Any]]:
+    """Replace the license dataset without violating unique Discord IDs.
+
+    Older versions used ``upsert(..., on_conflict="identifier")`` here.
+    That is unsafe for imports/edits because ``discord_id`` is also unique:
+    if an existing record is matched by its Discord ID but has the same
+    identifier (or an identifier was renamed), PostgREST could attempt an
+    INSERT and the unique ``Licenses_discord_id_key`` constraint would fail.
+
+    Match each incoming record to an existing row by identifier first, then
+    Discord ID, then license key. Matched rows are UPDATEd in place; only
+    genuinely new records are INSERTed. Game mappings are synchronized after
+    the row update, and unmatched existing records are removed at the end.
+    """
     client = _client_sync()
-    normalized = []
-    desired_ids = set()
+
+    existing_rows = (client.table("licenses").select("*").execute()).data or []
+    existing_by_identifier = {str(row.get("identifier") or "").casefold(): row for row in existing_rows}
+    existing_by_discord = {
+        str(row.get("discord_id")): row
+        for row in existing_rows
+        if row.get("discord_id") not in (None, "")
+    }
+    existing_by_key = {
+        str(row.get("license_key")): row
+        for row in existing_rows
+        if row.get("license_key") not in (None, "")
+    }
+
+    normalized_records: List[Dict[str, Any]] = []
+    seen_identifiers = set()
+    seen_discord = set()
+    seen_keys = set()
+
+    # Validate the whole incoming dataset before mutating anything. This
+    # prevents a bad import from partially writing records before discovering
+    # a duplicate unique field later in the file.
     for record in users:
         identifier = str(record.get("Identifier") or "").strip()
         if not identifier:
             continue
-        desired_ids.add(identifier)
-        normalized.append(record)
-        client.table("licenses").upsert(_db_row_from_record(record), on_conflict="identifier").execute()
-        _set_games_sync(identifier, record.get("Games") or ["*"])
+        row = _db_row_from_record(record)
+        normalized_records.append(record)
 
-    existing = (client.table("licenses").select("identifier").execute()).data or []
-    for row in existing:
+        identifier_key = identifier.casefold()
+        if identifier_key in seen_identifiers:
+            raise ValueError(f"Duplicate identifier: {identifier}")
+        seen_identifiers.add(identifier_key)
+
+        discord_id = row.get("discord_id")
+        if discord_id:
+            if discord_id in seen_discord:
+                raise ValueError(f"Duplicate Discord ID: {discord_id}")
+            seen_discord.add(discord_id)
+
+        license_key = row.get("license_key")
+        if license_key:
+            if license_key in seen_keys:
+                raise ValueError(f"Duplicate license key: {license_key}")
+            seen_keys.add(license_key)
+
+    matched_existing_identifiers = set()
+
+    for record in normalized_records:
+        row = _db_row_from_record(record)
         identifier = str(row["identifier"])
-        if identifier not in desired_ids:
-            client.table("licenses").delete().eq("identifier", identifier).execute()
+        discord_id = row.get("discord_id")
+        license_key = row.get("license_key")
+
+        existing = existing_by_identifier.get(identifier.casefold())
+        if existing is None and discord_id:
+            existing = existing_by_discord.get(str(discord_id))
+        if existing is None and license_key:
+            existing = existing_by_key.get(str(license_key))
+
+        if existing is not None:
+            old_identifier = str(existing.get("identifier") or "").strip()
+
+            # A different existing record may already own the incoming unique
+            # value. Never turn that into a blind INSERT/UPDATE that trips a
+            # database constraint.
+            owner = existing_by_identifier.get(identifier.casefold())
+            if owner is not None and str(owner.get("identifier")) != old_identifier:
+                raise ValueError(f"Identifier already exists: {identifier}")
+
+            if discord_id:
+                owner = existing_by_discord.get(str(discord_id))
+                if owner is not None and str(owner.get("identifier")) != old_identifier:
+                    raise ValueError(f"Discord ID already exists: {discord_id}")
+
+            if license_key:
+                owner = existing_by_key.get(str(license_key))
+                if owner is not None and str(owner.get("identifier")) != old_identifier:
+                    raise ValueError(f"License key already exists: {license_key}")
+
+            result = (
+                client.table("licenses")
+                .update(row)
+                .eq("identifier", old_identifier)
+                .execute()
+            )
+            if not result.data:
+                raise RuntimeError(f"Supabase did not update license `{old_identifier}`")
+
+            # If the identifier itself changed, move the child game mapping
+            # explicitly so it stays attached to the renamed record.
+            if old_identifier != identifier:
+                client.table("license_games").delete().eq("identifier", old_identifier).execute()
+            _set_games_sync(identifier, record.get("Games") or ["*"])
+            matched_existing_identifiers.add(old_identifier)
+        else:
+            inserted = client.table("licenses").insert(row).execute().data or []
+            if not inserted:
+                raise RuntimeError(f"Supabase did not create license `{identifier}`")
+            _set_games_sync(identifier, record.get("Games") or ["*"])
+
+    # Delete only records that were not matched by the replacement dataset.
+    desired_identifiers = {
+        str(record.get("Identifier") or "").strip().casefold()
+        for record in normalized_records
+        if str(record.get("Identifier") or "").strip()
+    }
+    for existing in existing_rows:
+        old_identifier = str(existing.get("identifier") or "").strip()
+        if not old_identifier:
+            continue
+        if old_identifier in matched_existing_identifiers:
+            continue
+        if old_identifier.casefold() in desired_identifiers:
+            continue
+        client.table("license_games").delete().eq("identifier", old_identifier).execute()
+        client.table("licenses").delete().eq("identifier", old_identifier).execute()
+
     return _fetch_users_sync()
 
 
