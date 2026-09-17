@@ -301,29 +301,201 @@ class Database(commands.Cog):
 
     @app_commands.command(name="dbsearch", description="Searches the license database for a value.")
     @app_commands.guilds(GUILD)
-    @app_commands.describe(query="Text to search for")
+    @app_commands.describe(
+        query="Text to search for",
+        field="Optional database field to search only",
+        fuzzy="Whether fuzzy matching should be used (defaults to true)",
+    )
+    @app_commands.choices(field=[
+        app_commands.Choice(name="All fields", value="all"),
+        app_commands.Choice(name="Identifier", value="identifier"),
+        app_commands.Choice(name="Discord ID", value="discord_id"),
+        app_commands.Choice(name="License Key", value="license_key"),
+        app_commands.Choice(name="Activated", value="activated"),
+        app_commands.Choice(name="Executions", value="executions"),
+        app_commands.Choice(name="Rank", value="rank"),
+        app_commands.Choice(name="Notes", value="notes"),
+        app_commands.Choice(name="Enabled", value="enabled"),
+        app_commands.Choice(name="Expires At", value="expires_at"),
+        app_commands.Choice(name="Games", value="games"),
+        app_commands.Choice(name="HWID", value="hwid"),
+        app_commands.Choice(name="Last HWID Reset", value="last_hwid_reset"),
+        app_commands.Choice(name="HWID Resets", value="hwid_resets"),
+        app_commands.Choice(name="Created At", value="created_at"),
+        app_commands.Choice(name="Updated At", value="updated_at"),
+    ])
     @has_role(config.REQUIRED_ROLE_ID)
     @is_in_guild(config.GUILD_ID)
-    async def dbsearch(self, interaction, query: str):
+    async def dbsearch(self, interaction, query: str, field: app_commands.Choice[str] = None, fuzzy: bool = True):
         await safe_defer(interaction, ephemeral=True)
-        q = query.lower().strip(); users = await fetch_users(); matches=[]
-        for u in users:
-            hay = " ".join(str(u.get(k,"")) for k in ("Identifier","DiscordId","Key","Rank","Notes","Games")).lower()
-            if q in hay: matches.append(u)
-        if not matches: return await send_error(interaction, "No matching license records found.")
-        lines=[]
-        for u in matches[:25]:
-            lines.append(f"**{u.get('Identifier','Unknown')}** — <@{u.get('DiscordId')}> — `{u.get('Key')}` — Games: {', '.join(u.get('Games') or [])}")
-        embed = discord.Embed(title="🔎 Database Search", description=f"Found {len(matches)} matching license record(s).", color=discord.Color.blurple())
-        for index, u in enumerate(matches[:25], start=1):
-            embed.add_field(
-                name=f"{index}. {u.get('Identifier', 'Unknown')}",
-                value=f"Discord: <@{u.get('DiscordId')}>\nKey: `{u.get('Key')}`\nGames: {', '.join(u.get('Games') or []) or 'None'}",
-                inline=False,
-            )
-        if len(matches) > 25:
-            embed.set_footer(text=f"Showing 25 of {len(matches)} matches")
-        await interaction.followup.send(embed=embed, ephemeral=True)
+
+        q = query.strip()
+        if not q:
+            return await send_error(interaction, "Search query cannot be empty.")
+
+        try:
+            users = await fetch_users()
+        except Exception as exc:
+            return await send_error(interaction, f"Failed to search the license database: {exc}")
+
+        field_map = {
+            "identifier": "Identifier",
+            "discord_id": "DiscordId",
+            "license_key": "Key",
+            "activated": "Activated",
+            "executions": "Executions",
+            "rank": "Rank",
+            "notes": "Notes",
+            "enabled": "Enabled",
+            "expires_at": "ExpiresAt",
+            "games": "Games",
+            "hwid": "HWID",
+            "last_hwid_reset": "LastHwidReset",
+            "hwid_resets": "totalHwidResets",
+            "created_at": "CreatedAt",
+            "updated_at": "UpdatedAt",
+        }
+        selected_field = field.value if field else "all"
+        # CreatedAt/UpdatedAt are system-maintained metadata and are excluded from
+        # an "All fields" search. They remain available through explicit field selection.
+        all_search_keys = [key for key in field_map.values() if key not in {"CreatedAt", "UpdatedAt"}]
+        search_keys = all_search_keys if selected_field == "all" else [field_map[selected_field]]
+
+        def _stringify(value):
+            if isinstance(value, (list, tuple, set)):
+                return " ".join(str(item) for item in value)
+            if value is None:
+                return ""
+            return str(value)
+
+        def _score(value: str) -> float:
+            import difflib
+            candidate = value.casefold()
+            target = q.casefold()
+            if target == candidate:
+                return 1.0
+            if target in candidate:
+                return 0.95
+            ratio = difflib.SequenceMatcher(None, target, candidate).ratio()
+            words = candidate.replace("_", " ").replace("-", " ").split()
+            if words:
+                ratio = max(ratio, max(difflib.SequenceMatcher(None, target, word).ratio() for word in words))
+            return ratio
+
+        scored = []
+        target = q.casefold()
+        for user in users:
+            matched_fields = []
+            best = 0.0
+            for key in search_keys:
+                value = _stringify(user.get(key))
+                candidate = value.casefold()
+
+                # With fuzzy disabled, only an exact case-insensitive value match counts.
+                # This intentionally does not treat a query such as `eth` as matching `ethan`.
+                if target == candidate and candidate:
+                    score = 1.0
+                elif fuzzy:
+                    if target in candidate:
+                        score = 0.95
+                    else:
+                        score = _score(value) if candidate else 0.0
+                else:
+                    score = 0.0
+
+                threshold = 0.55 if fuzzy else 1.0
+                if score >= threshold:
+                    matched_fields.append((key, value, score))
+                    best = max(best, score)
+
+            threshold = 0.55 if fuzzy else 1.0
+            if best >= threshold and matched_fields:
+                scored.append((best, user, matched_fields))
+
+        scored.sort(key=lambda item: (-item[0], str(item[1].get("Identifier") or "Unknown").casefold()))
+        matches = [(user, matched_fields) for _, user, matched_fields in scored]
+
+
+        if not matches:
+            scope = "the database" if selected_field == "all" else f"the {field.name} field"
+            return await send_error(interaction, f"No matching license records found in {scope}.")
+
+        def _record_value(user, key, fallback="None"):
+            value = user.get(key)
+            if isinstance(value, (list, tuple, set)):
+                value = ", ".join(str(item) for item in value)
+            if value is None or value == "":
+                return fallback
+            return str(value)
+
+        page_size = 8
+        pages = [matches[i:i + page_size] for i in range(0, len(matches), page_size)]
+
+        class DatabaseSearchView(discord.ui.View):
+            def __init__(self, owner_id: int):
+                super().__init__(timeout=300)
+                self.owner_id = owner_id
+                self.page = 0
+                self.previous.disabled = True
+                self._sync()
+
+            async def interaction_check(self, button_interaction: discord.Interaction) -> bool:
+                if button_interaction.user.id != self.owner_id:
+                    await send_error(button_interaction, "Only the person who started this search can change pages.")
+                    return False
+                return True
+
+            def _sync(self):
+                self.previous.disabled = self.page <= 0
+                self.next.disabled = self.page >= len(pages) - 1
+
+            def build_embed(self):
+                page = pages[self.page]
+                embed = discord.Embed(
+                    title="🔎 Database Search",
+                    description=(
+                        f"Found **{len(matches)}** matching license record(s).\n"
+                        f"Search: `{q}`\n"
+                        f"Field: **{field.name if field else 'All fields'}**\n"
+                        f"Fuzzy matching: **{'Enabled' if fuzzy else 'Disabled'}**"
+                    ),
+                    color=discord.Color.blurple(),
+                )
+                for offset, (user, matched_fields) in enumerate(page, start=self.page * page_size + 1):
+                    # Discord is the only persistent user field. Every other displayed
+                    # field below it must be a field that actually matched the query.
+                    matched_details = []
+                    for key, value, _ in matched_fields:
+                        label = next((label for value_key, label in field_map.items() if value_key == key), key)
+                        display_value = value if value else "None"
+                        matched_details.append(f"{label}: {display_value}")
+
+                    result_lines = [f"Discord: <@{_record_value(user, 'DiscordId', '0')}>"]
+                    if matched_details:
+                        result_lines.extend(matched_details)
+
+                    embed.add_field(
+                        name=f"{offset}. {_record_value(user, 'Identifier', 'Unknown')}",
+                        value="\n".join(result_lines),
+                        inline=False,
+                    )
+                embed.set_footer(text=f"Page {self.page + 1}/{len(pages)} • {len(matches)} total match(es)")
+                return embed
+
+            @discord.ui.button(label="Previous", style=discord.ButtonStyle.secondary, emoji="◀️")
+            async def previous(self, button_interaction: discord.Interaction, button: discord.ui.Button):
+                self.page -= 1
+                self._sync()
+                await button_interaction.response.edit_message(embed=self.build_embed(), view=self)
+
+            @discord.ui.button(label="Next", style=discord.ButtonStyle.primary, emoji="▶️")
+            async def next(self, button_interaction: discord.Interaction, button: discord.ui.Button):
+                self.page += 1
+                self._sync()
+                await button_interaction.response.edit_message(embed=self.build_embed(), view=self)
+
+        view = DatabaseSearchView(interaction.user.id)
+        await interaction.followup.send(embed=view.build_embed(), view=view, ephemeral=True)
 
     games_group = app_commands.guilds(GUILD)(
         app_commands.Group(name="games", description="Game management commands.")
