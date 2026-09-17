@@ -12,6 +12,7 @@ from discord.ext import commands
 
 from api import config
 from api.discord_helpers import has_role, is_in_guild, send_error, send_success, default_ui_error, safe_defer, safe_send_modal
+from api.alerts import send_alert, alert_embed, ALERT_COLOR_ADD, ALERT_COLOR_REMOVE, ALERT_COLOR_EDIT
 from api.supabase_db import fetch_users, fetch_api_text_and_sha, commit_content, serialize_users_json, list_games, get_game, create_game, delete_game, update_game
 from api.supabase_storage import fetch_game_script_bytes, upload_game_script, delete_game_script, get_game_script_filename, SupabaseStorageError
 from api.users import revoke_buyer_role, find_removed_discord_ids
@@ -155,9 +156,25 @@ class Database(commands.Cog):
                 ])
             data = buf.getvalue().encode()
             await interaction.followup.send(file=discord.File(io.BytesIO(data), filename="licenses.csv"), ephemeral=True)
+            await send_alert(
+                interaction.client,
+                alert_embed(
+                    "📤 License Database Exported",
+                    f"{interaction.user.mention} exported **{len(users)}** license record(s) as CSV.",
+                    color=ALERT_COLOR_EDIT,
+                ),
+            )
             return
         data = serialize_users_json(users).encode()
         await interaction.followup.send(file=discord.File(io.BytesIO(data), filename="licenses.json"), ephemeral=True)
+        await send_alert(
+            interaction.client,
+            alert_embed(
+                "📤 License Database Exported",
+                f"{interaction.user.mention} exported **{len(users)}** license record(s) as JSON.",
+                color=ALERT_COLOR_EDIT,
+            ),
+        )
 
     @app_commands.command(name="upload", description="Replaces the Supabase license database using an exported JSON or CSV file.")
     @app_commands.guilds(GUILD)
@@ -267,6 +284,20 @@ class Database(commands.Cog):
             f"**Changed:** {len(changed_ids)}" + (f" — {_format_names(changed_ids, new_by_identifier)}" if changed_ids else ""),
         ]
         await send_success(interaction, "Imported license database into Supabase.\n\n" + "\n".join(details))
+        await send_alert(
+            interaction.client,
+            alert_embed(
+                "📥 License Database Uploaded",
+                f"{interaction.user.mention} replaced the license database from `{file.filename}`.",
+                color=ALERT_COLOR_EDIT,
+                fields=[
+                    ("Total", str(len(data)), True),
+                    ("Added", str(len(added_ids)), True),
+                    ("Removed", str(len(removed_ids)), True),
+                    ("Changed", str(len(changed_ids)), True),
+                ],
+            ),
+        )
 
     @app_commands.command(name="dbsearch", description="Searches the license database for a value.")
     @app_commands.guilds(GUILD)
@@ -445,6 +476,14 @@ class Database(commands.Cog):
         embed.add_field(name="Script Path", value=f"`{script_path}`", inline=False)
         embed.add_field(name="Uploaded File", value=f"`{file.filename}`", inline=False)
         await interaction.followup.send(embed=embed, ephemeral=True)
+        await send_alert(
+            interaction.client,
+            alert_embed(
+                "🎮 Game Added",
+                f"{interaction.user.mention} added **{name}** (`{game_id}`) to the Games database and uploaded `{script_path}`.",
+                color=ALERT_COLOR_ADD,
+            ),
+        )
 
 
     @games_group.command(name="remove", description="Removes a supported game and its script from the private storage bucket.")
@@ -511,6 +550,14 @@ class Database(commands.Cog):
         embed.add_field(name="Script Path", value=f"`{script_path}`", inline=False)
         embed.set_footer(text="Database entry and private Storage script deleted.")
         await interaction.followup.send(embed=embed, ephemeral=True)
+        await send_alert(
+            interaction.client,
+            alert_embed(
+                "🎮 Game Removed",
+                f"{interaction.user.mention} removed **{game.get('name', game_id)}** (`{game_id}`) and deleted `{script_path}` from Storage.",
+                color=ALERT_COLOR_REMOVE,
+            ),
+        )
 
     @games_group.command(name="update", description="Replaces a game's script in the private game-scripts bucket.")
     @has_role(config.REQUIRED_ROLE_ID)
@@ -556,6 +603,14 @@ class Database(commands.Cog):
         embed.add_field(name="Script Path", value=f"`{script_path}`", inline=True)
         embed.add_field(name="Updated File", value=f"`{file.filename}`", inline=True)
         await interaction.followup.send(embed=embed, ephemeral=True)
+        await send_alert(
+            interaction.client,
+            alert_embed(
+                "🎮 Game Script Updated",
+                f"{interaction.user.mention} replaced the script for **{game.get('name', game_id)}** (`{game_id}`) at `{script_path}`.",
+                color=ALERT_COLOR_EDIT,
+            ),
+        )
 
 
 async def setup(bot):

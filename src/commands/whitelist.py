@@ -2,6 +2,7 @@ import asyncio
 """Whitelist/license administration backed by Supabase."""
 
 import csv
+import difflib
 import io
 import json
 from datetime import datetime, timezone
@@ -14,11 +15,11 @@ from discord.ui import Modal, TextInput, Label, LayoutView, Container, TextDispl
 
 from api import config
 from api.discord_helpers import has_role, is_in_guild, send_success, send_error, default_ui_error, resolve_user_option, safe_edit_message, safe_send_modal, safe_defer, safe_respond
-from api.alerts import send_alert, alert_embed, ALERT_COLOR_ADD, ALERT_COLOR_REMOVE, ALERT_COLOR_EDIT
+from api.alerts import send_alert, send_component_alert, alert_embed, ALERT_COLOR_ADD, ALERT_COLOR_REMOVE, ALERT_COLOR_EDIT, LicenseDatabaseDiffView
 from api.supabase_db import (
     fetch_users, fetch_users_with_sha, fetch_api_text_and_sha, commit_content,
     commit_users, get_license_by_discord_id, get_license_by_key, get_license_by_identifier, update_license,
-    delete_license, set_license_games, get_license_game_ids, record_from_import_row,
+    delete_license, set_license_games, get_license_game_ids, record_from_import_row, rename_license_identifier,
 )
 from api.users import find_user_by_discord_id, find_user_by_key, remove_user_by_discord_id, build_user_entry, revoke_buyer_role, find_removed_discord_ids
 from api.keys import generate_unique_key, is_valid_discord_id, parse_game_ids
@@ -33,6 +34,88 @@ MAX_BULK_WHITELIST_ROWS = 50
 def _games_text(games):
     games = games or []
     return "All games" if "*" in games else ", ".join(games) or "No games assigned"
+
+
+def _canonical_license_records(users):
+    """Build a stable, semantic representation for database diffs.
+
+    Games are normalized and sorted so representation/order changes do not
+    appear as edits. CreatedAt/UpdatedAt are omitted because they are
+    database-maintained metadata and may legitimately change when a record is
+    written even when the license fields themselves were untouched.
+    """
+    fields = (
+        "Identifier", "DiscordId", "Key", "Activated", "Executions",
+        "Rank", "Notes", "Games", "Enabled", "ExpiresAt", "HWID",
+        "LastHwidReset", "totalHwidResets",
+    )
+
+    normalized = []
+    for user in users or []:
+        record = {}
+        for field in fields:
+            value = user.get(field) if isinstance(user, dict) else None
+            if field == "Games":
+                games = [str(game).strip() for game in (value or []) if str(game).strip()]
+                if "*" in games:
+                    games = ["*"]
+                else:
+                    games = sorted(set(games))
+                value = games
+            elif field == "Enabled":
+                value = bool(value)
+            elif field in {"Executions", "totalHwidResets"}:
+                value = int(value or 0)
+            elif value == "":
+                value = None
+            record[field] = value
+        normalized.append(record)
+
+    normalized.sort(key=lambda item: str(item.get("Identifier") or "").casefold())
+    return normalized
+
+
+def _changed_license_identifiers(before_users, after_users):
+    """Return identifiers for records whose user-facing license fields changed."""
+    before = {
+        str((record or {}).get("Identifier") or "").casefold(): record
+        for record in _canonical_license_records(before_users)
+    }
+    after = {
+        str((record or {}).get("Identifier") or "").casefold(): record
+        for record in _canonical_license_records(after_users)
+    }
+
+    changed = []
+    for key in sorted(set(before) | set(after)):
+        if before.get(key) != after.get(key):
+            record = after.get(key) or before.get(key) or {}
+            identifier = record.get("Identifier") or key
+            changed.append(str(identifier))
+    return changed
+
+
+def _license_database_diff(before_users, after_users) -> str:
+    """Return a stable unified diff containing only actual license-field changes.
+
+    The records are canonicalized before diffing so list formatting/order does
+    not create noise. Database-managed CreatedAt/UpdatedAt fields are excluded
+    because they may change as a side effect of the write. Zero context lines
+    keep the diff focused on the changed fields instead of repeating unrelated
+    users and unchanged values.
+    """
+    before = _canonical_license_records(before_users)
+    after = _canonical_license_records(after_users)
+    before_text = json.dumps(before, indent=2, ensure_ascii=False, sort_keys=True).splitlines()
+    after_text = json.dumps(after, indent=2, ensure_ascii=False, sort_keys=True).splitlines()
+    return "\n".join(difflib.unified_diff(
+        before_text,
+        after_text,
+        fromfile="licenses.before.json",
+        tofile="licenses.after.json",
+        lineterm="",
+        n=0,
+    ))
 
 
 def _games_links_text(games):
@@ -171,6 +254,23 @@ async def _bulkwhitelist_impl(interaction, attachment):
     if errors:
         message += "\n\nSkipped:\n" + "\n".join(errors[:10])
     await send_success(interaction, message)
+    if added:
+        shown = []
+        for entry in added[:15]:
+            discord_id = str(entry.get("DiscordId") or "").strip()
+            mention = f"<@{discord_id}>" if discord_id else "no Discord ID"
+            shown.append(f"`{entry.get('Identifier')}` ({mention})")
+        if len(added) > 15:
+            shown.append(f"+ {len(added) - 15} more")
+        await send_alert(
+            interaction.client,
+            alert_embed(
+                "👥 Users Bulk Whitelisted",
+                f"{interaction.user.mention} bulk-whitelisted **{len(added)}** user(s).",
+                color=ALERT_COLOR_ADD,
+                fields=[("Users", ", ".join(shown), False)],
+            ),
+        )
 
 
 async def _unwhitelist_user_impl(interaction, user: discord.Member):
@@ -224,20 +324,81 @@ class EditUserModal(Modal, title="Edit User"):
             games = parse_game_ids(self.games.component.value)
         except ValueError as e:
             return await send_error(interaction, str(e))
-        old = await get_license_by_identifier(self.original_identifier)
+
+        try:
+            old = await get_license_by_identifier(self.original_identifier)
+        except Exception as exc:
+            import traceback
+            traceback.print_exc()
+            return await send_error(interaction, f"Failed to load the license: {exc}")
         if not old:
             return await send_error(interaction, "License no longer exists.")
-        if identifier != self.original_identifier and await get_license_by_identifier(identifier):
-            return await send_error(interaction, "That identifier is already in use.")
-        updates = {"discord_id": discord_id, "rank": self.rank.component.values[0], "notes": self.notes.component.value.strip() or None, "games": games}
+
         if identifier != self.original_identifier:
-            updates["license_key"] = old.get("Key")
-            new_record = dict(old); new_record["Identifier"] = identifier; new_record["DiscordId"] = discord_id; new_record["Rank"] = updates["rank"]; new_record["Notes"] = updates["notes"]; new_record["Games"] = games
-            users = await fetch_users(); users = [new_record if str(u.get("Identifier")) == self.original_identifier else u for u in users]
-            await commit_users(users, None, f"Edit license {identifier} ({discord_id})")
-        else:
-            await update_license(self.original_identifier, **updates)
+            try:
+                existing = await get_license_by_identifier(identifier)
+            except Exception as exc:
+                import traceback
+                traceback.print_exc()
+                return await send_error(interaction, f"Failed to validate the new identifier: {exc}")
+            if existing:
+                return await send_error(interaction, "That identifier is already in use.")
+
+        updates = {
+            "discord_id": discord_id,
+            "rank": self.rank.component.values[0],
+            "notes": self.notes.component.value.strip() or None,
+            "games": games,
+        }
+
+        try:
+            if identifier != self.original_identifier:
+                await rename_license_identifier(self.original_identifier, identifier)
+                await update_license(identifier, **updates)
+            else:
+                await update_license(self.original_identifier, **updates)
+        except Exception as exc:
+            import traceback
+            traceback.print_exc()
+            return await send_error(interaction, f"Failed to update the license: {exc}")
+
+        new_values = {
+            "Identifier": identifier,
+            "DiscordId": discord_id,
+            "Rank": updates["rank"],
+            "Notes": updates["notes"],
+            "Games": games,
+        }
+        old_values = {
+            "Identifier": old.get("Identifier"),
+            "DiscordId": old.get("DiscordId"),
+            "Rank": old.get("Rank"),
+            "Notes": old.get("Notes"),
+            "Games": old.get("Games") or ["*"],
+        }
+        changed_fields = []
+        for field in ("Identifier", "DiscordId", "Rank", "Notes", "Games"):
+            old_value = old_values[field]
+            new_value = new_values[field]
+            if field == "Games":
+                old_value = ", ".join(str(v) for v in (old_value or [])) or "None"
+                new_value = ", ".join(str(v) for v in (new_value or [])) or "None"
+            else:
+                old_value = "None" if old_value in (None, "") else str(old_value)
+                new_value = "None" if new_value in (None, "") else str(new_value)
+            if old_value != new_value:
+                changed_fields.append(f"**{field}:** `{old_value}` → `{new_value}`")
+
         await send_success(interaction, f"Updated **{identifier}**.")
+        await send_alert(
+            interaction.client,
+            alert_embed(
+                "✏️ User Edited",
+                f"{interaction.user.mention} edited **{identifier}** in the whitelist.",
+                color=ALERT_COLOR_EDIT,
+                fields=[("Changes", "\n".join(changed_fields) if changed_fields else "No tracked fields changed.", False)],
+            ),
+        )
         if self.whitelist_view is not None:
             try:
                 self.whitelist_view.users = await fetch_users()
@@ -467,22 +628,66 @@ class Whitelist(commands.Cog):
     @is_in_guild(config.GUILD_ID)
     async def editwhitelist(self, interaction):
         try:
-            current, _ = await asyncio.wait_for(fetch_api_text_and_sha(), timeout=2.0)
+            before_users = await asyncio.wait_for(fetch_users(), timeout=2.0)
         except asyncio.TimeoutError:
             return await send_error(interaction, "The license database took too long to respond. Please try again.")
         except Exception as exc:
             return await send_error(interaction, f"Failed to load the license database: {exc}")
+
+        current = json.dumps(before_users, indent=4, ensure_ascii=False) + "\n"
         modal = Modal(title="Edit License JSON")
         text = TextInput(label="License JSON", style=discord.TextStyle.paragraph, default=current[:4000], max_length=4000)
         modal.add_item(text)
+
         async def submit(i):
             try:
                 payload = json.loads(text.value)
-                if not isinstance(payload, list): raise ValueError("JSON must be an array of license objects")
-                await commit_content(json.dumps(payload), None, f"Replace license database by {i.user}")
+                if not isinstance(payload, list):
+                    raise ValueError("JSON must be an array of license objects")
+
+                normalized = []
+                identifiers = set()
+                for row in payload:
+                    record = record_from_import_row(row)
+                    key = record["Identifier"].casefold()
+                    if key in identifiers:
+                        raise ValueError(f"Duplicate identifier: {record['Identifier']}")
+                    identifiers.add(key)
+                    normalized.append(record)
+
+                committed = await commit_content(
+                    json.dumps(normalized, ensure_ascii=False),
+                    None,
+                    f"Replace license database by {i.user}",
+                )
+                after_users = committed if isinstance(committed, list) else await fetch_users()
+                diff_text = _license_database_diff(before_users, after_users)
             except Exception as e:
+                import traceback
+                traceback.print_exc()
                 return await send_error(i, f"Invalid license JSON: {e}")
+
             await send_success(i, "License database updated.")
+            changed_identifiers = _changed_license_identifiers(before_users, after_users)
+            if changed_identifiers:
+                if len(changed_identifiers) <= 15:
+                    changed_text = ", ".join(f"`{identifier}`" for identifier in changed_identifiers)
+                else:
+                    shown = ", ".join(f"`{identifier}`" for identifier in changed_identifiers[:15])
+                    changed_text = f"{shown}, + {len(changed_identifiers) - 15} more"
+                description = (
+                    f"{i.user.mention} replaced the license database via `/editwhitelist`.\n"
+                    f"**Edited user(s):** {changed_text}"
+                )
+            else:
+                description = (
+                    f"{i.user.mention} replaced the license database via `/editwhitelist`.\n"
+                    f"**Edited user(s):** None detected"
+                )
+
+            diff_view = LicenseDatabaseDiffView(description, diff_text)
+            await send_component_alert(i.client, diff_view)
+
         modal.on_submit = submit
         await safe_send_modal(interaction, modal)
 

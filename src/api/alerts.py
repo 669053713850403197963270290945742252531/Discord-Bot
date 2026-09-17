@@ -20,12 +20,13 @@ channels can see a lot of traffic -- full context belongs in the commit
 message on GitHub, not in every embed here.
 """
 
+import io
 from datetime import datetime, timezone
 from typing import Any, Dict, List, Optional, Tuple
 
 import discord
 from discord.ext import commands
-from discord.ui import View
+from discord.ui import View, LayoutView, Container, TextDisplay, ActionRow, Button, File
 
 from . import config
 from .discord_helpers import build_embed
@@ -179,6 +180,35 @@ async def send_alert(bot: commands.Bot, embed: discord.Embed, view: Optional[Vie
     return await _deliver_alert(bot, config.ALERTS_CHANNEL_ID, "Alerts", embed, view)
 
 
+async def send_component_alert(
+    bot: commands.Bot,
+    view: LayoutView,
+    *,
+    bypass_mute: bool = False,
+    file: Optional[discord.File] = None,
+) -> Optional[discord.Message]:
+    """Best-effort delivery of a Components V2 alert without an embed.
+
+    Components V2 messages must be sent as component layouts rather than the
+    legacy embed + View combination, which keeps interactive controls inside
+    the layout container.
+    """
+    if not _alerts_enabled and not bypass_mute:
+        return None
+    channel = bot.get_channel(config.ALERTS_CHANNEL_ID)
+    if not channel:
+        print(f"Alerts channel not found (channel_id={config.ALERTS_CHANNEL_ID}).")
+        return None
+    try:
+        kwargs = {"view": view}
+        if file is not None:
+            kwargs["file"] = file
+        return await channel.send(**kwargs)
+    except Exception as e:
+        print(f"Failed to send Components V2 alert to Alerts channel: {e}")
+        return None
+
+
 async def send_moderation_alert(bot: commands.Bot, embed: discord.Embed, view: Optional[View] = None, *, bypass_mute: bool = False) -> Optional[discord.Message]:
     """Best-effort delivery to the staff Moderation Alerts channel -- the
     moderation-side counterpart to send_alert() above.
@@ -192,6 +222,70 @@ async def send_moderation_alert(bot: commands.Bot, embed: discord.Embed, view: O
     if not _moderation_alerts_enabled and not bypass_mute:
         return None
     return await _deliver_alert(bot, config.MODERATION_ALERTS_CHANNEL_ID, "Moderation Alerts", embed, view)
+
+
+class LicenseDatabaseDiffView(LayoutView):
+    """Components V2 alert layout with an in-message diff attachment button."""
+
+    def __init__(self, description: str, diff_text: str, *, filename: str = "license-database.diff"):
+        super().__init__(timeout=None)
+        self.description = description
+        self.diff_text = diff_text
+        self.filename = filename
+        self.attached = False
+        self._rebuild()
+
+    def _rebuild(self) -> None:
+        self.clear_items()
+        children = [
+            TextDisplay("### 📝 License Database Edited"),
+            TextDisplay(self.description),
+        ]
+        if self.attached:
+            children.append(TextDisplay(f"**Diff:** `{self.filename}` is attached to this alert."))
+            children.append(File(f"attachment://{self.filename}"))
+            button = Button(label="Diff Attached", style=discord.ButtonStyle.secondary, disabled=True)
+        else:
+            children.append(TextDisplay("Click **View Diff** to attach the exact database changes to this alert."))
+            button = Button(label="View Diff", style=discord.ButtonStyle.secondary)
+            button.callback = self._attach_diff
+        children.append(ActionRow(button))
+        self.add_item(Container(*children, accent_color=ALERT_COLOR_EDIT))
+
+    async def _attach_diff(self, interaction: discord.Interaction) -> None:
+        if self.attached:
+            return await interaction.response.send_message("The diff is already attached to this alert.", ephemeral=True)
+        if not self.diff_text:
+            self.attached = True
+            self._rebuild()
+            return await interaction.response.edit_message(view=self)
+
+        diff_file = discord.File(io.BytesIO(self.diff_text.encode("utf-8")), filename=self.filename)
+        try:
+            # Send the attachment and the Components V2 layout in the same
+            # message edit. Discord only resolves attachment:// URLs when
+            # the referenced attachment is present in that request.
+            self.attached = True
+            self._rebuild()
+            await interaction.response.defer()
+            await interaction.message.edit(view=self, attachments=[diff_file])
+        except Exception as exc:
+            self.attached = False
+            self._rebuild()
+            print(f"Failed to attach alert diff: {exc}")
+            try:
+                if interaction.response.is_done():
+                    await interaction.followup.send(
+                        "I couldn't attach the diff file to the alert message.",
+                        ephemeral=True,
+                    )
+                else:
+                    await interaction.response.send_message(
+                        "I couldn't attach the diff file to the alert message.",
+                        ephemeral=True,
+                    )
+            except Exception:
+                pass
 
 
 def alert_embed(
