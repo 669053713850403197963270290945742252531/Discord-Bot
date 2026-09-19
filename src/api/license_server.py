@@ -23,6 +23,7 @@ from .supabase_db import (
     get_game,
     complete_successful_execution,
     bind_license_hwid,
+    disable_license,
 )
 from .supabase_storage import fetch_game_script, SupabaseStorageError
 from .keys import is_valid_hwid
@@ -37,6 +38,7 @@ _state_lock = threading.Lock()
 _recent: Dict[Tuple[str, str], float] = {}
 _challenges: Dict[str, float] = {}
 _challenge_recent: Dict[str, float] = {}
+_breach_recent: Dict[Tuple[str, str], float] = {}
 _execution_tokens: Dict[str, Dict[str, Any]] = {}
 
 
@@ -50,6 +52,9 @@ def _purge(now: float) -> None:
     for remote, last in list(_challenge_recent.items()):
         if now - last > 120:
             _challenge_recent.pop(remote, None)
+    for key, last in list(_breach_recent.items()):
+        if now - last > 60:
+            _breach_recent.pop(key, None)
     for token, record in list(_execution_tokens.items()):
         if now - record["issued_at"] > 90:
             _execution_tokens.pop(token, None)
@@ -132,6 +137,8 @@ def _send_breach_webhook(
     job_id: Any,
     device: Any,
     reason: str,
+    detection_details: Any = None,
+    license_disabled: bool = False,
 ) -> None:
     """Send a security alert for a suspicious license-server event.
 
@@ -149,6 +156,9 @@ def _send_breach_webhook(
     discord_id = _safe_log_value(entry.get("DiscordId"), fallback="Unknown")
     owner_rank = _safe_log_value(entry.get("Rank"), fallback="Unknown")
     owner_hwid = _safe_log_value(entry.get("HWID"), fallback="Unset")
+    detection_details_text = _safe_log_value(
+        detection_details, fallback="No additional details", max_length=1024
+    )
     used_key = _safe_log_value(key, fallback="Unknown", max_length=256)
     current_hwid = _safe_log_value(current_hwid, fallback="Unknown", max_length=128)
     game_id = _safe_log_value(game_id)
@@ -186,6 +196,16 @@ def _send_breach_webhook(
                     f"**Rank:** `{owner_rank}`\n"
                     f"**Owner HWID:** ||`{owner_hwid}`||"
                 ),
+                "inline": False,
+            },
+            {
+                "name": "Detection",
+                "value": f"`{detection_details_text}`",
+                "inline": False,
+            },
+            {
+                "name": "Enforcement",
+                "value": f"**License Status:** {"Disabled" if license_disabled else "Not changed"}",
                 "inline": False,
             },
             {
@@ -242,6 +262,8 @@ def _queue_breach_webhook(
     job_id: Any,
     device: Any,
     reason: str,
+    detection_details: Any = None,
+    license_disabled: bool = False,
 ) -> None:
     if not getattr(config, "LICENSE_BREACH_LOGGING_ENABLED", True):
         return
@@ -250,11 +272,101 @@ def _queue_breach_webhook(
 
     threading.Thread(
         target=_send_breach_webhook,
-        args=(entry, key, current_hwid, game_id, remote, executor, job_id, device, reason),
+        args=(entry, key, current_hwid, game_id, remote, executor, job_id, device, reason, detection_details, license_disabled),
         daemon=True,
         name="celestial-breach-webhook",
     ).start()
 
+
+
+def _breach_rate_limited(key: str, remote: str) -> bool:
+    now = time.time()
+    bucket = (key, remote)
+    with _state_lock:
+        _purge(now)
+        last = _breach_recent.get(bucket, 0.0)
+        if now - last < 5.0:
+            return True
+        _breach_recent[bucket] = now
+    return False
+
+
+def handle_breach_request(raw: bytes, remote: str) -> Tuple[int, str, Dict[str, str]]:
+    """Process a client-reported potential-circumvention event.
+
+    The key must resolve to an existing license. The license row is disabled
+    server-side; the reported telemetry is treated as untrusted context and
+    the owner details in the alert come from Supabase.
+    """
+    if not getattr(config, "LICENSE_TAMPER_DETECTION_ENABLED", True):
+        return 403, json.dumps({"ok": False, "reason": "tamper_detection_disabled"}), {"Content-Type": "application/json"}
+    if len(raw) > MAX_BODY_BYTES:
+        return 413, json.dumps({"ok": False, "reason": "request_too_large"}), {"Content-Type": "application/json"}
+    try:
+        payload = json.loads(raw.decode("utf-8"))
+    except (UnicodeDecodeError, json.JSONDecodeError):
+        return 400, json.dumps({"ok": False, "reason": "malformed_request"}), {"Content-Type": "application/json"}
+    if not isinstance(payload, dict):
+        return 400, json.dumps({"ok": False, "reason": "malformed_request"}), {"Content-Type": "application/json"}
+
+    key = str(payload.get("key") or "").strip()
+    hwid = str(payload.get("hwid") or "").strip().lower()
+    game_id = str(payload.get("game_id") or "").strip()
+    reason = str(payload.get("reason") or "").strip()
+    details = _safe_log_value(payload.get("detection"), fallback="Unknown tamper detection", max_length=512)
+    executor = _safe_log_value(payload.get("executor"), fallback="Unknown", max_length=256)
+    job_id = _safe_log_value(payload.get("job_id"), fallback="Unknown", max_length=128)
+    device = _safe_log_value(payload.get("device"), fallback="Unknown", max_length=128)
+
+    if reason != "potential_circumvention":
+        return 400, json.dumps({"ok": False, "reason": "invalid_breach_reason"}), {"Content-Type": "application/json"}
+    if not _valid_key(key) or not is_valid_hwid(hwid) or not game_id.isdigit():
+        return 400, json.dumps({"ok": False, "reason": "malformed_request"}), {"Content-Type": "application/json"}
+    if _breach_rate_limited(key, remote):
+        return 429, json.dumps({"ok": False, "reason": "rate_limited"}), {"Content-Type": "application/json"}
+
+    try:
+        entry = _run(get_license_by_key(key))
+    except Exception as exc:
+        print(f"[License] Potential-circumvention license lookup failed: {exc}")
+        return 503, json.dumps({"ok": False, "reason": "backend_unavailable"}), {"Content-Type": "application/json"}
+
+    if not entry:
+        return 404, json.dumps({"ok": False, "reason": "not_whitelisted"}), {"Content-Type": "application/json"}
+
+    identifier = str(entry.get("Identifier") or "").strip()
+    if not identifier:
+        return 503, json.dumps({"ok": False, "reason": "backend_unavailable"}), {"Content-Type": "application/json"}
+
+    try:
+        disabled_entry = _run(disable_license(identifier))
+    except Exception as exc:
+        print(f"[License] Failed to disable license after potential circumvention: {exc}")
+        return 503, json.dumps({"ok": False, "reason": "backend_unavailable"}), {"Content-Type": "application/json"}
+
+    if not disabled_entry:
+        return 503, json.dumps({"ok": False, "reason": "backend_unavailable"}), {"Content-Type": "application/json"}
+
+    _queue_breach_webhook(
+        entry=entry,
+        key=key,
+        current_hwid=hwid,
+        game_id=game_id,
+        remote=remote,
+        executor=executor,
+        job_id=job_id,
+        device=device,
+        reason=reason,
+        detection_details=details,
+        license_disabled=True,
+    )
+
+    return 200, json.dumps({
+        "ok": True,
+        "reason": reason,
+        "disabled": True,
+        "identifier": identifier,
+    }), {"Content-Type": "application/json", "Cache-Control": "no-store"}
 
 def evaluate_and_load(
     key: str,

@@ -196,6 +196,13 @@ LICENSE_BREACH_LOGGING_ENABLED = os.getenv(
 ).strip().lower() not in ("false", "0", "no", "off")
 LICENSE_BREACH_WEBHOOK_URL = os.getenv("LICENSE_BREACH_WEBHOOK_URL", "").strip()
 
+# Client-side function tampering detection. This controls the request/kick
+# integrity monitor in the public licensing client. The server still keeps
+# its own breach logging toggle above.
+LICENSE_TAMPER_DETECTION_ENABLED = os.getenv(
+    "LICENSE_TAMPER_DETECTION_ENABLED", "true"
+).strip().lower() not in ("false", "0", "no", "off")
+
 # Sentivel heartbeat used by the bot status page. By default it is enabled
 # only on Render, since local development intentionally goes offline during
 # restarts/debugging. Set SENTIVEL_ENABLED explicitly to true/false to

@@ -616,6 +616,11 @@ async def update_license(identifier: str, **updates: Any) -> Optional[Dict[str, 
     return await asyncio.to_thread(_update)
 
 
+async def disable_license(identifier: str) -> Optional[Dict[str, Any]]:
+    """Disable a license while retaining its database row."""
+    return await update_license(identifier, enabled=False)
+
+
 async def delete_license(identifier: str) -> bool:
     def _delete():
         result = _client_sync().table("licenses").delete().eq("identifier", identifier).execute()
