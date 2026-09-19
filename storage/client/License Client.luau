@@ -8,10 +8,80 @@ local ENDPOINT = "__LICENSE_API_BASE__"
 local CHALLENGE_ENDPOINT = ENDPOINT .. "/whitelist/challenge"
 local CHECK_ENDPOINT = ENDPOINT .. "/whitelist/check"
 local COMPLETE_ENDPOINT = ENDPOINT .. "/whitelist/complete"
+local BREACH_ENDPOINT = ENDPOINT .. "/whitelist/breach"
+local TAMPER_DETECTION_ENABLED = "__LICENSE_TAMPER_DETECTION_ENABLED__" == "true"
 
 local ENV = getgenv()
 local key = ENV.script_key
 local localPlayer = Players.LocalPlayer
+
+-- Capture the request transport before authentication. These checks are
+-- defensive telemetry: they detect common replacement and hook techniques,
+-- but no client-side check can guarantee that a hostile process cannot observe
+-- traffic at a lower network layer.
+local originalRequest = ENV.request
+local originalRequestHash = nil
+local originalRequestFlags = {}
+
+-- Capture the native Player:Kick method before authentication. Auth failures
+-- always call this captured reference instead of re-looking up `:Kick()` from
+-- the player instance, so a simple global/object overwrite cannot replace the
+-- enforcement path.
+local originalKick = nil
+local originalKickHash = nil
+local originalKickFlags = {}
+
+pcall(function()
+    if localPlayer and type(localPlayer.Kick) == "function" then
+        originalKick = localPlayer.Kick
+    end
+end)
+
+if TAMPER_DETECTION_ENABLED and type(originalKick) == "function" then
+    local getfunctionhash_fn = ENV.getfunctionhash
+    if type(getfunctionhash_fn) == "function" then
+        pcall(function()
+            originalKickHash = getfunctionhash_fn(originalKick)
+        end)
+    end
+
+    local closureChecks = {
+        {name = "executor_closure", fn = ENV.isexecutorclosure},
+        {name = "c_closure", fn = ENV.iscclosure},
+        {name = "new_c_closure", fn = ENV.isnewcclosure},
+    }
+    for _, check in ipairs(closureChecks) do
+        if type(check.fn) == "function" then
+            local ok, value = pcall(check.fn, originalKick)
+            if ok and type(value) == "boolean" then
+                originalKickFlags[check.name] = value
+            end
+        end
+    end
+end
+
+if TAMPER_DETECTION_ENABLED and type(originalRequest) == "function" then
+    local getfunctionhash_fn = ENV.getfunctionhash
+    if type(getfunctionhash_fn) == "function" then
+        pcall(function()
+            originalRequestHash = getfunctionhash_fn(originalRequest)
+        end)
+    end
+
+    local closureChecks = {
+        {name = "executor_closure", fn = ENV.isexecutorclosure},
+        {name = "c_closure", fn = ENV.iscclosure},
+        {name = "new_c_closure", fn = ENV.isnewcclosure},
+    }
+    for _, check in ipairs(closureChecks) do
+        if type(check.fn) == "function" then
+            local ok, value = pcall(check.fn, originalRequest)
+            if ok and type(value) == "boolean" then
+                originalRequestFlags[check.name] = value
+            end
+        end
+    end
+end
 
 -- Optional loader mode:
 --   "normal" (default) = authenticate and load the protected script.
@@ -40,6 +110,7 @@ local REASONS = {
     hwid_hash_failed = "Unable to securely process this device's HWID.",
     invalid_hwid_format = "Your device HWID could not be validated.",
     hwid_mismatch = "Unauthorized key sharing detected: this license key is bound to another device.",
+    potential_circumvention = "Potential circumvention detected. Your license has been disabled.",
     game_not_configured = "This game is not configured for Celestial licensing.",
     game_not_supported = "This game is not currently supported by Celestial.",
     game_disabled = "This game is currently disabled by Celestial.",
@@ -243,7 +314,186 @@ local function get_device()
     return "Unknown"
 end
 
-local function reject(reason)
+local breachReported = false
+local tamperMonitorStarted = false
+
+local reject
+
+local function kick_tamper_reason()
+    if not TAMPER_DETECTION_ENABLED or type(originalKick) ~= "function" then
+        return nil
+    end
+
+    if not localPlayer then
+        return "kick_player_unavailable"
+    end
+
+    local ok, currentKick = pcall(function()
+        return localPlayer.Kick
+    end)
+
+    if ok and type(currentKick) == "function" and currentKick ~= originalKick then
+        return "kick_reference_changed"
+    end
+
+    local isfunctionhooked_fn = ENV.isfunctionhooked
+    if type(isfunctionhooked_fn) == "function" then
+        local hookedOk, hooked = pcall(isfunctionhooked_fn, originalKick)
+        if hookedOk and hooked == true then
+            return "kick_hooked"
+        end
+    end
+
+    local getfunctionhash_fn = ENV.getfunctionhash
+    if originalKickHash and type(getfunctionhash_fn) == "function" then
+        local hashOk, currentHash = pcall(getfunctionhash_fn, originalKick)
+        if hashOk and type(currentHash) == "string" and currentHash ~= originalKickHash then
+            return "kick_function_hash_changed"
+        end
+    end
+
+    local currentFlags = {
+        executor_closure = ENV.isexecutorclosure,
+        c_closure = ENV.iscclosure,
+        new_c_closure = ENV.isnewcclosure,
+    }
+    for name, originalValue in pairs(originalKickFlags) do
+        local fn = currentFlags[name]
+        if type(fn) == "function" then
+            local flagOk, value = pcall(fn, originalKick)
+            if flagOk and type(value) == "boolean" and value ~= originalValue then
+                return "kick_closure_type_changed:" .. name
+            end
+        end
+    end
+
+    return nil
+end
+
+local function request_tamper_reason()
+    if not TAMPER_DETECTION_ENABLED or type(originalRequest) ~= "function" then
+        return nil
+    end
+
+    if type(ENV.request) ~= "function" then
+        return "request_replaced_with_non_function"
+    end
+
+    if ENV.request ~= originalRequest then
+        return "request_reference_changed"
+    end
+
+    local isfunctionhooked_fn = ENV.isfunctionhooked
+    if type(isfunctionhooked_fn) == "function" then
+        local ok, hooked = pcall(isfunctionhooked_fn, originalRequest)
+        if ok and hooked == true then
+            return "request_hooked"
+        end
+    end
+
+    local getfunctionhash_fn = ENV.getfunctionhash
+    if originalRequestHash and type(getfunctionhash_fn) == "function" then
+        local ok, currentHash = pcall(getfunctionhash_fn, originalRequest)
+        if ok and type(currentHash) == "string" and currentHash ~= originalRequestHash then
+            return "request_function_hash_changed"
+        end
+    end
+
+    local currentFlags = {
+        executor_closure = ENV.isexecutorclosure,
+        c_closure = ENV.iscclosure,
+        new_c_closure = ENV.isnewcclosure,
+    }
+    for name, originalValue in pairs(originalRequestFlags) do
+        local fn = currentFlags[name]
+        if type(fn) == "function" then
+            local ok, value = pcall(fn, originalRequest)
+            if ok and type(value) == "boolean" and value ~= originalValue then
+                return "request_closure_type_changed:" .. name
+            end
+        end
+    end
+
+    return nil
+end
+
+local function report_potential_circumvention(detectionReason, currentHwid)
+    if not TAMPER_DETECTION_ENABLED or breachReported then
+        return false
+    end
+
+    local payload = {
+        key = key,
+        hwid = currentHwid or "",
+        game_id = tostring(game.PlaceId),
+        reason = "potential_circumvention",
+        detection = detectionReason,
+        executor = auth.getExecutor() or "Unknown",
+        job_id = tostring(game.JobId or "Unknown"),
+        device = get_device(),
+    }
+
+    local encoded = HttpService:JSONEncode(payload)
+    for attempt = 1, 2 do
+        local ok, response = pcall(originalRequest, {
+            Url = BREACH_ENDPOINT,
+            Method = "POST",
+            Headers = {
+                ["Content-Type"] = "application/json",
+                ["Cache-Control"] = "no-cache",
+            },
+            Body = encoded,
+        })
+
+        if ok and type(response) == "table" and response.Success == true then
+            breachReported = true
+            return true
+        end
+
+        if attempt == 1 then
+            task.wait(0.25)
+        end
+    end
+
+    return false
+end
+
+local function trigger_potential_circumvention(detectionReason, currentHwid)
+    if breachReported then
+        return
+    end
+
+    -- Report before kicking so the enforcement request can complete.
+    report_potential_circumvention(detectionReason, currentHwid)
+    reject("potential_circumvention")
+end
+
+local function start_tamper_monitor(currentHwid)
+    if not TAMPER_DETECTION_ENABLED or tamperMonitorStarted then
+        return
+    end
+    tamperMonitorStarted = true
+
+    task.spawn(function()
+        while not breachReported and not auth.isKicked() do
+            local requestReason = request_tamper_reason()
+            if requestReason then
+                trigger_potential_circumvention(requestReason, currentHwid)
+                break
+            end
+
+            local kickReason = kick_tamper_reason()
+            if kickReason then
+                trigger_potential_circumvention(kickReason, currentHwid)
+                break
+            end
+
+            task.wait(1)
+        end
+    end)
+end
+
+reject = function(reason)
     if reason == "hwid_mismatch" then
         print("[Celestial][SECURITY] Unauthorized key sharing detected.")
         print("[Celestial][SECURITY] The supplied license key is bound to another HWID.")
@@ -256,9 +506,33 @@ local function reject(reason)
     -- failures are reported to the caller instead of terminating the session.
     if not infoOnly and localPlayer then
         kicked = true
-        pcall(function()
-            localPlayer:Kick("Celestial License: " .. message)
-        end)
+
+        local kickMessage = "Celestial License: " .. message
+
+        -- Prefer the method reference captured before authentication. If the
+        -- closure was hooked, restore the original implementation when the
+        -- executor exposes Potassium's documented restorefunction() API.
+        if type(originalKick) == "function" then
+            local isfunctionhooked_fn = ENV.isfunctionhooked
+            local restorefunction_fn = ENV.restorefunction
+
+            if type(isfunctionhooked_fn) == "function" and type(restorefunction_fn) == "function" then
+                local ok, hooked = pcall(isfunctionhooked_fn, originalKick)
+                if ok and hooked == true then
+                    pcall(restorefunction_fn, originalKick)
+                end
+            end
+
+            -- Call the captured method directly rather than performing a fresh
+            -- `localPlayer:Kick(...)` lookup that a hook could intercept.
+            pcall(originalKick, localPlayer, kickMessage)
+        else
+            -- Extremely defensive fallback for environments where the method
+            -- could not be captured at startup.
+            pcall(function()
+                localPlayer:Kick(kickMessage)
+            end)
+        end
     end
 
     -- Always return the auth API, even when authentication fails, so callers can
@@ -271,7 +545,7 @@ if type(key) ~= "string" or key == "" then
 end
 
 local function httpPost(url, body)
-    local ok, response = pcall(request, {
+    local ok, response = pcall(originalRequest, {
         Url = url,
         Method = "POST",
         Headers = {
@@ -325,6 +599,15 @@ end
 local hwid, hwidError = get_hwid()
 if not hwid then
     return reject(hwidError)
+end
+
+if TAMPER_DETECTION_ENABLED then
+    local startupTamper = request_tamper_reason()
+    if startupTamper then
+        report_potential_circumvention(startupTamper, hwid)
+        return reject("potential_circumvention")
+    end
+    start_tamper_monitor(hwid)
 end
 
 local challengeResponse, challengeError = httpPost(CHALLENGE_ENDPOINT, "{}")
@@ -406,12 +689,12 @@ if not payloadOk or type(source) ~= "string" or source == "" then
     return reject("payload_decode_failed")
 end
 
-local chunk, compileError = loadstring(source)
+local chunk, _ = loadstring(source)
 if type(chunk) ~= "function" then
     return reject("payload_compile_failed")
 end
 
-local runOk, runError = pcall(chunk)
+local runOk, _ = pcall(chunk)
 if not runOk then
     return reject("payload_runtime_failed")
 end

@@ -20,6 +20,7 @@ import os
 from threading import Thread
 
 from flask import Flask, request, jsonify, Response
+from api import config
 
 app = Flask('')
 
@@ -54,6 +55,10 @@ def public_license_client():
     except OSError:
         return "-- license client unavailable", 503, {"Content-Type": "text/plain; charset=utf-8"}
     source = source.replace("__LICENSE_API_BASE__", base_url)
+    source = source.replace(
+        "__LICENSE_TAMPER_DETECTION_ENABLED__",
+        "true" if config.LICENSE_TAMPER_DETECTION_ENABLED else "false",
+    )
 
     # `/client` must remain usable by the executor's HTTP client, but opening
     # the endpoint in a normal browser should never expose the license client
@@ -129,6 +134,15 @@ def whitelist_challenge():
 def whitelist_check():
     from api.license_server import handle_check_request
     status, body, headers = handle_check_request(
+        request.get_data(), request.remote_addr or 'unknown'
+    )
+    return Response(body, status=status, headers=headers)
+
+
+@app.route('/whitelist/breach', methods=['POST'])
+def whitelist_breach():
+    from api.license_server import handle_breach_request
+    status, body, headers = handle_breach_request(
         request.get_data(), request.remote_addr or 'unknown'
     )
     return Response(body, status=status, headers=headers)
