@@ -128,374 +128,130 @@ def _parse_bool_text(value, default=True):
     raise ValueError("enabled must be True or False")
 
 
+async def _upload_impl(interaction, file: discord.Attachment):
+    await safe_defer(interaction, ephemeral=True)
+    raw = await file.read()
+    try:
+        text = raw.decode("utf-8-sig")
+        stripped = text.lstrip()
+        if stripped.startswith("["):
+            data = json.loads(text)
+            if not isinstance(data, list):
+                raise ValueError("JSON root must be an array")
+        else:
+            reader = csv.DictReader(io.StringIO(text))
+            rows = list(reader)
+            if not rows:
+                raise ValueError("CSV contains no license records")
+            data = []
+            for row in rows:
+                normalized = {str(k).strip().lower(): v for k, v in row.items()}
+                data.append({
+                    "Identifier": normalized.get("identifier", "").strip(),
+                    "DiscordId": normalized.get("discord_id", "").strip() or None,
+                    "Key": normalized.get("license_key", normalized.get("key", "")).strip() or None,
+                    "Activated": normalized.get("activated", "").strip() or None,
+                    "Executions": int(normalized.get("executions") or 0),
+                    "Rank": normalized.get("rank", "User").strip() or "User",
+                    "Notes": normalized.get("notes", "").strip() or None,
+                    "Enabled": _parse_bool_text(normalized.get("enabled"), True),
+                    "ExpiresAt": normalized.get("expires_at", "").strip() or None,
+                    "Games": [x.strip() for x in normalized.get("games", "*").split(",") if x.strip()] or ["*"],
+                    "HWID": normalized.get("hwid", "").strip() or None,
+                    "LastHwidReset": normalized.get("last_hwid_reset", "").strip() or None,
+                    "totalHwidResets": int(normalized.get("hwid_resets") or 0),
+                    "CreatedAt": normalized.get("created_at", "").strip() or None,
+                    "UpdatedAt": normalized.get("updated_at", "").strip() or None,
+                })
+        old = await fetch_users()
+        await commit_content(json.dumps(data, ensure_ascii=False), None, f"Import license database by {interaction.user}")
+    except Exception as e:
+        return await send_error(interaction, f"Failed to import license database: {e}")
+    def _identifier(record):
+        return str(record.get("Identifier") or "").strip()
+
+    def _normalize_games(value):
+        if isinstance(value, (list, tuple, set)):
+            return tuple(str(game).strip() for game in value)
+        if value in (None, ""):
+            return tuple()
+        return tuple(part.strip() for part in str(value).split(",") if part.strip())
+
+    def _signature(record):
+        return (
+            _identifier(record),
+            str(record.get("DiscordId") or "").strip(),
+            str(record.get("Key") or "").strip(),
+            str(record.get("Activated") or "").strip(),
+            int(record.get("Executions") or 0),
+            str(record.get("Rank") or "User").strip(),
+            str(record.get("Notes") or "").strip(),
+            bool(record.get("Enabled", True)),
+            str(record.get("ExpiresAt") or "").strip(),
+            _normalize_games(record.get("Games") or []),
+            str(record.get("HWID") or "").strip(),
+            str(record.get("LastHwidReset") or record.get("LastHWIDReset") or "").strip(),
+            int(record.get("totalHwidResets", record.get("HwidResets", record.get("HWIDResets", 0))) or 0),
+            str(record.get("CreatedAt") or "").strip(),
+            str(record.get("UpdatedAt") or "").strip(),
+        )
+
+    old_by_identifier = {_identifier(record): record for record in old if _identifier(record)}
+    new_by_identifier = {_identifier(record): record for record in data if _identifier(record)}
+
+    added_ids = [identifier for identifier in new_by_identifier if identifier not in old_by_identifier]
+    removed_ids = [identifier for identifier in old_by_identifier if identifier not in new_by_identifier]
+    changed_ids = [
+        identifier
+        for identifier in new_by_identifier
+        if identifier in old_by_identifier
+        and _signature(old_by_identifier[identifier]) != _signature(new_by_identifier[identifier])
+    ]
+
+    # Preserve the existing role cleanup for licenses that disappeared.
+    for identifier in removed_ids:
+        discord_id = old_by_identifier[identifier].get("DiscordId")
+        if discord_id:
+            await revoke_buyer_role(interaction.guild, discord_id)
+
+    def _format_names(identifiers, source):
+        values = []
+        for identifier in identifiers[:15]:
+            record = source.get(identifier, {})
+            discord_id = str(record.get("DiscordId") or "").strip()
+            mention = f"<@{discord_id}>" if discord_id else "no Discord ID"
+            values.append(f"`{identifier}` ({mention})")
+        suffix = "" if len(identifiers) <= 15 else f" + {len(identifiers) - 15} more"
+        return ", ".join(values) + suffix
+
+    details = [
+        f"**Total:** {len(data)}",
+        f"**Added:** {len(added_ids)}" + (f" — {_format_names(added_ids, new_by_identifier)}" if added_ids else ""),
+        f"**Removed:** {len(removed_ids)}" + (f" — {_format_names(removed_ids, old_by_identifier)}" if removed_ids else ""),
+        f"**Changed:** {len(changed_ids)}" + (f" — {_format_names(changed_ids, new_by_identifier)}" if changed_ids else ""),
+    ]
+    await send_success(interaction, "Imported license database into Supabase.\n\n" + "\n".join(details))
+    await send_alert(
+        interaction.client,
+        alert_embed(
+            "📥 License Database Uploaded",
+            f"{interaction.user.mention} replaced the license database from `{file.filename}`.",
+            color=ALERT_COLOR_EDIT,
+            fields=[
+                ("Total", str(len(data)), True),
+                ("Added", str(len(added_ids)), True),
+                ("Removed", str(len(removed_ids)), True),
+                ("Changed", str(len(changed_ids)), True),
+            ],
+        ),
+    )
+
+
 class Database(commands.Cog):
     def __init__(self, bot): self.bot = bot
 
-    @app_commands.command(name="export", description="Exports the current Supabase license database.")
-    @app_commands.guilds(GUILD)
-    @app_commands.describe(format="Export format")
-    @app_commands.choices(format=[app_commands.Choice(name="JSON", value="json"), app_commands.Choice(name="CSV", value="csv")])
-    @has_role(config.REQUIRED_ROLE_ID)
-    @is_in_guild(config.GUILD_ID)
-    async def export(self, interaction, format: app_commands.Choice[str] = None):
-        await safe_defer(interaction, ephemeral=True)
-        users = await fetch_users()
-        selected = format.value if format else "json"
-        if selected == "csv":
-            buf = io.StringIO(); writer = csv.writer(buf)
-            writer.writerow([
-                "identifier","discord_id","license_key","activated","executions","rank","notes",
-                "enabled","expires_at","games","hwid","last_hwid_reset","hwid_resets","created_at","updated_at"
-            ])
-            for u in users:
-                writer.writerow([
-                    u.get("Identifier"), u.get("DiscordId"), u.get("Key"), u.get("Activated"),
-                    u.get("Executions", 0), u.get("Rank"), u.get("Notes"), u.get("Enabled", True),
-                    u.get("ExpiresAt"), ",".join(u.get("Games") or []), u.get("HWID"),
-                    u.get("LastHwidReset"), u.get("totalHwidResets", 0), u.get("CreatedAt"), u.get("UpdatedAt"),
-                ])
-            data = buf.getvalue().encode()
-            await interaction.followup.send(file=discord.File(io.BytesIO(data), filename="licenses.csv"), ephemeral=True)
-            await send_alert(
-                interaction.client,
-                alert_embed(
-                    "📤 License Database Exported",
-                    f"{interaction.user.mention} exported **{len(users)}** license record(s) as CSV.",
-                    color=ALERT_COLOR_EDIT,
-                ),
-            )
-            return
-        data = serialize_users_json(users).encode()
-        await interaction.followup.send(file=discord.File(io.BytesIO(data), filename="licenses.json"), ephemeral=True)
-        await send_alert(
-            interaction.client,
-            alert_embed(
-                "📤 License Database Exported",
-                f"{interaction.user.mention} exported **{len(users)}** license record(s) as JSON.",
-                color=ALERT_COLOR_EDIT,
-            ),
-        )
-
-    @app_commands.command(name="upload", description="Replaces the Supabase license database using an exported JSON or CSV file.")
-    @app_commands.guilds(GUILD)
-    @app_commands.describe(file="JSON or CSV export containing license records")
-    @has_role(config.REQUIRED_ROLE_ID)
-    @is_in_guild(config.GUILD_ID)
-    async def upload(self, interaction, file: discord.Attachment):
-        await safe_defer(interaction, ephemeral=True)
-        raw = await file.read()
-        try:
-            text = raw.decode("utf-8-sig")
-            stripped = text.lstrip()
-            if stripped.startswith("["):
-                data = json.loads(text)
-                if not isinstance(data, list):
-                    raise ValueError("JSON root must be an array")
-            else:
-                reader = csv.DictReader(io.StringIO(text))
-                rows = list(reader)
-                if not rows:
-                    raise ValueError("CSV contains no license records")
-                data = []
-                for row in rows:
-                    normalized = {str(k).strip().lower(): v for k, v in row.items()}
-                    data.append({
-                        "Identifier": normalized.get("identifier", "").strip(),
-                        "DiscordId": normalized.get("discord_id", "").strip() or None,
-                        "Key": normalized.get("license_key", normalized.get("key", "")).strip() or None,
-                        "Activated": normalized.get("activated", "").strip() or None,
-                        "Executions": int(normalized.get("executions") or 0),
-                        "Rank": normalized.get("rank", "User").strip() or "User",
-                        "Notes": normalized.get("notes", "").strip() or None,
-                        "Enabled": _parse_bool_text(normalized.get("enabled"), True),
-                        "ExpiresAt": normalized.get("expires_at", "").strip() or None,
-                        "Games": [x.strip() for x in normalized.get("games", "*").split(",") if x.strip()] or ["*"],
-                        "HWID": normalized.get("hwid", "").strip() or None,
-                        "LastHwidReset": normalized.get("last_hwid_reset", "").strip() or None,
-                        "totalHwidResets": int(normalized.get("hwid_resets") or 0),
-                        "CreatedAt": normalized.get("created_at", "").strip() or None,
-                        "UpdatedAt": normalized.get("updated_at", "").strip() or None,
-                    })
-            old = await fetch_users()
-            await commit_content(json.dumps(data, ensure_ascii=False), None, f"Import license database by {interaction.user}")
-        except Exception as e:
-            return await send_error(interaction, f"Failed to import license database: {e}")
-        def _identifier(record):
-            return str(record.get("Identifier") or "").strip()
-
-        def _normalize_games(value):
-            if isinstance(value, (list, tuple, set)):
-                return tuple(str(game).strip() for game in value)
-            if value in (None, ""):
-                return tuple()
-            return tuple(part.strip() for part in str(value).split(",") if part.strip())
-
-        def _signature(record):
-            return (
-                _identifier(record),
-                str(record.get("DiscordId") or "").strip(),
-                str(record.get("Key") or "").strip(),
-                str(record.get("Activated") or "").strip(),
-                int(record.get("Executions") or 0),
-                str(record.get("Rank") or "User").strip(),
-                str(record.get("Notes") or "").strip(),
-                bool(record.get("Enabled", True)),
-                str(record.get("ExpiresAt") or "").strip(),
-                _normalize_games(record.get("Games") or []),
-                str(record.get("HWID") or "").strip(),
-                str(record.get("LastHwidReset") or record.get("LastHWIDReset") or "").strip(),
-                int(record.get("totalHwidResets", record.get("HwidResets", record.get("HWIDResets", 0))) or 0),
-                str(record.get("CreatedAt") or "").strip(),
-                str(record.get("UpdatedAt") or "").strip(),
-            )
-
-        old_by_identifier = {_identifier(record): record for record in old if _identifier(record)}
-        new_by_identifier = {_identifier(record): record for record in data if _identifier(record)}
-
-        added_ids = [identifier for identifier in new_by_identifier if identifier not in old_by_identifier]
-        removed_ids = [identifier for identifier in old_by_identifier if identifier not in new_by_identifier]
-        changed_ids = [
-            identifier
-            for identifier in new_by_identifier
-            if identifier in old_by_identifier
-            and _signature(old_by_identifier[identifier]) != _signature(new_by_identifier[identifier])
-        ]
-
-        # Preserve the existing role cleanup for licenses that disappeared.
-        for identifier in removed_ids:
-            discord_id = old_by_identifier[identifier].get("DiscordId")
-            if discord_id:
-                await revoke_buyer_role(interaction.guild, discord_id)
-
-        def _format_names(identifiers, source):
-            values = []
-            for identifier in identifiers[:15]:
-                record = source.get(identifier, {})
-                discord_id = str(record.get("DiscordId") or "").strip()
-                mention = f"<@{discord_id}>" if discord_id else "no Discord ID"
-                values.append(f"`{identifier}` ({mention})")
-            suffix = "" if len(identifiers) <= 15 else f" + {len(identifiers) - 15} more"
-            return ", ".join(values) + suffix
-
-        details = [
-            f"**Total:** {len(data)}",
-            f"**Added:** {len(added_ids)}" + (f" — {_format_names(added_ids, new_by_identifier)}" if added_ids else ""),
-            f"**Removed:** {len(removed_ids)}" + (f" — {_format_names(removed_ids, old_by_identifier)}" if removed_ids else ""),
-            f"**Changed:** {len(changed_ids)}" + (f" — {_format_names(changed_ids, new_by_identifier)}" if changed_ids else ""),
-        ]
-        await send_success(interaction, "Imported license database into Supabase.\n\n" + "\n".join(details))
-        await send_alert(
-            interaction.client,
-            alert_embed(
-                "📥 License Database Uploaded",
-                f"{interaction.user.mention} replaced the license database from `{file.filename}`.",
-                color=ALERT_COLOR_EDIT,
-                fields=[
-                    ("Total", str(len(data)), True),
-                    ("Added", str(len(added_ids)), True),
-                    ("Removed", str(len(removed_ids)), True),
-                    ("Changed", str(len(changed_ids)), True),
-                ],
-            ),
-        )
-
-    @app_commands.command(name="dbsearch", description="Searches the license database for a value.")
-    @app_commands.guilds(GUILD)
-    @app_commands.describe(
-        query="Text to search for",
-        field="Optional database field to search only",
-        fuzzy="Whether fuzzy matching should be used (defaults to true)",
-    )
-    @app_commands.choices(field=[
-        app_commands.Choice(name="All fields", value="all"),
-        app_commands.Choice(name="Identifier", value="identifier"),
-        app_commands.Choice(name="Discord ID", value="discord_id"),
-        app_commands.Choice(name="License Key", value="license_key"),
-        app_commands.Choice(name="Activated", value="activated"),
-        app_commands.Choice(name="Executions", value="executions"),
-        app_commands.Choice(name="Rank", value="rank"),
-        app_commands.Choice(name="Notes", value="notes"),
-        app_commands.Choice(name="Enabled", value="enabled"),
-        app_commands.Choice(name="Expires At", value="expires_at"),
-        app_commands.Choice(name="Games", value="games"),
-        app_commands.Choice(name="HWID", value="hwid"),
-        app_commands.Choice(name="Last HWID Reset", value="last_hwid_reset"),
-        app_commands.Choice(name="HWID Resets", value="hwid_resets"),
-        app_commands.Choice(name="Created At", value="created_at"),
-        app_commands.Choice(name="Updated At", value="updated_at"),
-    ])
-    @has_role(config.REQUIRED_ROLE_ID)
-    @is_in_guild(config.GUILD_ID)
-    async def dbsearch(self, interaction, query: str, field: app_commands.Choice[str] = None, fuzzy: bool = True):
-        await safe_defer(interaction, ephemeral=True)
-
-        q = query.strip()
-        if not q:
-            return await send_error(interaction, "Search query cannot be empty.")
-
-        try:
-            users = await fetch_users()
-        except Exception as exc:
-            return await send_error(interaction, f"Failed to search the license database: {exc}")
-
-        field_map = {
-            "identifier": "Identifier",
-            "discord_id": "DiscordId",
-            "license_key": "Key",
-            "activated": "Activated",
-            "executions": "Executions",
-            "rank": "Rank",
-            "notes": "Notes",
-            "enabled": "Enabled",
-            "expires_at": "ExpiresAt",
-            "games": "Games",
-            "hwid": "HWID",
-            "last_hwid_reset": "LastHwidReset",
-            "hwid_resets": "totalHwidResets",
-            "created_at": "CreatedAt",
-            "updated_at": "UpdatedAt",
-        }
-        selected_field = field.value if field else "all"
-        # CreatedAt/UpdatedAt are system-maintained metadata and are excluded from
-        # an "All fields" search. They remain available through explicit field selection.
-        all_search_keys = [key for key in field_map.values() if key not in {"CreatedAt", "UpdatedAt"}]
-        search_keys = all_search_keys if selected_field == "all" else [field_map[selected_field]]
-
-        def _stringify(value):
-            if isinstance(value, (list, tuple, set)):
-                return " ".join(str(item) for item in value)
-            if value is None:
-                return ""
-            return str(value)
-
-        def _score(value: str) -> float:
-            import difflib
-            candidate = value.casefold()
-            target = q.casefold()
-            if target == candidate:
-                return 1.0
-            if target in candidate:
-                return 0.95
-            ratio = difflib.SequenceMatcher(None, target, candidate).ratio()
-            words = candidate.replace("_", " ").replace("-", " ").split()
-            if words:
-                ratio = max(ratio, max(difflib.SequenceMatcher(None, target, word).ratio() for word in words))
-            return ratio
-
-        scored = []
-        target = q.casefold()
-        for user in users:
-            matched_fields = []
-            best = 0.0
-            for key in search_keys:
-                value = _stringify(user.get(key))
-                candidate = value.casefold()
-
-                # With fuzzy disabled, only an exact case-insensitive value match counts.
-                # This intentionally does not treat a query such as `eth` as matching `ethan`.
-                if target == candidate and candidate:
-                    score = 1.0
-                elif fuzzy:
-                    if target in candidate:
-                        score = 0.95
-                    else:
-                        score = _score(value) if candidate else 0.0
-                else:
-                    score = 0.0
-
-                threshold = 0.55 if fuzzy else 1.0
-                if score >= threshold:
-                    matched_fields.append((key, value, score))
-                    best = max(best, score)
-
-            threshold = 0.55 if fuzzy else 1.0
-            if best >= threshold and matched_fields:
-                scored.append((best, user, matched_fields))
-
-        scored.sort(key=lambda item: (-item[0], str(item[1].get("Identifier") or "Unknown").casefold()))
-        matches = [(user, matched_fields) for _, user, matched_fields in scored]
 
 
-        if not matches:
-            scope = "the database" if selected_field == "all" else f"the {field.name} field"
-            return await send_error(interaction, f"No matching license records found in {scope}.")
-
-        def _record_value(user, key, fallback="None"):
-            value = user.get(key)
-            if isinstance(value, (list, tuple, set)):
-                value = ", ".join(str(item) for item in value)
-            if value is None or value == "":
-                return fallback
-            return str(value)
-
-        page_size = 8
-        pages = [matches[i:i + page_size] for i in range(0, len(matches), page_size)]
-
-        class DatabaseSearchView(discord.ui.View):
-            def __init__(self, owner_id: int):
-                super().__init__(timeout=300)
-                self.owner_id = owner_id
-                self.page = 0
-                self.previous.disabled = True
-                self._sync()
-
-            async def interaction_check(self, button_interaction: discord.Interaction) -> bool:
-                if button_interaction.user.id != self.owner_id:
-                    await send_error(button_interaction, "Only the person who started this search can change pages.")
-                    return False
-                return True
-
-            def _sync(self):
-                self.previous.disabled = self.page <= 0
-                self.next.disabled = self.page >= len(pages) - 1
-
-            def build_embed(self):
-                page = pages[self.page]
-                embed = discord.Embed(
-                    title="🔎 Database Search",
-                    description=(
-                        f"Found **{len(matches)}** matching license record(s).\n"
-                        f"Search: `{q}`\n"
-                        f"Field: **{field.name if field else 'All fields'}**\n"
-                        f"Fuzzy matching: **{'Enabled' if fuzzy else 'Disabled'}**"
-                    ),
-                    color=discord.Color.blurple(),
-                )
-                for offset, (user, matched_fields) in enumerate(page, start=self.page * page_size + 1):
-                    # Discord is the only persistent user field. Every other displayed
-                    # field below it must be a field that actually matched the query.
-                    matched_details = []
-                    for key, value, _ in matched_fields:
-                        label = next((label for value_key, label in field_map.items() if value_key == key), key)
-                        display_value = value if value else "None"
-                        matched_details.append(f"{label}: {display_value}")
-
-                    result_lines = [f"Discord: <@{_record_value(user, 'DiscordId', '0')}>"]
-                    if matched_details:
-                        result_lines.extend(matched_details)
-
-                    embed.add_field(
-                        name=f"{offset}. {_record_value(user, 'Identifier', 'Unknown')}",
-                        value="\n".join(result_lines),
-                        inline=False,
-                    )
-                embed.set_footer(text=f"Page {self.page + 1}/{len(pages)} • {len(matches)} total match(es)")
-                return embed
-
-            @discord.ui.button(label="Previous", style=discord.ButtonStyle.secondary, emoji="◀️")
-            async def previous(self, button_interaction: discord.Interaction, button: discord.ui.Button):
-                self.page -= 1
-                self._sync()
-                await button_interaction.response.edit_message(embed=self.build_embed(), view=self)
-
-            @discord.ui.button(label="Next", style=discord.ButtonStyle.primary, emoji="▶️")
-            async def next(self, button_interaction: discord.Interaction, button: discord.ui.Button):
-                self.page += 1
-                self._sync()
-                await button_interaction.response.edit_message(embed=self.build_embed(), view=self)
-
-        view = DatabaseSearchView(interaction.user.id)
-        await interaction.followup.send(embed=view.build_embed(), view=view, ephemeral=True)
 
     games_group = app_commands.guilds(GUILD)(
         app_commands.Group(name="games", description="Game management commands.")

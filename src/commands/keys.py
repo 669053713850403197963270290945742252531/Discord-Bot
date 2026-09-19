@@ -12,7 +12,7 @@ from discord.ext import commands
 
 from api import config
 from api.discord_helpers import has_role, is_in_guild, send_success, send_error, resolve_user_option, safe_defer
-from api.alerts import send_alert, alert_embed, ALERT_COLOR_ADD, ALERT_COLOR_EDIT
+from api.alerts import send_alert, alert_embed, ALERT_COLOR_ADD, ALERT_COLOR_EDIT, ALERT_COLOR_TEMP
 from api.keys import generate_key, parse_key_length_range, parse_game_ids
 from api.supabase_db import (
     fetch_users, fetch_temp_whitelists, fetch_redeemable_keys, create_redeemable_key, delete_redeemable_key, delete_redeemable_keys,
@@ -76,6 +76,19 @@ async def _tempwhitelist_impl(interaction, user: discord.User, minutes: int, gam
     except Exception as e:
         return await send_error(interaction, f"Failed to create temporary license: {e}")
     asyncio.create_task(_expire_temp_license_after_delay(identifier, expiry))
+    await send_alert(
+        interaction.client,
+        alert_embed(
+            "⏱️ Temporary License Added",
+            f"{interaction.user.mention} added a temporary license for {user.mention}.",
+            color=ALERT_COLOR_TEMP,
+            fields=[
+                ("Identifier", f"`{identifier}`", True),
+                ("Discord", f"{user.mention} (`{user.id}`)", True),
+                ("Expires At", f"<t:{int(expiry.timestamp())}:F>", False),
+            ],
+        ),
+    )
     await send_success(interaction, f"Granted {user.mention} temporary access until <t:{int(expiry.timestamp())}:F>.", fields=[
         ("License Key", f"||`{key}`||", False), ("Games", _games_text(games), False),
     ])
@@ -316,6 +329,21 @@ async def _extend_impl(interaction, user, minutes: int):
     # remains harmless because it re-reads the current expiration before deleting.
     asyncio.create_task(_expire_temp_license_after_delay(entry["Identifier"], new_expiry))
 
+    if minutes > 0:
+        await send_alert(
+            interaction.client,
+            alert_embed(
+                "⏱️ Temporary License Extended",
+                f"{interaction.user.mention} extended the temporary license for {user.mention} by **{minutes} minute(s)**.",
+                color=ALERT_COLOR_TEMP,
+                fields=[
+                    ("Identifier", f"`{entry.get('Identifier')}`", True),
+                    ("Discord", f"{user.mention} (`{user.id}`)", True),
+                    ("New Expiry", f"<t:{int(new_expiry.timestamp())}:F>", False),
+                ],
+            ),
+        )
+
     action = "extended" if minutes > 0 else "decreased"
     await send_success(
         interaction,
@@ -327,29 +355,8 @@ async def _extend_impl(interaction, user, minutes: int):
 class Keys(commands.Cog):
     def __init__(self, bot): self.bot = bot
 
-    @app_commands.command(name="tempwhitelist", description="Temporarily licenses a user for a number of minutes.")
-    @app_commands.guilds(GUILD)
-    @app_commands.describe(user="User", minutes="Duration in minutes", games="Comma-separated PlaceIds; use * for all")
-    @has_role(config.REQUIRED_ROLE_ID)
-    @is_in_guild(config.GUILD_ID)
-    async def tempwhitelist(self, interaction, user: discord.User, minutes: int, games: str = "*"):
-        await _tempwhitelist_impl(interaction, user, minutes, games)
 
-    @app_commands.command(name="checktemp", description="Checks temporary license status.")
-    @app_commands.guilds(GUILD)
-    @app_commands.describe(user="User to check")
-    @has_role(config.REQUIRED_ROLE_ID)
-    @is_in_guild(config.GUILD_ID)
-    async def checktemp(self, interaction, user: discord.Member):
-        await _checktemp_impl(interaction, user)
 
-    @app_commands.command(name="extend", description="Extends a temporary license.")
-    @app_commands.guilds(GUILD)
-    @app_commands.describe(user="User", minutes="Minutes to add")
-    @has_role(config.REQUIRED_ROLE_ID)
-    @is_in_guild(config.GUILD_ID)
-    async def extend(self, interaction, user: discord.Member, minutes: int):
-        await _extend_impl(interaction, user, minutes)
 
     # Guild restriction goes on the group itself -- per discord.py, a group's
     # subcommands can't carry their own @app_commands.guilds(...) -- so
@@ -360,53 +367,8 @@ class Keys(commands.Cog):
         app_commands.Group(name="key", description="License-key administration.")
     )
 
-    user_group = app_commands.guilds(GUILD)(
-        app_commands.Group(name="user", description="Manage a licensed user.")
-    )
 
-    async def _set_user_enabled(self, interaction: discord.Interaction, user: discord.Member, enabled: bool):
-        await safe_defer(interaction, ephemeral=True)
-        if config.REQUIRED_ROLE_ID not in [r.id for r in getattr(interaction.user, "roles", [])]:
-            return await send_error(interaction, "You do not have permission.")
 
-        entry = await get_license_by_discord_id(str(user.id))
-        if not entry:
-            return await send_error(interaction, f"{user.mention} is not licensed.")
-
-        currently_enabled = bool(entry.get("Enabled", True))
-        if currently_enabled == enabled:
-            state = "enabled" if enabled else "disabled"
-            return await send_error(interaction, f"{user.mention}'s whitelist is already {state}.")
-
-        try:
-            updated = await update_license(entry["Identifier"], enabled=enabled)
-        except Exception as exc:
-            state = "enable" if enabled else "disable"
-            return await send_error(interaction, f"Failed to {state} {user.mention}'s whitelist: {exc}")
-
-        if not updated:
-            return await send_error(interaction, "The license could not be updated.")
-
-        state = "enabled" if enabled else "disabled"
-        await send_success(
-            interaction,
-            f"{user.mention}'s whitelist has been **{state}**.",
-            title=f"Whitelist {state.title()}",
-            fields=[
-                ("Identifier", f"`{updated.get('Identifier')}`", True),
-                ("License Enabled", "Yes ✅" if enabled else "No ❌", True),
-            ],
-        )
-
-    @user_group.command(name="enable", description="Enable a licensed user's whitelist entry.")
-    @app_commands.describe(user="Licensed user to enable")
-    async def user_enable(self, interaction: discord.Interaction, user: discord.Member):
-        await self._set_user_enabled(interaction, user, True)
-
-    @user_group.command(name="disable", description="Disable a licensed user's whitelist entry.")
-    @app_commands.describe(user="Licensed user to disable")
-    async def user_disable(self, interaction: discord.Interaction, user: discord.Member):
-        await self._set_user_enabled(interaction, user, False)
 
     @key_group.command(name="generate", description="Generate unredeemed license keys.")
     @app_commands.describe(amount="Number of keys", length="Fixed length or range, e.g. 25 or 25-32")

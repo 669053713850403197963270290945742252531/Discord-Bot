@@ -5,6 +5,7 @@ import csv
 import difflib
 import io
 import json
+import re
 from datetime import datetime, timezone
 from typing import Optional
 
@@ -15,14 +16,16 @@ from discord.ui import Modal, TextInput, Label, LayoutView, Container, TextDispl
 
 from api import config
 from api.discord_helpers import has_role, is_in_guild, send_success, send_error, default_ui_error, resolve_user_option, safe_edit_message, safe_send_modal, safe_defer, safe_respond
-from api.alerts import send_alert, send_component_alert, alert_embed, ALERT_COLOR_ADD, ALERT_COLOR_REMOVE, ALERT_COLOR_EDIT, LicenseDatabaseDiffView
+from api.alerts import send_alert, send_component_alert, alert_embed, ALERT_COLOR_ADD, ALERT_COLOR_REMOVE, ALERT_COLOR_EDIT, ALERT_COLOR_TEMP, LicenseDatabaseDiffView
 from api.supabase_db import (
-    fetch_users, fetch_users_with_sha, fetch_api_text_and_sha, commit_content,
+    fetch_users, fetch_users_with_sha, fetch_api_text_and_sha, commit_content, serialize_users_json,
     commit_users, get_license_by_discord_id, get_license_by_key, get_license_by_identifier, update_license,
     delete_license, set_license_games, get_license_game_ids, record_from_import_row, rename_license_identifier,
 )
 from api.users import find_user_by_discord_id, find_user_by_key, remove_user_by_discord_id, build_user_entry, revoke_buyer_role, find_removed_discord_ids
 from api.keys import generate_unique_key, is_valid_discord_id, parse_game_ids
+from commands.keys import _tempwhitelist_impl, _checktemp_impl, _extend_impl
+from commands.database import _upload_impl
 from api.time_utils import format_discord_timestamp
 
 GUILD = discord.Object(id=config.GUILD_ID)
@@ -142,6 +145,45 @@ def _record_updates_from_legacy(entry):
         "expires_at": entry.get("ExpiresAt"),
         "games": entry.get("Games") or ["*"],
     }
+
+
+async def _resolve_whitelist_user(
+    interaction: discord.Interaction,
+    user: discord.User,
+    *,
+    defer_on_fetch: bool = True,
+) -> Optional[discord.User]:
+    """Resolve Discord's native USER option.
+
+    Discord's native USER application-command option provides the normal user
+    picker/autocomplete. When a raw user snowflake is supplied instead, the
+    interaction may contain a lightweight ``discord.Object`` rather than a
+    fully resolved User. In that case, resolve the user once when the command
+    is submitted. No custom autocomplete requests are used.
+    """
+    if isinstance(user, discord.User):
+        return user
+
+    user_id = getattr(user, "id", None)
+    if user_id is None or not is_valid_discord_id(str(user_id)):
+        await send_error(interaction, "Select a Discord user or provide a valid Discord user ID.")
+        return None
+
+    cached = interaction.client.get_user(int(user_id))
+    if cached is not None:
+        return cached
+
+    if defer_on_fetch and not interaction.response.is_done():
+        await interaction.response.defer(ephemeral=True)
+
+    try:
+        return await interaction.client.fetch_user(int(user_id))
+    except discord.NotFound:
+        await send_error(interaction, f"No Discord user exists with ID `{user_id}`.")
+        return None
+    except discord.HTTPException as exc:
+        await send_error(interaction, f"Couldn't look up that Discord user: {exc}")
+        return None
 
 
 class WhitelistModal(Modal, title="Whitelist a User"):
@@ -458,7 +500,7 @@ class DeleteUserConfirmView(LayoutView):
             interaction.client,
             alert_embed(
                 "🗑️ User Deleted",
-                f"{interaction.user.mention} deleted **{identifier}** from the whitelist via `/viewwhitelist`.",
+                f"{interaction.user.mention} deleted **{identifier}** from the whitelist via `/whitelist view`.",
                 color=ALERT_COLOR_REMOVE,
             ),
         )
@@ -599,31 +641,44 @@ class WhitelistView(LayoutView):
 class Whitelist(commands.Cog):
     def __init__(self, bot): self.bot = bot
 
-    @app_commands.command(name="whitelist", description="Adds a user to the license database.")
-    @app_commands.guilds(GUILD)
+    whitelist_group = app_commands.guilds(GUILD)(
+        app_commands.Group(name="whitelist", description="Whitelist/license administration commands.")
+    )
+    whitelist_user_group = app_commands.Group(
+        name="user",
+        description="Manage a licensed user.",
+        parent=whitelist_group,
+    )
+    whitelist_temporary_group = app_commands.Group(
+        name="temporary",
+        description="Manage temporary whitelist entries.",
+        parent=whitelist_group,
+    )
+
+    @whitelist_group.command(name="add", description="Adds a user to the license database.")
     @has_role(config.REQUIRED_ROLE_ID)
     @is_in_guild(config.GUILD_ID)
     async def whitelist(self, interaction):
         await safe_send_modal(interaction, WhitelistModal())
 
-    @app_commands.command(name="bulkwhitelist", description="Bulk-add licenses from an exported or compatible license CSV.")
-    @app_commands.guilds(GUILD)
+    @whitelist_group.command(name="bulk", description="Bulk-add licenses from an exported or compatible license CSV.")
     @app_commands.describe(file="CSV file to import")
     @has_role(config.REQUIRED_ROLE_ID)
     @is_in_guild(config.GUILD_ID)
     async def bulkwhitelist(self, interaction, file: discord.Attachment):
         await _bulkwhitelist_impl(interaction, file)
 
-    @app_commands.command(name="unwhitelist", description="Removes a user's license.")
-    @app_commands.guilds(GUILD)
-    @app_commands.describe(user="User to remove")
+    @whitelist_group.command(name="remove", description="Removes a user's license.")
+    @app_commands.describe(user="Discord user to remove, or enter a Discord user ID")
     @has_role(config.REQUIRED_ROLE_ID)
     @is_in_guild(config.GUILD_ID)
-    async def unwhitelist(self, interaction, user: discord.Member):
-        await _unwhitelist_user_impl(interaction, user)
+    async def unwhitelist(self, interaction, user: discord.User):
+        resolved_user = await _resolve_whitelist_user(interaction, user)
+        if resolved_user is None:
+            return
+        await _unwhitelist_user_impl(interaction, resolved_user)
 
-    @app_commands.command(name="editwhitelist", description="Replace the license database from JSON export.")
-    @app_commands.guilds(GUILD)
+    @whitelist_group.command(name="edit", description="Replace the license database from JSON export.")
     @has_role(config.REQUIRED_ROLE_ID)
     @is_in_guild(config.GUILD_ID)
     async def editwhitelist(self, interaction):
@@ -676,12 +731,12 @@ class Whitelist(commands.Cog):
                     shown = ", ".join(f"`{identifier}`" for identifier in changed_identifiers[:15])
                     changed_text = f"{shown}, + {len(changed_identifiers) - 15} more"
                 description = (
-                    f"{i.user.mention} replaced the license database via `/editwhitelist`.\n"
+                    f"{i.user.mention} replaced the license database via `/whitelist edit`.\n"
                     f"**Edited user(s):** {changed_text}"
                 )
             else:
                 description = (
-                    f"{i.user.mention} replaced the license database via `/editwhitelist`.\n"
+                    f"{i.user.mention} replaced the license database via `/whitelist edit`.\n"
                     f"**Edited user(s):** None detected"
                 )
 
@@ -691,12 +746,286 @@ class Whitelist(commands.Cog):
         modal.on_submit = submit
         await safe_send_modal(interaction, modal)
 
-    @app_commands.command(name="edituser", description="Edits a licensed user's information.")
-    @app_commands.guilds(GUILD)
-    @app_commands.describe(user="Licensed user")
+    @whitelist_group.command(name="search", description="Searches the license database for a value.")
+    @app_commands.describe(
+        query="Text to search for",
+        field="Optional database field to search only",
+        fuzzy="Whether fuzzy matching should be used (defaults to true)",
+    )
+    @app_commands.choices(field=[
+        app_commands.Choice(name="All fields", value="all"),
+        app_commands.Choice(name="Identifier", value="identifier"),
+        app_commands.Choice(name="Discord ID", value="discord_id"),
+        app_commands.Choice(name="License Key", value="license_key"),
+        app_commands.Choice(name="Activated", value="activated"),
+        app_commands.Choice(name="Executions", value="executions"),
+        app_commands.Choice(name="Rank", value="rank"),
+        app_commands.Choice(name="Notes", value="notes"),
+        app_commands.Choice(name="Enabled", value="enabled"),
+        app_commands.Choice(name="Expires At", value="expires_at"),
+        app_commands.Choice(name="Games", value="games"),
+        app_commands.Choice(name="HWID", value="hwid"),
+        app_commands.Choice(name="Last HWID Reset", value="last_hwid_reset"),
+        app_commands.Choice(name="HWID Resets", value="hwid_resets"),
+        app_commands.Choice(name="Created At", value="created_at"),
+        app_commands.Choice(name="Updated At", value="updated_at"),
+    ])
     @has_role(config.REQUIRED_ROLE_ID)
     @is_in_guild(config.GUILD_ID)
-    async def edituser(self, interaction, user: discord.Member):
+    async def dbsearch(self, interaction, query: str, field: app_commands.Choice[str] = None, fuzzy: bool = True):
+        await safe_defer(interaction, ephemeral=True)
+
+        q = query.strip()
+        if not q:
+            return await send_error(interaction, "Search query cannot be empty.")
+
+        try:
+            users = await fetch_users()
+        except Exception as exc:
+            return await send_error(interaction, f"Failed to search the license database: {exc}")
+
+        field_map = {
+            "identifier": "Identifier",
+            "discord_id": "DiscordId",
+            "license_key": "Key",
+            "activated": "Activated",
+            "executions": "Executions",
+            "rank": "Rank",
+            "notes": "Notes",
+            "enabled": "Enabled",
+            "expires_at": "ExpiresAt",
+            "games": "Games",
+            "hwid": "HWID",
+            "last_hwid_reset": "LastHwidReset",
+            "hwid_resets": "totalHwidResets",
+            "created_at": "CreatedAt",
+            "updated_at": "UpdatedAt",
+        }
+        selected_field = field.value if field else "all"
+        # CreatedAt/UpdatedAt are system-maintained metadata and are excluded from
+        # an "All fields" search. They remain available through explicit field selection.
+        all_search_keys = [key for key in field_map.values() if key not in {"CreatedAt", "UpdatedAt"}]
+        search_keys = all_search_keys if selected_field == "all" else [field_map[selected_field]]
+
+        def _stringify(value):
+            if isinstance(value, (list, tuple, set)):
+                return " ".join(str(item) for item in value)
+            if value is None:
+                return ""
+            return str(value)
+
+        def _score(value: str) -> float:
+            import difflib
+            candidate = value.casefold()
+            target = q.casefold()
+            if target == candidate:
+                return 1.0
+            if target in candidate:
+                return 0.95
+            ratio = difflib.SequenceMatcher(None, target, candidate).ratio()
+            words = candidate.replace("_", " ").replace("-", " ").split()
+            if words:
+                ratio = max(ratio, max(difflib.SequenceMatcher(None, target, word).ratio() for word in words))
+            return ratio
+
+        scored = []
+        target = q.casefold()
+        for user in users:
+            matched_fields = []
+            best = 0.0
+            for key in search_keys:
+                value = _stringify(user.get(key))
+                candidate = value.casefold()
+
+                # With fuzzy disabled, only an exact case-insensitive value match counts.
+                # This intentionally does not treat a query such as `eth` as matching `ethan`.
+                if target == candidate and candidate:
+                    score = 1.0
+                elif fuzzy:
+                    if target in candidate:
+                        score = 0.95
+                    else:
+                        score = _score(value) if candidate else 0.0
+                else:
+                    score = 0.0
+
+                threshold = 0.55 if fuzzy else 1.0
+                if score >= threshold:
+                    matched_fields.append((key, value, score))
+                    best = max(best, score)
+
+            threshold = 0.55 if fuzzy else 1.0
+            if best >= threshold and matched_fields:
+                scored.append((best, user, matched_fields))
+
+        scored.sort(key=lambda item: (-item[0], str(item[1].get("Identifier") or "Unknown").casefold()))
+        matches = [(user, matched_fields) for _, user, matched_fields in scored]
+
+
+        if not matches:
+            scope = "the database" if selected_field == "all" else f"the {field.name} field"
+            return await send_error(interaction, f"No matching license records found in {scope}.")
+
+        def _record_value(user, key, fallback="None"):
+            value = user.get(key)
+            if isinstance(value, (list, tuple, set)):
+                value = ", ".join(str(item) for item in value)
+            if value is None or value == "":
+                return fallback
+            return str(value)
+
+        page_size = 8
+        pages = [matches[i:i + page_size] for i in range(0, len(matches), page_size)]
+
+        class DatabaseSearchView(discord.ui.View):
+            def __init__(self, owner_id: int):
+                super().__init__(timeout=300)
+                self.owner_id = owner_id
+                self.page = 0
+                self.previous.disabled = True
+                self._sync()
+
+            async def interaction_check(self, button_interaction: discord.Interaction) -> bool:
+                if button_interaction.user.id != self.owner_id:
+                    await send_error(button_interaction, "Only the person who started this search can change pages.")
+                    return False
+                return True
+
+            def _sync(self):
+                self.previous.disabled = self.page <= 0
+                self.next.disabled = self.page >= len(pages) - 1
+
+            def build_embed(self):
+                page = pages[self.page]
+                embed = discord.Embed(
+                    title="🔎 Database Search",
+                    description=(
+                        f"Found **{len(matches)}** matching license record(s).\n"
+                        f"Search: `{q}`\n"
+                        f"Field: **{field.name if field else 'All fields'}**\n"
+                        f"Fuzzy matching: **{'Enabled' if fuzzy else 'Disabled'}**"
+                    ),
+                    color=discord.Color.blurple(),
+                )
+                for offset, (user, matched_fields) in enumerate(page, start=self.page * page_size + 1):
+                    # Discord is the only persistent user field. Every other displayed
+                    # field below it must be a field that actually matched the query.
+                    matched_details = []
+                    for key, value, _ in matched_fields:
+                        label = next((label for value_key, label in field_map.items() if value_key == key), key)
+                        display_value = value if value else "None"
+                        matched_details.append(f"{label}: {display_value}")
+
+                    result_lines = [f"Discord: <@{_record_value(user, 'DiscordId', '0')}>"]
+                    if matched_details:
+                        result_lines.extend(matched_details)
+
+                    embed.add_field(
+                        name=f"{offset}. {_record_value(user, 'Identifier', 'Unknown')}",
+                        value="\n".join(result_lines),
+                        inline=False,
+                    )
+                embed.set_footer(text=f"Page {self.page + 1}/{len(pages)} • {len(matches)} total match(es)")
+                return embed
+
+            @discord.ui.button(label="Previous", style=discord.ButtonStyle.secondary, emoji="◀️")
+            async def previous(self, button_interaction: discord.Interaction, button: discord.ui.Button):
+                self.page -= 1
+                self._sync()
+                await button_interaction.response.edit_message(embed=self.build_embed(), view=self)
+
+            @discord.ui.button(label="Next", style=discord.ButtonStyle.primary, emoji="▶️")
+            async def next(self, button_interaction: discord.Interaction, button: discord.ui.Button):
+                self.page += 1
+                self._sync()
+                await button_interaction.response.edit_message(embed=self.build_embed(), view=self)
+
+        view = DatabaseSearchView(interaction.user.id)
+        await interaction.followup.send(embed=view.build_embed(), view=view, ephemeral=True)
+
+    @whitelist_group.command(name="export", description="Exports the current Supabase license database.")
+    @app_commands.describe(format="Export format")
+    @app_commands.choices(format=[app_commands.Choice(name="JSON", value="json"), app_commands.Choice(name="CSV", value="csv")])
+    @has_role(config.REQUIRED_ROLE_ID)
+    @is_in_guild(config.GUILD_ID)
+    async def export(self, interaction, format: app_commands.Choice[str] = None):
+        await safe_defer(interaction, ephemeral=True)
+        users = await fetch_users()
+        selected = format.value if format else "json"
+        if selected == "csv":
+            buf = io.StringIO(); writer = csv.writer(buf)
+            writer.writerow([
+                "identifier","discord_id","license_key","activated","executions","rank","notes",
+                "enabled","expires_at","games","hwid","last_hwid_reset","hwid_resets","created_at","updated_at"
+            ])
+            for u in users:
+                writer.writerow([
+                    u.get("Identifier"), u.get("DiscordId"), u.get("Key"), u.get("Activated"),
+                    u.get("Executions", 0), u.get("Rank"), u.get("Notes"), u.get("Enabled", True),
+                    u.get("ExpiresAt"), ",".join(u.get("Games") or []), u.get("HWID"),
+                    u.get("LastHwidReset"), u.get("totalHwidResets", 0), u.get("CreatedAt"), u.get("UpdatedAt"),
+                ])
+            data = buf.getvalue().encode()
+            await interaction.followup.send(file=discord.File(io.BytesIO(data), filename="licenses.csv"), ephemeral=True)
+            await send_alert(
+                interaction.client,
+                alert_embed(
+                    "📤 License Database Exported",
+                    f"{interaction.user.mention} exported **{len(users)}** license record(s) as CSV.",
+                    color=ALERT_COLOR_EDIT,
+                ),
+            )
+            return
+        data = serialize_users_json(users).encode()
+        await interaction.followup.send(file=discord.File(io.BytesIO(data), filename="licenses.json"), ephemeral=True)
+        await send_alert(
+            interaction.client,
+            alert_embed(
+                "📤 License Database Exported",
+                f"{interaction.user.mention} exported **{len(users)}** license record(s) as JSON.",
+                color=ALERT_COLOR_EDIT,
+            ),
+        )
+
+    @whitelist_temporary_group.command(name="add", description="Temporarily licenses a user for a number of minutes.")
+    @app_commands.describe(minutes="Duration in minutes", user="Discord user to add, or enter a Discord user ID", games="Comma-separated PlaceIds; use * for all")
+    @has_role(config.REQUIRED_ROLE_ID)
+    @is_in_guild(config.GUILD_ID)
+    async def tempwhitelist(self, interaction, minutes: int, user: discord.User, games: str = "*"):
+        resolved_user = await _resolve_whitelist_user(interaction, user)
+        if resolved_user is None:
+            return
+        await _tempwhitelist_impl(interaction, resolved_user, minutes, games)
+
+    @whitelist_temporary_group.command(name="status", description="Checks temporary license status.")
+    @app_commands.describe(user="Discord user to check, or enter a Discord user ID")
+    @has_role(config.REQUIRED_ROLE_ID)
+    @is_in_guild(config.GUILD_ID)
+    async def checktemp(self, interaction, user: discord.User):
+        resolved_user = await _resolve_whitelist_user(interaction, user)
+        if resolved_user is None:
+            return
+        await _checktemp_impl(interaction, resolved_user)
+
+    @whitelist_temporary_group.command(name="extend", description="Extends a temporary license.")
+    @app_commands.describe(minutes="Minutes to add", user="Discord user to extend, or enter a Discord user ID")
+    @has_role(config.REQUIRED_ROLE_ID)
+    @is_in_guild(config.GUILD_ID)
+    async def extend(self, interaction, minutes: int, user: discord.User):
+        resolved_user = await _resolve_whitelist_user(interaction, user)
+        if resolved_user is None:
+            return
+        await _extend_impl(interaction, resolved_user, minutes)
+
+    @whitelist_user_group.command(name="edit", description="Edits a licensed user's information.")
+    @app_commands.describe(user="Discord user to edit, or enter a Discord user ID")
+    @has_role(config.REQUIRED_ROLE_ID)
+    @is_in_guild(config.GUILD_ID)
+    async def edituser(self, interaction, user: discord.User):
+        resolved_user = await _resolve_whitelist_user(interaction, user, defer_on_fetch=False)
+        if resolved_user is None:
+            return
+        user = resolved_user
         # A modal must be the interaction's initial response, so the lookup has
         # to finish before Discord's acknowledgement window closes. Bound the
         # lookup; a slow backend becomes a normal error instead of an expired
@@ -710,12 +1039,31 @@ class Whitelist(commands.Cog):
         if not entry: return await send_error(interaction, "That user is not licensed.")
         await safe_send_modal(interaction, EditUserModal(entry))
 
-    @app_commands.command(name="fetchuser", description="Fetches stored license information.")
-    @app_commands.guilds(GUILD)
-    @app_commands.describe(user="Licensed user")
+    @whitelist_user_group.command(name="enable", description="Enable a licensed user's whitelist entry.")
+    @app_commands.describe(user="Discord user to enable, or enter a Discord user ID")
+    async def user_enable(self, interaction: discord.Interaction, user: discord.User):
+        resolved_user = await _resolve_whitelist_user(interaction, user)
+        if resolved_user is None:
+            return
+        await self._set_user_enabled(interaction, resolved_user, True)
+
+    @whitelist_user_group.command(name="disable", description="Disable a licensed user's whitelist entry.")
+    @app_commands.describe(user="Discord user to disable, or enter a Discord user ID")
+    async def user_disable(self, interaction: discord.Interaction, user: discord.User):
+        resolved_user = await _resolve_whitelist_user(interaction, user)
+        if resolved_user is None:
+            return
+        await self._set_user_enabled(interaction, resolved_user, False)
+
+    @whitelist_user_group.command(name="fetch", description="Fetches stored license information.")
+    @app_commands.describe(user="Discord user to fetch, or enter a Discord user ID")
     @has_role(config.REQUIRED_ROLE_ID)
     @is_in_guild(config.GUILD_ID)
-    async def fetchuser(self, interaction, user: discord.Member):
+    async def fetchuser(self, interaction, user: discord.User):
+        resolved_user = await _resolve_whitelist_user(interaction, user)
+        if resolved_user is None:
+            return
+        user = resolved_user
         await safe_defer(interaction, ephemeral=True)
         entry = await get_license_by_discord_id(str(user.id))
         if not entry: return await send_error(interaction, "That user is not licensed.")
@@ -743,8 +1091,14 @@ class Whitelist(commands.Cog):
             embed.add_field(name=name, value=str(value), inline=True)
         await safe_respond(interaction, embed=embed, ephemeral=True)
 
-    @app_commands.command(name="viewwhitelist", description="View all license entries.")
-    @app_commands.guilds(GUILD)
+    @whitelist_group.command(name="upload", description="Replaces the Supabase license database using an exported JSON or CSV file.")
+    @app_commands.describe(file="JSON or CSV export containing license records")
+    @has_role(config.REQUIRED_ROLE_ID)
+    @is_in_guild(config.GUILD_ID)
+    async def upload(self, interaction, file: discord.Attachment):
+        await _upload_impl(interaction, file)
+
+    @whitelist_group.command(name="view", description="View all license entries.")
     @has_role(config.REQUIRED_ROLE_ID)
     @is_in_guild(config.GUILD_ID)
     async def viewwhitelist(self, interaction):
@@ -758,6 +1112,54 @@ class Whitelist(commands.Cog):
         view = WhitelistView(interaction.client, users)
         view.message = await interaction.followup.send(view=view, ephemeral=True)
 
+    async def _set_user_enabled(self, interaction: discord.Interaction, user: discord.Member, enabled: bool):
+        await safe_defer(interaction, ephemeral=True)
+        if config.REQUIRED_ROLE_ID not in [r.id for r in getattr(interaction.user, "roles", [])]:
+            return await send_error(interaction, "You do not have permission.")
+
+        entry = await get_license_by_discord_id(str(user.id))
+        if not entry:
+            return await send_error(interaction, f"{user.mention} is not licensed.")
+
+        currently_enabled = bool(entry.get("Enabled", True))
+        if currently_enabled == enabled:
+            state = "enabled" if enabled else "disabled"
+            return await send_error(interaction, f"{user.mention}'s whitelist is already {state}.")
+
+        try:
+            updated = await update_license(entry["Identifier"], enabled=enabled)
+        except Exception as exc:
+            state = "enable" if enabled else "disable"
+            return await send_error(interaction, f"Failed to {state} {user.mention}'s whitelist: {exc}")
+
+        if not updated:
+            return await send_error(interaction, "The license could not be updated.")
+
+        state = "enabled" if enabled else "disabled"
+        await send_success(
+            interaction,
+            f"{user.mention}'s whitelist has been **{state}**.",
+            title=f"Whitelist {state.title()}",
+            fields=[
+                ("Identifier", f"`{updated.get('Identifier')}`", True),
+                ("License Enabled", "Yes ✅" if enabled else "No ❌", True),
+            ],
+        )
+        alert_title = "✅ License Enabled" if enabled else "⛔ License Disabled"
+        alert_color = ALERT_COLOR_ADD if enabled else ALERT_COLOR_REMOVE
+        await send_alert(
+            interaction.client,
+            alert_embed(
+                alert_title,
+                f"{interaction.user.mention} {'enabled' if enabled else 'disabled'} **{updated.get('Identifier')}** for {user.mention}.",
+                color=alert_color,
+                fields=[
+                    ("Discord", f"{user.mention} (`{user.id}`)", True),
+                    ("Identifier", f"`{updated.get('Identifier')}`", True),
+                    ("License Enabled", "Yes ✅" if enabled else "No ❌", True),
+                ],
+            ),
+        )
 
 
 async def setup(bot):
@@ -799,4 +1201,3 @@ async def _fetchuser_impl(interaction, target):
     ]:
         embed.add_field(name=name, value=str(value), inline=True)
     await safe_respond(interaction, embed=embed, ephemeral=True)
-
