@@ -188,6 +188,14 @@ LICENSE_SERVER_BASE_URL = (
 LICENSE_EXECUTION_LOGGING_ENABLED = os.getenv("LICENSE_EXECUTION_LOGGING_ENABLED", "false").strip().lower() not in ("false", "0", "no", "off")
 LICENSE_EXECUTION_WEBHOOK_URL = os.getenv("LICENSE_EXECUTION_WEBHOOK_URL", "").strip()
 
+# Server-side security monitoring. Breach alerts use their own webhook. The
+# webhook URL remains completely separate from execution logging and the bot's
+# normal Alerts channel. The webhook is never exposed to the Roblox client.
+LICENSE_BREACH_LOGGING_ENABLED = os.getenv(
+    "LICENSE_BREACH_LOGGING_ENABLED", "true"
+).strip().lower() not in ("false", "0", "no", "off")
+LICENSE_BREACH_WEBHOOK_URL = os.getenv("LICENSE_BREACH_WEBHOOK_URL", "").strip()
+
 # Sentivel heartbeat used by the bot status page. By default it is enabled
 # only on Render, since local development intentionally goes offline during
 # restarts/debugging. Set SENTIVEL_ENABLED explicitly to true/false to
