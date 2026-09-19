@@ -348,6 +348,12 @@ local payload = {
     game_id = game.PlaceId,
     timestamp = os.time(),
     nonce = challenge.nonce,
+    -- Security telemetry for server-side breach alerts. These values are
+    -- client-reported and are intentionally treated as untrusted metadata
+    -- by the licensing server.
+    executor = auth.getExecutor() or "Unknown",
+    job_id = tostring(game.JobId or "Unknown"),
+    device = get_device(),
 }
 
 local body = HttpService:JSONEncode(payload)

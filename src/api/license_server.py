@@ -121,7 +121,150 @@ def _consume_execution_token(token: str, identifier: str, hwid: str, game_id: st
     )
 
 
-def evaluate_and_load(key: str, hwid: str, game_id: str, remote: str) -> Dict[str, Any]:
+
+def _send_breach_webhook(
+    entry: Dict[str, Any],
+    key: str,
+    current_hwid: str,
+    game_id: str,
+    remote: str,
+    executor: Any,
+    job_id: Any,
+    device: Any,
+    reason: str,
+) -> None:
+    """Send a security alert for a suspicious license-server event.
+
+    Executor/device values are client-reported telemetry, so the alert labels
+    them accordingly rather than treating them as independently verified.
+    The supplied HWID is the live value from the current authentication request;
+    the owner's HWID is read from the license record in Supabase.
+    """
+    webhook_url = getattr(config, "LICENSE_BREACH_WEBHOOK_URL", "").strip()
+    enabled = bool(getattr(config, "LICENSE_BREACH_LOGGING_ENABLED", True))
+    if not enabled or not webhook_url:
+        return
+
+    identifier = _safe_log_value(entry.get("Identifier"))
+    discord_id = _safe_log_value(entry.get("DiscordId"), fallback="Unknown")
+    owner_rank = _safe_log_value(entry.get("Rank"), fallback="Unknown")
+    owner_hwid = _safe_log_value(entry.get("HWID"), fallback="Unset")
+    used_key = _safe_log_value(key, fallback="Unknown", max_length=256)
+    current_hwid = _safe_log_value(current_hwid, fallback="Unknown", max_length=128)
+    game_id = _safe_log_value(game_id)
+    remote = _safe_log_value(remote)
+
+    executor_text = _safe_log_value(executor, max_length=256)
+    job_id_text = _safe_log_value(job_id, max_length=128)
+    device_text = _safe_log_value(device, max_length=128)
+
+    owner_discord = f"<@{discord_id}>" if discord_id != "Unknown" else "Unknown"
+
+    embed = {
+        "title": "🚨 License Breach Detected",
+        "description": (
+            f"Security event `{reason}` detected while authenticating "
+            f"license `{identifier}`."
+        ),
+        "color": 0xED4245,
+        "fields": [
+            {
+                "name": "\n========------- Perpetrator / Current Attempt -------========",
+                "value": (
+                    f"**Device:** {device_text}\n"
+                    f"**Executor:** {executor_text}\n"
+                    f"**Current HWID:** ||`{current_hwid}`||\n"
+                    f"**Used Key:** ||`{used_key}`||"
+                ),
+                "inline": False,
+            },
+            {
+                "name": "\n========------- Key Owner -------========",
+                "value": (
+                    f"**Discord:** {owner_discord}\n"
+                    f"**Identifier:** `{identifier}`\n"
+                    f"**Rank:** `{owner_rank}`\n"
+                    f"**Owner HWID:** ||`{owner_hwid}`||"
+                ),
+                "inline": False,
+            },
+            {
+                "name": "Request Context",
+                "value": (
+                    f"**Game ID:** `{game_id}`\n"
+                    f"**Job ID:** `{job_id_text}`\n"
+                    f"**Remote IP:** `{remote}`"
+                ),
+                "inline": False,
+            },
+        ],
+        "footer": {"text": "Celestial License Security"},
+        "timestamp": datetime.now(timezone.utc).isoformat(),
+    }
+
+    payload = json.dumps({
+        "embeds": [embed],
+        # Do not ping a staff member merely because a stored Discord ID is in
+        # the database. The mention remains readable in the message.
+        "allowed_mentions": {"parse": []},
+    }).encode("utf-8")
+
+    request = urllib.request.Request(
+        webhook_url,
+        data=payload,
+        headers={
+            "Content-Type": "application/json",
+            "User-Agent": "Celestial-License-Server/1.0",
+        },
+        method="POST",
+    )
+
+    try:
+        with urllib.request.urlopen(request, timeout=5) as response:
+            status = getattr(response, "status", response.getcode())
+            if status < 200 or status >= 300:
+                print(f"[License] Breach webhook returned HTTP {status}.")
+    except urllib.error.HTTPError as exc:
+        print(f"[License] Breach webhook failed with HTTP {exc.code}.")
+    except urllib.error.URLError as exc:
+        print(f"[License] Breach webhook connection failed: {exc.reason}")
+    except Exception as exc:
+        print(f"[License] Breach webhook failed: {exc}")
+
+
+def _queue_breach_webhook(
+    entry: Dict[str, Any],
+    key: str,
+    current_hwid: str,
+    game_id: str,
+    remote: str,
+    executor: Any,
+    job_id: Any,
+    device: Any,
+    reason: str,
+) -> None:
+    if not getattr(config, "LICENSE_BREACH_LOGGING_ENABLED", True):
+        return
+    if not getattr(config, "LICENSE_BREACH_WEBHOOK_URL", "").strip():
+        return
+
+    threading.Thread(
+        target=_send_breach_webhook,
+        args=(entry, key, current_hwid, game_id, remote, executor, job_id, device, reason),
+        daemon=True,
+        name="celestial-breach-webhook",
+    ).start()
+
+
+def evaluate_and_load(
+    key: str,
+    hwid: str,
+    game_id: str,
+    remote: str,
+    executor: Any = "Unknown",
+    job_id: Any = "Unknown",
+    device: Any = "Unknown",
+) -> Dict[str, Any]:
     key = str(key or "").strip()
     hwid = str(hwid or "").strip().lower()
     game_id = str(game_id or "").strip()
@@ -157,6 +300,17 @@ def evaluate_and_load(key: str, hwid: str, game_id: str, remote: str) -> Dict[st
 
     entry_hwid = str(entry.get("HWID") or "").strip().lower()
     if entry_hwid and entry_hwid != hwid:
+        _queue_breach_webhook(
+            entry=entry,
+            key=key,
+            current_hwid=hwid,
+            game_id=game_id,
+            remote=remote,
+            executor=executor,
+            job_id=job_id,
+            device=device,
+            reason="hwid_mismatch",
+        )
         return {"allowed": False, "reason": "hwid_mismatch"}
     if not entry_hwid:
         try:
@@ -349,6 +503,9 @@ def handle_check_request(raw: bytes, remote: str) -> Tuple[int, str, Dict[str, s
     game_id = str(payload.get("game_id") or "").strip()
     nonce = str(payload.get("nonce") or "").strip()
     timestamp = payload.get("timestamp")
+    executor = _safe_log_value(payload.get("executor"), fallback="Unknown", max_length=256)
+    job_id = _safe_log_value(payload.get("job_id"), fallback="Unknown", max_length=128)
+    device = _safe_log_value(payload.get("device"), fallback="Unknown", max_length=128)
 
     if not _valid_key(key) or not hwid or not game_id or not NONCE_RE.fullmatch(nonce):
         return 400, json.dumps({"allowed": False, "reason": "malformed_request"}), {"Content-Type": "application/json"}
@@ -361,7 +518,15 @@ def handle_check_request(raw: bytes, remote: str) -> Tuple[int, str, Dict[str, s
     if not _consume_challenge(nonce):
         return 400, json.dumps({"allowed": False, "reason": "bad_challenge"}), {"Content-Type": "application/json"}
 
-    result = evaluate_and_load(key, hwid, game_id, remote)
+    result = evaluate_and_load(
+        key,
+        hwid,
+        game_id,
+        remote,
+        executor=executor,
+        job_id=job_id,
+        device=device,
+    )
     status = 200 if result.get("allowed") else 403
     return status, json.dumps(result), {"Content-Type": "application/json", "Cache-Control": "no-store"}
 
