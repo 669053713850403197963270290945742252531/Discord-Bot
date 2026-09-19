@@ -1,138 +1,93 @@
--- Celestial Circumvention Protection Test
--- IMPORTANT:
---   This script intentionally tampers with the global `request` function so the
---   Licensing Client's protection should detect it, report a breach, disable
---   the license, and kick the player.
+-- Celestial Circumvention Protection Test v2
 --
--- Use a DEDICATED TEST LICENSE. A successful end-to-end test will set that
--- license's `enabled` field to false on the server.
+-- This script is intentionally destructive when DRY_RUN=false. Use a dedicated
+-- TEST license. A successful end-to-end detection should disable that license
+-- server-side and kick the client.
 --
--- Set DRY_RUN = true first if you only want to verify that the required
--- executor APIs are available without changing anything.
+-- Safe default:
+--   DRY_RUN = true
+--
 
 getgenv().script_key = "nsO8CyaCJ8jQ9VBaqtyPS0aFL8bZUhDq4gx"
 local auth = loadstring(game:HttpGet("http://127.0.0.1:8080/client"))(--[["info"]])
 
 if auth.isKicked() then return end
-
-task.wait(2)
+print("license client loaded")
+print("loading test..")
 
 local ENV = getgenv()
 
--- "replace" = replace the global request reference.
--- "hook"    = hook the existing request function in-place.
--- "both"    = perform both tests sequentially.
--- "status"  = only report available APIs; make no changes.
-local TEST_MODE = "replace"
+-- Select one target at a time so it is obvious which protection fired.
+-- Supported targets:
+--   request
+--   gethwid
+--   crypt.hash
+--   crypt.base64decode
+--   identifyexecutor
+--   loadstring
+--   HttpService.JSONEncode
+--   HttpService.JSONDecode
+--   Player.Kick
+--   script_key
+--   crypt
+--   getgenv
+--   game
+--   gethwid
+local TEST_TARGET = "script_key"
 
--- Set this to true only when intentionally performing a destructive test.
+-- Supported methods:
+--   replace  = replace a mutable global/table reference
+--   hook     = hook an existing function with hookfunction()
+--   spoof    = hook gethwid so it returns a different raw HWID
+--   mutate   = change a protected value such as script_key
+--   status   = only print available APIs; makes no changes
+local TEST_METHOD = "mutate"
+
 local DRY_RUN = false
-
--- Set to true to automatically restore the global request reference after the
--- test. This prevents the test script itself from leaving `request` replaced.
 local RESTORE_AFTER_TEST = true
 local RESTORE_DELAY = 8
-
--- Small delay after the script starts so the Licensing Client has already
--- captured its original request and started its tamper monitor.
 local START_DELAY = 2
-
--- Destructive-test confirmation. Leave unchanged unless you deliberately want
--- to enable a real tamper test.
 local CONFIRM_DESTRUCTIVE_TEST = "DISABLE_TEST_LICENSE"
 
 local function log(message)
     print("[Celestial][Circumvention Test] " .. tostring(message))
 end
 
-local function get_global(name)
-    local value = ENV[name]
-    if value == nil then
-        return nil
-    end
-    return value
+local function has_function(name)
+    return type(ENV[name]) == "function"
+end
+
+local function availability(ok)
+    return ok and "available" or "missing"
 end
 
 local function check_apis()
-    local requestFn = get_global("request")
+    local crypt = ENV.crypt
+    local localPlayer = game:GetService("Players").LocalPlayer
 
     log("Executor capability check:")
-    log("  request: " .. (type(requestFn) == "function" and "available" or "missing"))
-    log("  hookfunction: " .. (type(ENV.hookfunction) == "function" and "available" or "missing"))
-    log("  isfunctionhooked: " .. (type(ENV.isfunctionhooked) == "function" and "available" or "missing"))
-    log("  newcclosure: " .. (type(ENV.newcclosure) == "function" and "available" or "missing"))
-    log("  getfunctionhash: " .. (type(ENV.getfunctionhash) == "function" and "available" or "missing"))
-
-    return requestFn
+    log("  request: " .. availability(has_function("request")))
+    log("  gethwid: " .. availability(has_function("gethwid")))
+    log("  identifyexecutor: " .. availability(has_function("identifyexecutor")))
+    log("  loadstring: " .. availability(has_function("loadstring")))
+    log("  hookfunction: " .. availability(has_function("hookfunction")))
+    log("  isfunctionhooked: " .. availability(has_function("isfunctionhooked")))
+    log("  restorefunction: " .. availability(has_function("restorefunction")))
+    log("  getfunctionhash: " .. availability(has_function("getfunctionhash")))
+    log("  crypt: " .. availability(type(crypt) == "table"))
+    log("  crypt.hash: " .. availability(type(crypt) == "table" and type(crypt.hash) == "function"))
+    log("  crypt.base64decode: " .. availability(type(crypt) == "table" and type(crypt.base64decode) == "function"))
+    log("  LocalPlayer.Kick: " .. availability(localPlayer ~= nil and type(localPlayer.Kick) == "function"))
 end
 
 local function wait_for_client_start()
-    log("Waiting " .. tostring(START_DELAY) .. "s for the Licensing Client tamper monitor to start...")
+    log("Waiting " .. tostring(START_DELAY) .. "s for the Licensing Client to initialize...")
     task.wait(START_DELAY)
 end
 
-local function make_pass_through_replacement(original)
-    local function replacement(...)
-        -- This is intentionally transparent. The only thing being changed is
-        -- the identity of ENV.request, which should trigger the client's
-        -- `request_reference_changed` detection.
-        return original(...)
-    end
-
-    if type(ENV.newcclosure) == "function" then
-        local ok, wrapped = pcall(ENV.newcclosure, replacement)
-        if ok and type(wrapped) == "function" then
-            return wrapped
-        end
-    end
-
-    return replacement
-end
-
-local function test_reference_replacement()
-    local original = ENV.request
-    if type(original) ~= "function" then
-        error("getgenv().request is not a function; cannot perform replacement test.")
-    end
-
-    log("Testing request reference replacement...")
-    local replacement = make_pass_through_replacement(original)
-    ENV.request = replacement
-
-    log("request reference changed: " .. tostring(ENV.request ~= original))
-    log("Expected client detection: request_reference_changed")
-
-    if RESTORE_AFTER_TEST then
-        task.delay(RESTORE_DELAY, function()
-            if ENV.request == replacement then
-                ENV.request = original
-                log("Restored original request reference.")
-            end
-        end)
-    end
-end
-
-local function test_in_place_hook()
-    local requestFn = ENV.request
-    local hookfunction = ENV.hookfunction
-
-    if type(requestFn) ~= "function" then
-        error("getgenv().request is not a function; cannot perform hook test.")
-    end
-
-    if type(hookfunction) ~= "function" then
-        error("hookfunction() is not available in this executor.")
-    end
-
-    log("Testing in-place request hook...")
-
-    -- Declare `old` before creating the closure so the closure captures this
-    -- local rather than looking for a global named `old`.
-    local old
+local function new_pass_through(original)
     local replacement = function(...)
-        -- Pass through to the original function so this test changes only the
-        -- function's hook state.
-        return old(...)
+        return original(...)
     end
 
     if type(ENV.newcclosure) == "function" then
@@ -142,31 +97,167 @@ local function test_in_place_hook()
         end
     end
 
-    old = hookfunction(requestFn, replacement)
+    return replacement
+end
 
-    log("Expected client detection: request_hooked")
-    if type(ENV.isfunctionhooked) == "function" then
-        local ok, hooked = pcall(ENV.isfunctionhooked, requestFn)
-        log("isfunctionhooked(request) = " .. tostring(ok and hooked or false))
+local function make_hwid_spoof(original)
+    local replacement = function(...)
+        -- Deliberately return a plausible-looking but different raw value.
+        -- The client should detect the hook before trusting this value.
+        return "CELSTIAL_TEST_HWID_SPOOF_" .. tostring(os.clock())
+    end
+
+    if type(ENV.newcclosure) == "function" then
+        local ok, wrapped = pcall(ENV.newcclosure, replacement)
+        if ok and type(wrapped) == "function" then
+            replacement = wrapped
+        end
+    end
+
+    return replacement
+end
+
+local function hook_target(target, replacement)
+    local hookfunction = ENV.hookfunction
+    if type(hookfunction) ~= "function" then
+        error("hookfunction() is unavailable in this executor.")
+    end
+
+    local old
+    old = hookfunction(target, replacement)
+    log("hookfunction() installed successfully.")
+    return old
+end
+
+local function replace_global(name)
+    local original = ENV[name]
+    if type(original) ~= "function" then
+        error("Global `" .. name .. "` is not a function.")
+    end
+
+    local replacement = new_pass_through(original)
+    ENV[name] = replacement
+
+    log(name .. " reference replaced.")
+    log("Expected detection: " .. name .. "_reference_changed")
+
+    if RESTORE_AFTER_TEST then
+        task.delay(RESTORE_DELAY, function()
+            if ENV[name] == replacement then
+                ENV[name] = original
+                log("Restored original " .. name .. " reference.")
+            end
+        end)
     end
 end
 
-local function run()
-    local requestFn = check_apis()
+local function replace_crypt_table()
+    local original = ENV.crypt
+    if type(original) ~= "table" then
+        error("getgenv().crypt is not a table.")
+    end
 
-    if TEST_MODE == "status" then
+    local replacement = {}
+    for key, value in pairs(original) do
+        replacement[key] = value
+    end
+
+    ENV.crypt = replacement
+    log("crypt table reference replaced.")
+    log("Expected detection: crypt_reference_changed")
+
+    if RESTORE_AFTER_TEST then
+        task.delay(RESTORE_DELAY, function()
+            if ENV.crypt == replacement then
+                ENV.crypt = original
+                log("Restored original crypt table.")
+            end
+        end)
+    end
+end
+
+local function replace_game_reference()
+    local original = ENV.game
+    local replacement = {}
+    ENV.game = replacement
+
+    log("global game reference replaced.")
+    log("Expected detection: game_reference_changed")
+
+    if RESTORE_AFTER_TEST then
+        task.delay(RESTORE_DELAY, function()
+            if ENV.game == replacement then
+                ENV.game = original
+                log("Restored original game reference.")
+            end
+        end)
+    end
+end
+
+local function hook_crypt_member(member, spoof)
+    local crypt = ENV.crypt
+    if type(crypt) ~= "table" or type(crypt[member]) ~= "function" then
+        error("crypt." .. member .. " is unavailable.")
+    end
+
+    local original = crypt[member]
+    local replacement = spoof and make_hwid_spoof(original) or new_pass_through(original)
+    hook_target(original, replacement)
+
+    log("Expected detection: crypt." .. member .. "_hooked")
+end
+
+local function hook_http_method(name)
+    local HttpService = game:GetService("HttpService")
+    local original = HttpService[name]
+    if type(original) ~= "function" then
+        error("HttpService." .. name .. " is unavailable.")
+    end
+
+    local replacement = new_pass_through(original)
+    hook_target(original, replacement)
+    log("Expected detection: HttpService." .. name .. "_hooked")
+end
+
+local function hook_kick()
+    local localPlayer = game:GetService("Players").LocalPlayer
+    if not localPlayer or type(localPlayer.Kick) ~= "function" then
+        error("LocalPlayer.Kick is unavailable.")
+    end
+
+    local original = localPlayer.Kick
+    local replacement = new_pass_through(original)
+    hook_target(original, replacement)
+    log("Expected detection: Player.Kick_hooked")
+end
+
+local function mutate_value(name, value)
+    local original = ENV[name]
+    ENV[name] = value
+    log(name .. " value changed.")
+    log("Expected detection: " .. name .. "_changed")
+
+    if RESTORE_AFTER_TEST then
+        task.delay(RESTORE_DELAY, function()
+            if ENV[name] == value then
+                ENV[name] = original
+                log("Restored original " .. name .. " value.")
+            end
+        end)
+    end
+end
+
+local function run_test()
+    check_apis()
+
+    if TEST_METHOD == "status" then
         log("Status-only mode selected. No tampering performed.")
         return
     end
 
-    if type(requestFn) ~= "function" then
-        error("No request function is available.")
-    end
-
     if DRY_RUN then
-        log("DRY_RUN=true; no tampering will be performed.")
-        log("Set DRY_RUN=false and CONFIRM_DESTRUCTIVE_TEST to the exact value")
-        log("`DISABLE_TEST_LICENSE` to perform an end-to-end test.")
+        log("DRY_RUN=true; no tampering performed.")
+        log("Set DRY_RUN=false and keep the confirmation string unchanged for a real test.")
         return
     end
 
@@ -176,29 +267,66 @@ local function run()
 
     wait_for_client_start()
 
-    if TEST_MODE == "replace" then
-        test_reference_replacement()
-    elseif TEST_MODE == "hook" then
-        test_in_place_hook()
-    elseif TEST_MODE == "both" then
-        test_reference_replacement()
-        task.wait(3)
-        -- The first test should normally cause the client to kick before this
-        -- point. This branch is mainly useful for development where the first
-        -- detection is intentionally suppressed.
-        if ENV.request ~= requestFn then
-            log("Global request was restored/changed before the hook phase.")
+    if TEST_TARGET == "request" and TEST_METHOD == "replace" then
+        replace_global("request")
+    elseif TEST_TARGET == "gethwid" and TEST_METHOD == "replace" then
+        replace_global("gethwid")
+    elseif TEST_TARGET == "gethwid" and TEST_METHOD == "hook" then
+        hook_target(ENV.gethwid, new_pass_through(ENV.gethwid))
+        log("Expected detection: gethwid_hooked")
+    elseif TEST_TARGET == "gethwid" and TEST_METHOD == "spoof" then
+        hook_target(ENV.gethwid, make_hwid_spoof(ENV.gethwid))
+        log("Expected detection: gethwid_hooked (and/or gethwid_value_changed)")
+    elseif TEST_TARGET == "crypt.hash" and TEST_METHOD == "replace" then
+        local crypt = ENV.crypt
+        local original = crypt.hash
+        crypt.hash = new_pass_through(original)
+        log("crypt.hash reference replaced.")
+        log("Expected detection: crypt.hash_reference_changed")
+    elseif TEST_TARGET == "crypt.hash" and (TEST_METHOD == "hook" or TEST_METHOD == "spoof") then
+        hook_crypt_member("hash", false)
+    elseif TEST_TARGET == "crypt.base64decode" and TEST_METHOD == "hook" then
+        hook_crypt_member("base64decode", false)
+    elseif TEST_TARGET == "identifyexecutor" and TEST_METHOD == "replace" then
+        replace_global("identifyexecutor")
+    elseif TEST_TARGET == "identifyexecutor" and TEST_METHOD == "hook" then
+        hook_target(ENV.identifyexecutor, new_pass_through(ENV.identifyexecutor))
+        log("Expected detection: identifyexecutor_hooked")
+    elseif TEST_TARGET == "loadstring" and TEST_METHOD == "replace" then
+        if type(ENV.loadstring) == "function" then
+            replace_global("loadstring")
+        else
+            error("ENV.loadstring is unavailable; use a compatible executor or test via hookfunction().")
         end
-        test_in_place_hook()
+    elseif TEST_TARGET == "loadstring" and TEST_METHOD == "hook" then
+        local target = ENV.loadstring or loadstring
+        if type(target) ~= "function" then
+            error("loadstring is unavailable.")
+        end
+        hook_target(target, new_pass_through(target))
+        log("Expected detection: loadstring_hooked")
+    elseif TEST_TARGET == "HttpService.JSONEncode" and TEST_METHOD == "hook" then
+        hook_http_method("JSONEncode")
+    elseif TEST_TARGET == "HttpService.JSONDecode" and TEST_METHOD == "hook" then
+        hook_http_method("JSONDecode")
+    elseif TEST_TARGET == "Player.Kick" and TEST_METHOD == "hook" then
+        hook_kick()
+    elseif TEST_TARGET == "script_key" and TEST_METHOD == "mutate" then
+        mutate_value("script_key", tostring(ENV.script_key or "") .. "_TAMPER_TEST")
+    elseif TEST_TARGET == "crypt" and TEST_METHOD == "replace" then
+        replace_crypt_table()
+    elseif TEST_TARGET == "getgenv" and TEST_METHOD == "replace" then
+        replace_global("getgenv")
+    elseif TEST_TARGET == "game" and TEST_METHOD == "replace" then
+        replace_game_reference()
     else
-        error("Unknown TEST_MODE: " .. tostring(TEST_MODE))
+        error("Unsupported TEST_TARGET/TEST_METHOD combination: " .. tostring(TEST_TARGET) .. "/" .. tostring(TEST_METHOD))
     end
 
-    log("Tamper injected. Wait for the Licensing Client to detect it.")
-    log("Expected enforcement: breach report -> license enabled=false -> kick.")
+    log("Tamper injected. Expected flow: detection -> /whitelist/breach -> license enabled=false -> kick.")
 end
 
-local ok, err = pcall(run)
+local ok, err = pcall(run_test)
 if not ok then
     warn("[Celestial][Circumvention Test] " .. tostring(err))
 end
