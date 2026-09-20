@@ -81,7 +81,7 @@ def public_license_client():
         import html
 
         loader_source = (
-            'getgenv().script_key = "YOUR-LICENSE-KEY"\n'
+            'script_key = "YOUR-LICENSE-KEY"\n'
             f'loadstring(game:HttpGet("{base_url}/client"))()'
         )
         escaped_loader = html.escape(loader_source)

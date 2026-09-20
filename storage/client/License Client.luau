@@ -14,7 +14,9 @@ local TAMPER_DETECTION_ENABLED = tostring("__LICENSE_TAMPER_DETECTION_ENABLED__"
 local originalGetgenv = getgenv
 local ENV = originalGetgenv()
 local GAME = game
-local key = ENV.script_key
+
+-- `script_key` is intentionally a global supplied by the loader.
+local key = script_key
 local localPlayer = Players.LocalPlayer
 
 -- Capture security-sensitive functions and values before authentication.
@@ -451,7 +453,7 @@ local function request_tamper_reason()
         return "crypt_reference_changed"
     end
 
-    if ENV.script_key ~= key then
+    if script_key ~= key then
         return "script_key_changed"
     end
 

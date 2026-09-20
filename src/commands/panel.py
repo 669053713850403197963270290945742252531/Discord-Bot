@@ -118,7 +118,7 @@ class ControlPanelView(LayoutView):
         key = str(entry["Key"])
         safe_key = key.replace("\\", "\\\\").replace('"', '\\"')
         script = (
-            f'getgenv().script_key = "{safe_key}"\n'
+            f'script_key = "{safe_key}"\n'
             f'loadstring(game:HttpGet("{config.LICENSE_SERVER_BASE_URL}/client"))()'
         )
         await interaction.followup.send(f"```lua\n{script}\n```", ephemeral=True)
@@ -209,18 +209,18 @@ class ControlPanelView(LayoutView):
         )
         # Sort the public License Stats embed organized into logical groups:
         # identity/access, license scope, usage/device status, then expiration.
-        embed.add_field(name="Identifier", value=f"`{entry.get('Identifier') or 'N/A'}`", inline=True)
-        embed.add_field(name="Discord ID", value=f"`{entry.get('DiscordId') or 'N/A'}`", inline=True)
-        embed.add_field(name="Key", value=f"||`{key}`|| 🔒", inline=True)
+        embed.add_field(name="Identifier", value=f"`{entry.get('Identifier') or 'N/A'}`", inline=False)
+        embed.add_field(name="Discord ID", value=f"`{entry.get('DiscordId') or 'N/A'}`", inline=False)
+        embed.add_field(name="Key", value=f"||`{key}`|| 🔒", inline=False)
 
         embed.add_field(name="Games", value=_games_links_text(entry.get("Games")), inline=False)
 
-        embed.add_field(name="Total Executions", value=f"`{int(entry.get('Executions') or 0)}` 🧠", inline=True)
-        embed.add_field(name="HWID Status", value="Assigned ✅" if hwid else "Unset ❌", inline=True)
-        embed.add_field(name="Total HWID Resets", value=f"`{int(entry.get('totalHwidResets') or 0)}` ⚙️", inline=True)
+        embed.add_field(name="Total Executions", value=f"`{int(entry.get('Executions') or 0)}` 🧠", inline=False)
+        embed.add_field(name="HWID Status", value="Assigned ✅" if hwid else "Unset ❌", inline=False)
+        embed.add_field(name="Total HWID Resets", value=f"`{int(entry.get('totalHwidResets') or 0)}` ⚙️", inline=False)
 
-        embed.add_field(name="Last Reset", value=f"{last_reset} 📅", inline=True)
-        embed.add_field(name="Expires At", value=f"{expires_at} 📅", inline=True)
+        embed.add_field(name="Last Reset", value=f"{last_reset} 📅", inline=False)
+        embed.add_field(name="Expires At", value=f"{expires_at} 📅", inline=False)
 
         await interaction.followup.send(embed=embed, ephemeral=True)
 
