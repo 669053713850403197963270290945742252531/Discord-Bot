@@ -138,7 +138,7 @@ STORAGE_BRANCH = os.getenv("GITHUB_STORAGE_BRANCH", "main")
 
 # GitHub-backed stored script used by the Discord control panel. Protected game scripts are stored in Supabase Storage.
 # storedscript.lua -- the base script /createpanel's "Get Script" button hands
-# out, with each user's Key spliced into its getgenv().script_key line.
+# out, with each user's Key spliced into its global script_key line.
 # /updatescript writes this back via commit_stored_script().
 STORED_SCRIPT_FILE_PATH = "storage/storedscript.lua"
 STORED_SCRIPT_RAW_URL = f"https://raw.githubusercontent.com/{OWNER}/{STORAGE_REPO}/refs/heads/{STORAGE_BRANCH}/{STORED_SCRIPT_FILE_PATH}"
