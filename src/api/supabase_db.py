@@ -113,6 +113,8 @@ def _record_from_db(row: Dict[str, Any], game_ids: Optional[List[str]] = None) -
         "HWID": row.get("hwid"),
         "LastHwidReset": _iso(row.get("last_hwid_reset")),
         "totalHwidResets": int(row.get("hwid_resets") or 0),
+        "ActivationCountry": row.get("activation_country_code"),
+        "ActivationRobloxUserId": int(row.get("activation_roblox_user_id")) if row.get("activation_roblox_user_id") not in (None, "") else None,
     }
 
 
@@ -142,6 +144,21 @@ def _db_row_from_record(record: Dict[str, Any], identifier_fallback: Optional[st
         "last_hwid_reset": _iso(record.get("LastHwidReset", record.get("LastHWIDReset"))),
         "hwid_resets": int(record.get("totalHwidResets", record.get("HwidResets", record.get("HWIDResets", 0))) or 0),
     }
+
+    # Activation fingerprint fields are immutable history. Only include them
+    # in import/update rows when the source record actually contains them;
+    # legacy imports therefore preserve any existing fingerprint in Supabase.
+    country_value = record.get("ActivationCountry") if "ActivationCountry" in record else record.get("activation_country_code") if "activation_country_code" in record else None
+    if country_value not in (None, ""):
+        out["activation_country_code"] = str(country_value).strip().upper()
+
+    user_id_value = record.get("ActivationRobloxUserId") if "ActivationRobloxUserId" in record else record.get("activation_roblox_user_id") if "activation_roblox_user_id" in record else None
+    if user_id_value not in (None, ""):
+        try:
+            out["activation_roblox_user_id"] = int(user_id_value)
+        except (TypeError, ValueError) as exc:
+            raise ValueError("Activation Roblox User ID must be an integer") from exc
+
     return out
 
 
@@ -285,6 +302,18 @@ def record_from_import_row(row: Dict[str, Any]) -> Dict[str, Any]:
         "LastHwidReset": first("LastHwidReset", "LastHWIDReset", "last_hwid_reset") or None,
         "totalHwidResets": hwid_resets,
     }
+    if any(key in row for key in ("ActivationCountry", "activation_country_code", "activation_country")):
+        value = first("ActivationCountry", "activation_country_code", "activation_country")
+        if value not in (None, ""):
+            record["ActivationCountry"] = str(value).strip().upper()
+    if any(key in row for key in ("ActivationRobloxUserId", "activation_roblox_user_id")):
+        value = first("ActivationRobloxUserId", "activation_roblox_user_id")
+        if value not in (None, ""):
+            try:
+                record["ActivationRobloxUserId"] = int(value)
+            except (TypeError, ValueError) as exc:
+                raise ValueError("Activation Roblox User ID must be an integer") from exc
+    return record
 
 
 def serialize_users_json(users: List[Dict[str, Any]]) -> str:
@@ -1091,7 +1120,17 @@ async def clear_hwid_reset_cooldown(identifier: str) -> Optional[Dict[str, Any]]
     return await asyncio.to_thread(_clear)
 
 
-async def complete_successful_execution(identifier: str) -> Optional[Dict[str, Any]]:
+async def complete_successful_execution(
+    identifier: str,
+    activation_country: Optional[str] = None,
+    activation_roblox_user_id: Optional[int] = None,
+) -> Optional[Dict[str, Any]]:
+    """Record a successful execution and capture first-activation identity once.
+
+    The activation country and Roblox user ID are historical fingerprints. They
+    are only populated when the corresponding database values are empty and are
+    never overwritten by later executions or HWID resets.
+    """
     def _complete():
         client = _client_sync()
         rows = (client.table("licenses").select("*").eq("identifier", identifier).limit(1).execute()).data or []
@@ -1101,8 +1140,35 @@ async def complete_successful_execution(identifier: str) -> Optional[Dict[str, A
         updates = {"executions": int(row.get("executions") or 0) + 1}
         if row.get("activated") is None:
             updates["activated"] = datetime.now(timezone.utc).isoformat()
-        result = client.table("licenses").update(updates).eq("identifier", identifier).execute()
+
+        # Capture the first observed activation fingerprint only once.
+        if row.get("activation_country_code") in (None, "") and activation_country:
+            country = str(activation_country).strip().upper()
+            if len(country) == 2 and country.isalpha():
+                updates["activation_country_code"] = country
+        if row.get("activation_roblox_user_id") in (None, "") and activation_roblox_user_id is not None:
+            try:
+                user_id = int(activation_roblox_user_id)
+                if user_id > 0:
+                    updates["activation_roblox_user_id"] = user_id
+            except (TypeError, ValueError):
+                pass
+
+        try:
+            result = client.table("licenses").update(updates).eq("identifier", identifier).execute()
+        except Exception as exc:
+            # Deployments that have not yet run the key-sharing migration must
+            # not break otherwise-valid executions. Retry the normal execution
+            # counter update without the optional fingerprint columns.
+            if "activation_country_code" not in updates and "activation_roblox_user_id" not in updates:
+                raise
+            print(f"[License] Activation fingerprint fields are unavailable; continuing without baseline capture: {exc}")
+            fallback_updates = {key: value for key, value in updates.items() if key not in {"activation_country_code", "activation_roblox_user_id"}}
+            result = client.table("licenses").update(fallback_updates).eq("identifier", identifier).execute()
+
         return result.data[0] if result.data else None
+
+    return await asyncio.to_thread(_complete)
     return await asyncio.to_thread(_complete)
 
 

@@ -9,10 +9,11 @@ import re
 from datetime import datetime, timezone
 from typing import Optional
 
+import aiohttp
 import discord
 from discord import app_commands
 from discord.ext import commands
-from discord.ui import Modal, TextInput, Label, LayoutView, Container, TextDisplay, ActionRow, Button
+from discord.ui import Modal, TextInput, Label, LayoutView, Container, TextDisplay, ActionRow, Button, Section, Thumbnail
 
 from api import config
 from api.discord_helpers import has_role, is_in_guild, send_success, send_error, default_ui_error, resolve_user_option, safe_edit_message, safe_send_modal, safe_defer, safe_respond
@@ -27,6 +28,7 @@ from api.keys import generate_unique_key, is_valid_discord_id, parse_game_ids
 from commands.keys import _tempwhitelist_impl, _checktemp_impl, _extend_impl
 from commands.database import _upload_impl
 from api.time_utils import format_discord_timestamp
+from api.tls import get_ssl_context
 
 GUILD = discord.Object(id=config.GUILD_ID)
 WHITELIST_RANKS = ["User", "Premium", "VIP", "Staff", "Admin", "Owner"]
@@ -145,6 +147,49 @@ def _record_updates_from_legacy(entry):
         "expires_at": entry.get("ExpiresAt"),
         "games": entry.get("Games") or ["*"],
     }
+
+
+def _roblox_profile_link(user_id):
+    try:
+        parsed = int(user_id)
+    except (TypeError, ValueError):
+        return "Unknown"
+    if parsed <= 0:
+        return "Unknown"
+    return f"[{parsed}](https://www.roblox.com/users/{parsed}/profile)"
+
+async def _roblox_headshot_url(user_id):
+    """Resolve a Roblox user ID to an actual image URL suitable for Discord embeds.
+
+    Roblox's thumbnails service returns the CDN image URL; the API endpoint
+    itself returns JSON and therefore cannot be used directly as an embed image.
+    """
+    try:
+        parsed = int(user_id)
+    except (TypeError, ValueError):
+        return None
+    if parsed <= 0:
+        return None
+
+    url = (
+        "https://thumbnails.roblox.com/v1/users/avatar-headshot"
+        f"?userIds={parsed}&size=150x150&format=Png&isCircular=false"
+    )
+    connector = aiohttp.TCPConnector(ssl=get_ssl_context())
+    try:
+        async with aiohttp.ClientSession(connector=connector) as session:
+            async with session.get(url, timeout=aiohttp.ClientTimeout(total=5)) as response:
+                if response.status != 200:
+                    return None
+                payload = await response.json()
+    except (aiohttp.ClientError, asyncio.TimeoutError, ValueError):
+        return None
+
+    data = payload.get("data") if isinstance(payload, dict) else None
+    if not data or not isinstance(data[0], dict):
+        return None
+    image_url = data[0].get("imageUrl")
+    return image_url if isinstance(image_url, str) and image_url.startswith("https://") else None
 
 
 async def _resolve_whitelist_user(
@@ -527,7 +572,34 @@ class WhitelistView(LayoutView):
         self.index = max(0, min(current_index, max(0, len(users) - 1)))
         self.message = None
         self.pending_notice = None
+        self.avatar_urls = {}
         self._rebuild()
+
+    async def _load_current_user_avatar(self):
+        if not self.users:
+            return
+        discord_id = str(self.users[self.index].get("DiscordId") or "").strip()
+        if not discord_id.isdigit():
+            self.avatar_urls[discord_id] = None
+            return
+
+        if discord_id in self.avatar_urls:
+            return
+
+        user = self.bot.get_user(int(discord_id))
+        if user is None:
+            try:
+                user = await self.bot.fetch_user(int(discord_id))
+            except discord.HTTPException:
+                user = None
+
+        if user is not None:
+            self.avatar_urls[discord_id] = user.display_avatar.url
+        else:
+            # Discord's default avatar URL is deterministic and requires no API request.
+            self.avatar_urls[discord_id] = (
+                f"https://cdn.discordapp.com/embed/avatars/{int(discord_id) % 5}.png"
+            )
 
     def _games_display(self, games):
         return _games_links_text(games)
@@ -549,27 +621,54 @@ class WhitelistView(LayoutView):
         reset_count = int(user.get("totalHwidResets") or 0)
         executions = int(user.get("Executions") or 0)
         notes = user.get("Notes")
-        lines = [
+        sections = [
             f"### Whitelist Entry — {self.index + 1}/{total}",
-            self.pending_notice or "",
-            f"**Identifier:** {user.get('Identifier') or 'N/A'}",
-            f"**Discord:** <@{discord_id}> (`{discord_id}`)" if discord_id else "**Discord:** N/A",
-            f"**Rank:** {user.get('Rank') or 'User'}",
-            f"**License Key:** ||`{key or 'N/A'}`||",
-            f"**License Enabled:** {'✅ Yes' if user.get('Enabled', True) else '❌ No'}",
-            f"**HWID Status:** {'✅ Assigned' if hwid else '❌ Unset'}",
-            f"**HWID:** ||`{hwid}`||" if hwid else "**HWID:** Unset",
-            f"**Games:**\n{self._games_display(user.get('Games'))}",
-            f"**Activated:** {format_discord_timestamp(activated) if activated else 'Pending first successful execution'}",
-            f"**Total Executions:** `{executions}`",
-            f"**Total HWID Resets:** `{reset_count}`",
-            f"**Last HWID Reset:** {format_discord_timestamp(last_reset) if last_reset else 'Never'}",
-            f"**Expires At:** {format_discord_timestamp(expires) if expires else 'Never'}",
-            f"**Created:** {format_discord_timestamp(created) if created else 'Unknown'}",
-            f"**License Updated:** {format_discord_timestamp(updated) if updated else 'Unknown'}",
-            f"**Notes:** {notes if notes else 'N/A'}",
         ]
-        return "\n".join(x for x in lines if x)
+        if self.pending_notice:
+            sections.append(self.pending_notice)
+
+        identity_text = (
+            "### Identity\n"
+            f"**Identifier:** {user.get('Identifier') or 'N/A'}\n"
+            f"**Discord:** <@{discord_id}> (`{discord_id}`)" if discord_id else
+            "### Identity\n"
+            f"**Identifier:** {user.get('Identifier') or 'N/A'}\n"
+            "**Discord:** N/A"
+        ) + f"\n**Rank:** {user.get('Rank') or 'User'}"
+        sections.extend([
+            identity_text,
+            (
+                "### License\n"
+                f"**License Key:** ||`{key or 'N/A'}`||\n"
+                f"**License Enabled:** {'✅ Yes' if user.get('Enabled', True) else '❌ No'}\n"
+                f"**Games:** {self._games_display(user.get('Games'))}"
+            ),
+            (
+                "### Activation\n"
+                f"**Activated:** {format_discord_timestamp(activated) if activated else 'Pending first successful execution'}\n"
+                f"**Activation Country:** {user.get('ActivationCountry') or 'Unknown'}\n"
+                f"**Activated Roblox User:** {_roblox_profile_link(user.get('ActivationRobloxUserId'))}"
+            ),
+            (
+                "### Usage\n"
+                f"**Total Executions:** `{executions}`\n"
+                f"**Notes:** {notes if notes else 'N/A'}"
+            ),
+            (
+                "### Hardware\n"
+                f"**HWID Status:** {'✅ Assigned' if hwid else '❌ Unset'}\n"
+                f"**HWID:** ||`{hwid}`||" if hwid else "### Hardware\n**HWID:** Unset"
+            ) +
+            f"\n**Total HWID Resets:** `{reset_count}`\n"
+            f"**Last HWID Reset:** {format_discord_timestamp(last_reset) if last_reset else 'Never'}",
+            (
+                "### Timestamps\n"
+                f"**Expires At:** {format_discord_timestamp(expires) if expires else 'Never'}\n"
+                f"**Created:** {format_discord_timestamp(created) if created else 'Unknown'}\n"
+                f"**License Updated:** {format_discord_timestamp(updated) if updated else 'Unknown'}"
+            ),
+        ])
+        return sections
 
     def _rebuild(self):
         self.clear_items()
@@ -583,10 +682,21 @@ class WhitelistView(LayoutView):
         self.edit_button.callback = self._edit_user
         self.delete_button.callback = self._delete_user
         self.refresh_button.callback = self._refresh
-        self.add_item(Container(
-            TextDisplay(self._description()),
-            ActionRow(self.previous_button, self.next_button, self.edit_button, self.delete_button, self.refresh_button),
-        ))
+        sections = self._description()
+        identity_text = sections[1] if len(sections) > 1 else "### Identity\n**Discord:** N/A"
+        avatar_url = None
+        if self.users:
+            discord_id = str(self.users[self.index].get("DiscordId") or "").strip()
+            avatar_url = self.avatar_urls.get(discord_id)
+
+        components = [TextDisplay(sections[0])]
+        if avatar_url:
+            components.append(Section(TextDisplay(identity_text), accessory=Thumbnail(avatar_url, description="Discord profile picture")))
+        else:
+            components.append(TextDisplay(identity_text))
+        components.extend(TextDisplay(section) for section in sections[2:])
+        components.append(ActionRow(self.previous_button, self.next_button, self.edit_button, self.delete_button, self.refresh_button))
+        self.add_item(Container(*components))
 
     def _update_buttons(self):
         self._rebuild()
@@ -596,16 +706,19 @@ class WhitelistView(LayoutView):
         if self.index >= len(self.users):
             self.index = max(0, len(self.users) - 1)
         self.pending_notice = None
+        await self._load_current_user_avatar()
         self._rebuild()
 
     async def _previous(self, interaction: discord.Interaction):
         self.index = max(0, self.index - 1)
+        await self._load_current_user_avatar()
         self._rebuild()
         await safe_edit_message(interaction, view=self)
         self.pending_notice = None
 
     async def _next(self, interaction: discord.Interaction):
         self.index = min(len(self.users) - 1, self.index + 1)
+        await self._load_current_user_avatar()
         self._rebuild()
         await safe_edit_message(interaction, view=self)
         self.pending_notice = None
@@ -956,7 +1069,8 @@ class Whitelist(commands.Cog):
             buf = io.StringIO(); writer = csv.writer(buf)
             writer.writerow([
                 "identifier","discord_id","license_key","activated","executions","rank","notes",
-                "enabled","expires_at","games","hwid","last_hwid_reset","hwid_resets","created_at","updated_at"
+                "enabled","expires_at","games","hwid","last_hwid_reset","hwid_resets","created_at","updated_at",
+                "activation_country_code","activation_roblox_user_id"
             ])
             for u in users:
                 writer.writerow([
@@ -964,6 +1078,7 @@ class Whitelist(commands.Cog):
                     u.get("Executions", 0), u.get("Rank"), u.get("Notes"), u.get("Enabled", True),
                     u.get("ExpiresAt"), ",".join(u.get("Games") or []), u.get("HWID"),
                     u.get("LastHwidReset"), u.get("totalHwidResets", 0), u.get("CreatedAt"), u.get("UpdatedAt"),
+                    u.get("ActivationCountry"), u.get("ActivationRobloxUserId"),
                 ])
             data = buf.getvalue().encode()
             await interaction.followup.send(file=discord.File(io.BytesIO(data), filename="licenses.csv"), ephemeral=True)
@@ -1068,27 +1183,71 @@ class Whitelist(commands.Cog):
         entry = await get_license_by_discord_id(str(user.id))
         if not entry: return await send_error(interaction, "That user is not licensed.")
         embed = discord.Embed(title="License Information", color=discord.Color.green())
+        headshot_url = await _roblox_headshot_url(entry.get("ActivationRobloxUserId"))
+        if headshot_url:
+            embed.set_thumbnail(url=headshot_url)
+
         updated = format_discord_timestamp(entry.get("UpdatedAt"), "R") if entry.get("UpdatedAt") else "Never"
         last_hwid_reset = format_discord_timestamp(entry.get("LastHwidReset"), "R") if entry.get("LastHwidReset") else "Never"
         expires_at = format_discord_timestamp(entry.get("ExpiresAt"), "R") if entry.get("ExpiresAt") else "Never"
-        for name, value in [
-            ("Identifier", entry.get("Identifier")),
-            ("Discord ID", entry.get("DiscordId")),
-            ("Rank", entry.get("Rank")),
-            ("Key", f"||`{entry.get('Key')}`||"),
-            ("Activated", format_discord_timestamp(entry.get("Activated"))),
-            ("Executions", str(entry.get("Executions", 0))),
-            ("Games", _games_links_text(entry.get("Games"))),
-            ("Notes", entry.get("Notes") or "N/A"),
-            ("Total HWID Resets", str(int(entry.get("totalHwidResets") or 0))),
-            ("Last HWID Reset", last_hwid_reset),
-            ("HWID", f"||`{entry.get('HWID')}`||" if entry.get("HWID") else "Unset"),
-            ("License Enabled", "Yes" if entry.get("Enabled", True) else "No"),
-            ("License Updated", updated),
-            ("HWID Status", "Assigned" if entry.get("HWID") else "Unset"),
-            ("Expires At", expires_at),
-        ]:
-            embed.add_field(name=name, value=str(value), inline=True)
+
+        # Keep the information in a fixed, predictable section order instead of
+        # relying on Discord's inline-field wrapping to visually group values.
+        embed.add_field(
+            name="Identity",
+            value=(
+                f"**Identifier:** {entry.get('Identifier') or 'N/A'}\n"
+                f"**Discord ID:** `{entry.get('DiscordId') or 'N/A'}`\n"
+                f"**Rank:** {entry.get('Rank') or 'User'}"
+            ),
+            inline=False,
+        )
+        embed.add_field(
+            name="License",
+            value=(
+                f"**Key:** ||`{entry.get('Key') or 'N/A'}`||\n"
+                f"**Enabled:** {'Yes' if entry.get('Enabled', True) else 'No'}\n"
+                f"**Games:** {_games_links_text(entry.get('Games'))}"
+            ),
+            inline=False,
+        )
+        embed.add_field(
+            name="Activation",
+            value=(
+                f"**Activated:** {format_discord_timestamp(entry.get('Activated'))}\n"
+                f"**Activation Country:** {entry.get('ActivationCountry') or 'Unknown'}\n"
+                f"**Activated Roblox User:** {_roblox_profile_link(entry.get('ActivationRobloxUserId'))}"
+            ),
+            inline=False,
+        )
+        embed.add_field(
+            name="Usage",
+            value=(
+                f"**Executions:** `{entry.get('Executions', 0)}`\n"
+                f"**Notes:** {entry.get('Notes') or 'N/A'}"
+            ),
+            inline=False,
+        )
+        embed.add_field(
+            name="Hardware",
+            value=(
+                f"**HWID Status:** {'Assigned' if entry.get('HWID') else 'Unset'}\n"
+                f"**HWID:** ||`{entry.get('HWID')}`||" if entry.get('HWID') else "**HWID:** Unset"
+            ) + (
+                f"\n**Total HWID Resets:** `{int(entry.get('totalHwidResets') or 0)}`\n"
+                f"**Last HWID Reset:** {last_hwid_reset}"
+            ),
+            inline=False,
+        )
+        embed.add_field(
+            name="Timestamps",
+            value=(
+                f"**Expires At:** {expires_at}\n"
+                f"**Created:** {format_discord_timestamp(entry.get('CreatedAt')) if entry.get('CreatedAt') else 'Unknown'}\n"
+                f"**License Updated:** {updated}"
+            ),
+            inline=False,
+        )
         await safe_respond(interaction, embed=embed, ephemeral=True)
 
     @whitelist_group.command(name="upload", description="Replaces the Supabase license database using an exported JSON or CSV file.")
@@ -1110,6 +1269,8 @@ class Whitelist(commands.Cog):
         if not users:
             return await send_error(interaction, "No database entries found.")
         view = WhitelistView(interaction.client, users)
+        await view._load_current_user_avatar()
+        view._rebuild()
         view.message = await interaction.followup.send(view=view, ephemeral=True)
 
     async def _set_user_enabled(self, interaction: discord.Interaction, user: discord.Member, enabled: bool):
@@ -1188,10 +1349,16 @@ async def _fetchuser_impl(interaction, target):
     updated = format_discord_timestamp(entry.get("UpdatedAt"), "R") if entry.get("UpdatedAt") else "Never"
     expires_at = format_discord_timestamp(entry.get("ExpiresAt"), "R") if entry.get("ExpiresAt") else "Never"
     embed = discord.Embed(title="License Information", color=discord.Color.green())
+    headshot_url = await _roblox_headshot_url(entry.get("ActivationRobloxUserId"))
+    if headshot_url:
+        embed.set_thumbnail(url=headshot_url)
     for name, value in [
         ("Identifier", entry.get("Identifier")), ("Discord ID", entry.get("DiscordId")),
         ("Key", f"||`{entry.get('Key')}`||"), ("Games", _games_links_text(entry.get("Games"))),
-        ("Activated", format_discord_timestamp(entry.get("Activated"))), ("Executions", str(entry.get("Executions", 0))),
+        ("Activated", format_discord_timestamp(entry.get("Activated"))),
+        ("Activation Country", entry.get("ActivationCountry") or "Unknown"),
+        ("Activated Roblox User", _roblox_profile_link(entry.get("ActivationRobloxUserId"))),
+        ("Executions", str(entry.get("Executions", 0))),
         ("Rank", entry.get("Rank")), ("Notes", entry.get("Notes") or "N/A"),
         ("Total HWID Resets", str(int(entry.get("totalHwidResets") or 0))),
         ("Last HWID Reset", last_hwid_reset),

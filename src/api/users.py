@@ -51,6 +51,8 @@ def build_user_entry(
         "HWID": None,
         "LastHwidReset": None,
         "totalHwidResets": 0,
+        "ActivationCountry": None,
+        "ActivationRobloxUserId": None,
     }
 
 

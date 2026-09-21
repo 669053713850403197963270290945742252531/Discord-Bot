@@ -162,6 +162,8 @@ async def _upload_impl(interaction, file: discord.Attachment):
                     "totalHwidResets": int(normalized.get("hwid_resets") or 0),
                     "CreatedAt": normalized.get("created_at", "").strip() or None,
                     "UpdatedAt": normalized.get("updated_at", "").strip() or None,
+                    "ActivationCountry": normalized.get("activation_country_code", "").strip().upper() or None,
+                    "ActivationRobloxUserId": (int(normalized.get("activation_roblox_user_id")) if normalized.get("activation_roblox_user_id", "").strip() else None),
                 })
         old = await fetch_users()
         await commit_content(json.dumps(data, ensure_ascii=False), None, f"Import license database by {interaction.user}")
@@ -194,6 +196,8 @@ async def _upload_impl(interaction, file: discord.Attachment):
             int(record.get("totalHwidResets", record.get("HwidResets", record.get("HWIDResets", 0))) or 0),
             str(record.get("CreatedAt") or "").strip(),
             str(record.get("UpdatedAt") or "").strip(),
+            str(record.get("ActivationCountry") or "").strip().upper(),
+            int(record.get("ActivationRobloxUserId") or 0),
         )
 
     old_by_identifier = {_identifier(record): record for record in old if _identifier(record)}
