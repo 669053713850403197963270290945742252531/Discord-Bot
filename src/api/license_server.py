@@ -100,6 +100,65 @@ def _valid_key(key: Any) -> bool:
     return isinstance(key, str) and 8 <= len(key.strip()) <= 256
 
 
+def _normalize_country_code(value: Any) -> str:
+    text = str(value or "").strip().upper()
+    if len(text) == 2 and text.isalpha():
+        return text
+    return ""
+
+
+def _parse_roblox_user_id(value: Any) -> int | None:
+    try:
+        parsed = int(value)
+    except (TypeError, ValueError):
+        return None
+    return parsed if parsed > 0 else None
+
+
+def _roblox_profile_link(value: Any) -> str:
+    user_id = _parse_roblox_user_id(value)
+    if user_id is None:
+        return "Unknown"
+    return f"[{user_id}](https://www.roblox.com/users/{user_id}/profile)"
+
+
+def _key_sharing_assessment(
+    entry: Dict[str, Any],
+    current_country: str,
+    current_roblox_user_id: int | None,
+) -> Dict[str, Any]:
+    """Compare current activation identity with the immutable first-activation snapshot.
+
+    HWID resets are the context in which this detector is primarily useful: a
+    newly bound HWID after a reset can otherwise make the same key appear valid
+    on a different user's device. Roblox UserId is treated as the stronger
+    identity signal; country is corroborating telemetry and can legitimately
+    change because of travel/VPNs.
+    """
+    stored_country = _normalize_country_code(entry.get("ActivationCountry"))
+    stored_user_id = _parse_roblox_user_id(entry.get("ActivationRobloxUserId"))
+    after_reset = int(entry.get("totalHwidResets") or 0) > 0 and not str(entry.get("HWID") or "").strip()
+
+    country_changed = bool(stored_country and current_country and stored_country != current_country)
+    user_changed = bool(stored_user_id and current_roblox_user_id and stored_user_id != current_roblox_user_id)
+
+    if not after_reset or not (country_changed or user_changed):
+        return {"suspected": False, "high_confidence": False}
+
+    high_confidence = user_changed
+    return {
+        "suspected": True,
+        "high_confidence": high_confidence,
+        "country_changed": country_changed,
+        "user_changed": user_changed,
+        "stored_country": stored_country or "Unknown",
+        "current_country": current_country or "Unknown",
+        "stored_user_id": stored_user_id,
+        "current_user_id": current_roblox_user_id,
+        "reset_count": int(entry.get("totalHwidResets") or 0),
+    }
+
+
 def _issue_execution_token(identifier: str, hwid: str, game_id: str) -> str:
     token = secrets.token_urlsafe(32)
     with _state_lock:
@@ -184,7 +243,8 @@ def _send_breach_webhook(
                     f"**Device:** {device_text}\n"
                     f"**Executor:** {executor_text}\n"
                     f"**Current HWID:** ||`{current_hwid}`||\n"
-                    f"**Used Key:** ||`{used_key}`||"
+                    f"**Used Key:** ||`{used_key}`||\n"
+                    f"**Current Roblox User:** {_roblox_profile_link(entry.get('CurrentRobloxUserId'))}"
                 ),
                 "inline": False,
             },
@@ -194,13 +254,15 @@ def _send_breach_webhook(
                     f"**Discord:** {owner_discord}\n"
                     f"**Identifier:** `{identifier}`\n"
                     f"**Rank:** `{owner_rank}`\n"
-                    f"**Owner HWID:** ||`{owner_hwid}`||"
+                    f"**Owner HWID:** ||`{owner_hwid}`||\n"
+                    f"**Activation Country:** `{_safe_log_value(entry.get('ActivationCountry'), fallback='Unknown')}`\n"
+                    f"**Activated Roblox User:** {_roblox_profile_link(entry.get('ActivationRobloxUserId'))}"
                 ),
                 "inline": False,
             },
             {
                 "name": "Detection",
-                "value": f"`{detection_details_text}`",
+                "value": detection_details_text,
                 "inline": False,
             },
             {
@@ -376,10 +438,14 @@ def evaluate_and_load(
     executor: Any = "Unknown",
     job_id: Any = "Unknown",
     device: Any = "Unknown",
+    country_code: Any = "",
+    roblox_user_id: Any = None,
 ) -> Dict[str, Any]:
     key = str(key or "").strip()
     hwid = str(hwid or "").strip().lower()
     game_id = str(game_id or "").strip()
+    country_code = _normalize_country_code(country_code)
+    roblox_user_id = _parse_roblox_user_id(roblox_user_id)
 
     if not _valid_key(key):
         return {"allowed": False, "reason": "invalid_key"}
@@ -409,6 +475,63 @@ def evaluate_and_load(
                 return {"allowed": False, "reason": "expired"}
         except ValueError:
             pass
+
+    sharing = {"suspected": False, "high_confidence": False}
+    if getattr(config, "LICENSE_KEY_SHARING_DETECTION_ENABLED", True):
+        sharing = _key_sharing_assessment(entry, country_code, roblox_user_id)
+        if sharing.get("suspected"):
+            details = (
+                f"HWID reset count: {sharing.get('reset_count', 0)}; "
+                f"Activation country: {sharing.get('stored_country', 'Unknown')}; "
+                f"Current country: {sharing.get('current_country', 'Unknown')}; "
+                f"Activation Roblox UserId: {_roblox_profile_link(sharing.get('stored_user_id'))}; "
+                f"Current Roblox UserId: {_roblox_profile_link(sharing.get('current_user_id'))}; "
+                f"Country changed: {'Yes' if sharing.get('country_changed') else 'No'}; "
+                f"Roblox UserId changed: {'Yes' if sharing.get('user_changed') else 'No'}; "
+                f"Confidence: {'High' if sharing.get('high_confidence') else 'Medium'}"
+            )
+            if sharing.get("high_confidence"):
+                disabled = False
+                disable_error = None
+                try:
+                    disabled = bool(_run(disable_license(str(entry["Identifier"]))))
+                except Exception as exc:
+                    disable_error = exc
+                    print(f"[License] Failed to disable suspected shared license: {exc}")
+                breach_entry = dict(entry)
+                breach_entry["CurrentRobloxUserId"] = roblox_user_id
+                _queue_breach_webhook(
+                    entry=breach_entry,
+                    key=key,
+                    current_hwid=hwid,
+                    game_id=game_id,
+                    remote=remote,
+                    executor=executor,
+                    job_id=job_id,
+                    device=device,
+                    reason="key_sharing_detected",
+                    detection_details=details + (f"; Enforcement error: {disable_error}" if disable_error else ""),
+                    license_disabled=disabled,
+                )
+                if disabled:
+                    return {"allowed": False, "reason": "key_sharing_detected"}
+                return {"allowed": False, "reason": "backend_unavailable"}
+
+            breach_entry = dict(entry)
+            breach_entry["CurrentRobloxUserId"] = roblox_user_id
+            _queue_breach_webhook(
+                entry=breach_entry,
+                key=key,
+                current_hwid=hwid,
+                game_id=game_id,
+                remote=remote,
+                executor=executor,
+                job_id=job_id,
+                device=device,
+                reason="key_sharing_suspected",
+                detection_details=details,
+                license_disabled=False,
+            )
 
     entry_hwid = str(entry.get("HWID") or "").strip().lower()
     if entry_hwid and entry_hwid != hwid:
@@ -618,6 +741,8 @@ def handle_check_request(raw: bytes, remote: str) -> Tuple[int, str, Dict[str, s
     executor = _safe_log_value(payload.get("executor"), fallback="Unknown", max_length=256)
     job_id = _safe_log_value(payload.get("job_id"), fallback="Unknown", max_length=128)
     device = _safe_log_value(payload.get("device"), fallback="Unknown", max_length=128)
+    country_code = _normalize_country_code(payload.get("country_code"))
+    roblox_user_id = _parse_roblox_user_id(payload.get("roblox_user_id"))
 
     if not _valid_key(key) or not hwid or not game_id or not NONCE_RE.fullmatch(nonce):
         return 400, json.dumps({"allowed": False, "reason": "malformed_request"}), {"Content-Type": "application/json"}
@@ -638,6 +763,8 @@ def handle_check_request(raw: bytes, remote: str) -> Tuple[int, str, Dict[str, s
         executor=executor,
         job_id=job_id,
         device=device,
+        country_code=country_code,
+        roblox_user_id=roblox_user_id,
     )
     status = 200 if result.get("allowed") else 403
     return status, json.dumps(result), {"Content-Type": "application/json", "Cache-Control": "no-store"}
@@ -660,6 +787,8 @@ def handle_complete_request(raw: bytes, remote: str) -> Tuple[int, str, Dict[str
     executor = _safe_log_value(payload.get("executor"), fallback="Unknown", max_length=256)
     job_id = _safe_log_value(payload.get("job_id"), fallback="Unknown", max_length=128)
     device = _safe_log_value(payload.get("device"), fallback="Unknown", max_length=64)
+    country_code = _normalize_country_code(payload.get("country_code"))
+    roblox_user_id = _parse_roblox_user_id(payload.get("roblox_user_id"))
     if not _valid_key(key) or not is_valid_hwid(hwid) or not game_id.isdigit() or not NONCE_RE.fullmatch(execution_token):
         return 400, json.dumps({"ok": False, "reason": "malformed_request"}), {"Content-Type": "application/json"}
 
@@ -679,7 +808,13 @@ def handle_complete_request(raw: bytes, remote: str) -> Tuple[int, str, Dict[str
             return 403, json.dumps({"ok": False, "reason": "game_not_authorized"}), {"Content-Type": "application/json"}
         if not _consume_execution_token(execution_token, str(entry["Identifier"]), hwid, game_id):
             return 403, json.dumps({"ok": False, "reason": "invalid_execution_token"}), {"Content-Type": "application/json"}
-        completed_entry = _run(complete_successful_execution(str(entry["Identifier"])))
+        completed_entry = _run(
+            complete_successful_execution(
+                str(entry["Identifier"]),
+                activation_country=country_code,
+                activation_roblox_user_id=roblox_user_id,
+            )
+        )
         if not completed_entry:
             return 503, json.dumps({"ok": False, "reason": "backend_unavailable"}), {"Content-Type": "application/json"}
         completed_executions = int(completed_entry.get("executions") or 0)

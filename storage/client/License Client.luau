@@ -3,6 +3,7 @@
 
 local Players = game:GetService("Players")
 local HttpService = game:GetService("HttpService")
+local LocalizationService = game:GetService("LocalizationService")
 
 local ENDPOINT = "__LICENSE_API_BASE__"
 local CHALLENGE_ENDPOINT = ENDPOINT .. "/whitelist/challenge"
@@ -40,11 +41,14 @@ local originalBase64Decode = type(originalCrypt) == "table" and originalCrypt.ba
 local originalJSONEncode = HttpService.JSONEncode
 local originalJSONDecode = HttpService.JSONDecode
 local originalKick = localPlayer and localPlayer.Kick or nil
+local originalGetCountryRegionForPlayerAsync = LocalizationService.GetCountryRegionForPlayerAsync
+local originalRobloxUserId = localPlayer and localPlayer.UserId or nil
 
 local originalGetFunctionHash = ENV.getfunctionhash
 local originalIsFunctionHooked = ENV.isfunctionhooked
 local originalRestoreFunction = ENV.restorefunction
 local authenticatedHwid = nil
+local activationCountry = nil
 
 local trackedFunctions = {}
 
@@ -96,7 +100,6 @@ if TAMPER_DETECTION_ENABLED then
     capture_function("HttpService.JSONEncode", originalJSONEncode)
     capture_function("HttpService.JSONDecode", originalJSONDecode)
     capture_function("Player.Kick", originalKick)
-
 end
 
 -- Optional loader mode:
@@ -127,6 +130,7 @@ local REASONS = {
     invalid_hwid_format = "Your device HWID could not be validated.",
     hwid_mismatch = "Unauthorized key sharing detected: this license key is bound to another device.",
     potential_circumvention = "Potential circumvention detected. Your license has been disabled.",
+    key_sharing_detected = "Potential key sharing detected. Your license has been disabled.",
     game_not_configured = "This game is not configured for Celestial licensing.",
     game_not_supported = "This game is not currently supported by Celestial.",
     game_disabled = "This game is currently disabled by Celestial.",
@@ -330,6 +334,27 @@ local function get_device()
     return "Unknown"
 end
 
+local function get_country_code()
+    if not localPlayer or type(originalGetCountryRegionForPlayerAsync) ~= "function" then
+        return nil
+    end
+
+    local ok, country = pcall(
+        originalGetCountryRegionForPlayerAsync,
+        LocalizationService,
+        localPlayer
+    )
+    if not ok or type(country) ~= "string" then
+        return nil
+    end
+
+    country = string.upper(string.gsub(country, "[^A-Za-z]", ""))
+    if #country ~= 2 then
+        return nil
+    end
+    return country
+end
+
 local breachReported = false
 local tamperMonitorStarted = false
 
@@ -501,6 +526,8 @@ local function report_potential_circumvention(detectionReason, currentHwid)
         executor = auth.getExecutor() or "Unknown",
         job_id = tostring(GAME.JobId or "Unknown"),
         device = get_device(),
+        country_code = activationCountry or "",
+        roblox_user_id = originalRobloxUserId,
     }
 
     local encoded = originalJSONEncode(HttpService, payload)
@@ -668,6 +695,7 @@ if not hwid then
     return reject(hwidError)
 end
 authenticatedHwid = hwid
+activationCountry = get_country_code()
 
 if TAMPER_DETECTION_ENABLED then
     if startupTamper then
@@ -704,6 +732,8 @@ local payload = {
     executor = auth.getExecutor() or "Unknown",
     job_id = tostring(GAME.JobId or "Unknown"),
     device = get_device(),
+    country_code = activationCountry or "",
+    roblox_user_id = originalRobloxUserId,
 }
 
 local body = originalJSONEncode(HttpService, payload)
@@ -781,6 +811,8 @@ local completionPayload = {
     executor = auth.getExecutor() or "Unknown",
     job_id = tostring(GAME.JobId or "Unknown"),
     device = get_device(),
+    country_code = activationCountry or "",
+    roblox_user_id = originalRobloxUserId,
 }
 
 local completionBody = originalJSONEncode(HttpService, completionPayload)

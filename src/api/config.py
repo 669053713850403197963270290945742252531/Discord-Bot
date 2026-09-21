@@ -203,6 +203,13 @@ LICENSE_TAMPER_DETECTION_ENABLED = os.getenv(
     "LICENSE_TAMPER_DETECTION_ENABLED", "true"
 ).strip().lower() not in ("false", "0", "no", "off")
 
+# Optional server-side detection for likely key sharing after a HWID reset.
+# High-confidence cases (different Roblox account identity) can disable the license;
+# country-only changes are treated as a warning to avoid penalizing travel/VPN use.
+LICENSE_KEY_SHARING_DETECTION_ENABLED = os.getenv(
+    "LICENSE_KEY_SHARING_DETECTION_ENABLED", "true"
+).strip().lower() not in ("false", "0", "no", "off")
+
 # Sentivel heartbeat used by the bot status page. By default it is enabled
 # only on Render, since local development intentionally goes offline during
 # restarts/debugging. Set SENTIVEL_ENABLED explicitly to true/false to

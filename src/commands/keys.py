@@ -154,18 +154,27 @@ async def _checktemp_impl(interaction, user):
         remaining_ = current_expiration - now_
         expires_ts = int(current_expiration.timestamp())
 
-        fields = [
-            ("Identifier", current_entry.get("Identifier"), True),
-            ("Rank", current_entry.get("Rank"), True),
-            ("Discord ID", f"{current_entry.get('DiscordId')} ({user.mention})", True),
-            ("HWID", f"||`{current_entry.get('HWID')}`||" if current_entry.get("HWID") else "N/A", True),
-            ("Key", f"||`{current_entry.get('Key')}`||" if current_entry.get("Key") else "N/A", True),
-            ("Activated", format_discord_timestamp(current_entry.get("Activated"), "F"), True),
-            ("Last HWID Reset", format_discord_timestamp(current_entry.get("LastHwidReset")), True),
-            ("Total HWID Resets", f"`{current_entry.get('totalHwidResets', 0)}`", True),
-            ("Expires", f"<t:{expires_ts}:F>", True),
-            ("Time Left", humanize_timeleft(remaining_), True),
-        ]
+        identity_value = (
+            f"**Identifier:** `{current_entry.get('Identifier') or 'N/A'}`\n"
+            f"**Discord:** {user.mention}\n"
+            f"**Discord ID:** `{current_entry.get('DiscordId') or user.id}`\n"
+            f"**Rank:** `{current_entry.get('Rank') or 'N/A'}`"
+        )
+        license_value = (
+            f"**Key:** ||`{current_entry.get('Key')}`||" if current_entry.get("Key") else "**Key:** `N/A`"
+        ) + (
+            f"\n**Activated:** {format_discord_timestamp(current_entry.get('Activated'), 'F')}"
+        )
+        timing_value = (
+            f"**Expires:** <t:{expires_ts}:F>\n"
+            f"**Time Left:** {humanize_timeleft(remaining_)}"
+        )
+        hardware_value = (
+            f"**HWID:** ||`{current_entry.get('HWID')}`||" if current_entry.get("HWID") else "**HWID:** `N/A`"
+        ) + (
+            f"\n**Last HWID Reset:** {format_discord_timestamp(current_entry.get('LastHwidReset'))}\n"
+            f"**Total HWID Resets:** `{current_entry.get('totalHwidResets', 0)}`"
+        )
 
         embed = discord.Embed(
             title=f"Temporary Whitelist: {current_entry.get('Identifier', user.name)}",
@@ -173,8 +182,10 @@ async def _checktemp_impl(interaction, user):
             timestamp=now_,
         )
         embed.set_thumbnail(url=user.display_avatar.url)
-        for name, value, inline in fields:
-            embed.add_field(name=name, value=value or "N/A", inline=inline)
+        embed.add_field(name="Identity", value=identity_value, inline=False)
+        embed.add_field(name="License", value=license_value, inline=False)
+        embed.add_field(name="Timing", value=timing_value, inline=False)
+        embed.add_field(name="Hardware", value=hardware_value, inline=False)
         embed.set_footer(text="Live countdown • updates automatically until expiry or extension")
         return embed
 
