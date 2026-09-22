@@ -1186,6 +1186,10 @@ class Whitelist(commands.Cog):
         headshot_url = await _roblox_headshot_url(entry.get("ActivationRobloxUserId"))
         if headshot_url:
             embed.set_thumbnail(url=headshot_url)
+        elif not entry.get("ActivationRobloxUserId") and not entry.get("ActivationCountry"):
+            discord_avatar_url = getattr(user.display_avatar, "url", None)
+            if discord_avatar_url:
+                embed.set_thumbnail(url=discord_avatar_url)
 
         updated = format_discord_timestamp(entry.get("UpdatedAt"), "R") if entry.get("UpdatedAt") else "Never"
         last_hwid_reset = format_discord_timestamp(entry.get("LastHwidReset"), "R") if entry.get("LastHwidReset") else "Never"
@@ -1352,6 +1356,10 @@ async def _fetchuser_impl(interaction, target):
     headshot_url = await _roblox_headshot_url(entry.get("ActivationRobloxUserId"))
     if headshot_url:
         embed.set_thumbnail(url=headshot_url)
+    elif not entry.get("ActivationRobloxUserId") and not entry.get("ActivationCountry"):
+        discord_avatar_url = getattr(target.display_avatar, "url", None)
+        if discord_avatar_url:
+            embed.set_thumbnail(url=discord_avatar_url)
     for name, value in [
         ("Identifier", entry.get("Identifier")), ("Discord ID", entry.get("DiscordId")),
         ("Key", f"||`{entry.get('Key')}`||"), ("Games", _games_links_text(entry.get("Games"))),
