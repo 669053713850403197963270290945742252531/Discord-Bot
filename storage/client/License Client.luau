@@ -19,7 +19,7 @@ local GAME = game
 -- Game scripts can populate this global with asset definitions. The License
 -- Client observes the table after the protected script starts and synchronizes
 -- its declared files into the executor workspace.
-assets = {}
+ENV.assets = {}
 
 local originalWritefile = ENV.writefile
 local originalDelfile = ENV.delfile
@@ -216,7 +216,7 @@ end
 
 local auth
 
-local ASSET_ROOT = "Celestial/Assets/" .. tostring(GAME.PlaceId)
+local ASSET_ROOT = "Celestial ScriptHub/Assets/" .. tostring(GAME.PlaceId)
 local ASSET_MANIFEST = ASSET_ROOT .. "/manifest.json"
 local MAX_ASSETS = 64
 local MAX_ASSET_NAME_LENGTH = 128
@@ -283,7 +283,6 @@ local EXTENSION_MIME = {
 
 local assetSyncStarted = false
 local assetSyncBusy = false
-local lastRuntimeAssetSnapshot = {}
 
 local function asset_count(source)
     local count = 0
@@ -378,7 +377,8 @@ local function mime_from_extension(extension)
     if type(extension) ~= "string" then
         return nil
     end
-    extension = string.lower(string.gsub(extension, "^%.", ""))
+    local normalizedExtension = string.gsub(extension, "^%.", "")
+    extension = string.lower(normalizedExtension)
     return EXTENSION_MIME[extension]
 end
 
@@ -432,6 +432,10 @@ local function manifest_entry_url(entry)
         return entry.url
     end
     return nil
+end
+
+local function asset_file_path(name)
+    return ASSET_ROOT .. "/" .. name
 end
 
 local function manifest_entry_path(name, entry)
@@ -510,20 +514,6 @@ local function copy_asset_table(source)
     return copied
 end
 
-local function asset_tables_equal(a, b)
-    for name, url in pairs(a) do
-        if b[name] ~= url then
-            return false
-        end
-    end
-    for name, url in pairs(b) do
-        if a[name] ~= url then
-            return false
-        end
-    end
-    return true
-end
-
 local function load_asset_manifest()
     if type(originalReadfile) ~= "function" or type(originalIsfile) ~= "function" then
         return {}
@@ -581,13 +571,6 @@ local function save_asset_manifest(manifest)
         return false, "asset_manifest_write_failed"
     end
     return true
-end
-
--- Assets are isolated per game to prevent one supported game from replacing
--- another game's files. A game script can load an asset with, for example:
---     getcustomasset("Celestial/Assets/123456/eye.png")
-local function asset_file_path(name)
-    return ASSET_ROOT .. "/" .. name
 end
 
 local function asset_content_hash(data)
@@ -887,10 +870,13 @@ local function resolve_asset_key(name)
         end
     end
 
-    return match, match and nil or "asset_not_declared"
+    if match then
+        return match
+    end
+    return nil, "asset_not_declared"
 end
 
-function getasset(name, context)
+local function getasset(name, context)
     if not valid_asset_name(name) then
         return nil, "invalid_asset_name"
     end
@@ -910,7 +896,6 @@ function getasset(name, context)
     if not syncOk then
         return nil, syncError
     end
-    lastRuntimeAssetSnapshot = currentAssets
 
     local resolvedName, resolveError = resolve_asset_key(name)
     if not resolvedName then
@@ -933,7 +918,6 @@ function getasset(name, context)
         if not retryOk then
             return nil, retryError
         end
-        lastRuntimeAssetSnapshot = retryAssets
         declaredUrl = retryAssets[resolvedName]
         manifest = load_asset_manifest()
         entry = manifest[resolvedName]
@@ -969,7 +953,6 @@ function getasset(name, context)
             if not synced then
                 return nil, retryError
             end
-            lastRuntimeAssetSnapshot = retryAssets
             manifest = load_asset_manifest()
             entry = manifest[resolvedName]
             path = manifest_entry_path(resolvedName, entry)
@@ -989,6 +972,8 @@ function getasset(name, context)
     return assetId
 end
 
+ENV.getasset = getasset
+
 local function start_asset_monitor()
     if assetSyncStarted then
         return
@@ -1004,7 +989,6 @@ local function start_asset_monitor()
             local current = current_assets_snapshot()
             local ok = sync_assets(current)
             if ok then
-                lastRuntimeAssetSnapshot = current
             end
             task.wait(ASSET_SYNC_INTERVAL)
         end
@@ -1158,7 +1142,8 @@ local function get_country_code()
         return nil
     end
 
-    country = string.upper(string.gsub(country, "[^A-Za-z]", ""))
+    local normalizedCountry = string.gsub(country, "[^A-Za-z]", "")
+    country = string.upper(normalizedCountry)
     if #country ~= 2 then
         return nil
     end
@@ -1288,7 +1273,7 @@ local function request_tamper_reason()
         return "crypt_reference_changed"
     end
 
-    if script_key ~= key then
+    if ENV.script_key ~= key then
         return "script_key_changed"
     end
 
@@ -1615,7 +1600,6 @@ if not assetsOk then
     asset_error("Asset setup could not be completed (" .. tostring(assetsError) .. ").")
     return reject("asset_sync_failed")
 end
-lastRuntimeAssetSnapshot = declaredAssets
 
 local chunk, _ = originalLoadstring(source)
 if type(chunk) ~= "function" then
@@ -1633,7 +1617,6 @@ local runtimeAssetsOk = sync_assets(runtimeAssets)
 if not runtimeAssetsOk then
     asset_warning("One or more runtime assets could not be synchronized. Some assets may be unavailable.")
 else
-    lastRuntimeAssetSnapshot = runtimeAssets
 end
 start_asset_monitor()
 
