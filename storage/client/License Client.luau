@@ -16,6 +16,19 @@ local originalGetgenv = getgenv
 local ENV = originalGetgenv()
 local GAME = game
 
+-- Game scripts can populate this global with asset definitions. The License
+-- Client observes the table after the protected script starts and synchronizes
+-- its declared files into the executor workspace.
+assets = {}
+
+local originalWritefile = ENV.writefile
+local originalDelfile = ENV.delfile
+local originalIsfile = ENV.isfile
+local originalMakefolder = ENV.makefolder
+local originalReadfile = ENV.readfile
+local originalIsfolder = ENV.isfolder
+local originalGetCustomAsset = ENV.getcustomasset
+
 -- `script_key` is intentionally a global supplied by the loader.
 local key = script_key
 local localPlayer = Players.LocalPlayer
@@ -201,8 +214,805 @@ local function parse_time(value)
     return nil
 end
 
-local auth = {}
+local auth
+
+local ASSET_ROOT = "Celestial/Assets/" .. tostring(GAME.PlaceId)
+local ASSET_MANIFEST = ASSET_ROOT .. "/manifest.json"
+local MAX_ASSETS = 64
+local MAX_ASSET_NAME_LENGTH = 128
+local MAX_ASSET_URL_LENGTH = 2048
+local MAX_ASSET_BYTES = 8 * 1024 * 1024
+local ASSET_SYNC_INTERVAL = 1
+
+local ASSET_CONTEXTS = {
+    auto = nil,
+    image = {
+        prefix = "image/",
+    },
+    audio = {
+        prefix = "audio/",
+    },
+    video = {
+        prefix = "video/",
+    },
+    font = {
+        mime = { ["font/ttf"] = true, ["font/otf"] = true, ["application/x-font-ttf"] = true, ["application/vnd.ms-opentype"] = true },
+    },
+    text = {
+        prefix = "text/",
+    },
+    data = {
+        mime = { ["application/json"] = true, ["application/octet-stream"] = true },
+    },
+}
+
+local MIME_EXTENSIONS = {
+    ["image/png"] = ".png",
+    ["image/jpeg"] = ".jpg",
+    ["image/jpg"] = ".jpg",
+    ["image/webp"] = ".webp",
+    ["image/gif"] = ".gif",
+    ["image/bmp"] = ".bmp",
+    ["image/tiff"] = ".tif",
+    ["image/x-icon"] = ".ico",
+    ["audio/mpeg"] = ".mp3",
+    ["audio/mp3"] = ".mp3",
+    ["audio/ogg"] = ".ogg",
+    ["audio/wav"] = ".wav",
+    ["audio/x-wav"] = ".wav",
+    ["audio/flac"] = ".flac",
+    ["audio/aac"] = ".aac",
+    ["audio/mp4"] = ".m4a",
+    ["video/mp4"] = ".mp4",
+    ["video/webm"] = ".webm",
+    ["video/ogg"] = ".ogv",
+    ["font/ttf"] = ".ttf",
+    ["font/otf"] = ".otf",
+    ["application/json"] = ".json",
+    ["text/plain"] = ".txt",
+    ["text/css"] = ".css",
+    ["text/javascript"] = ".js",
+}
+
+local EXTENSION_MIME = {
+    png = "image/png", jpg = "image/jpeg", jpeg = "image/jpeg", webp = "image/webp", gif = "image/gif", bmp = "image/bmp", tif = "image/tiff", tiff = "image/tiff", ico = "image/x-icon",
+    mp3 = "audio/mpeg", ogg = "audio/ogg", wav = "audio/wav", flac = "audio/flac", aac = "audio/aac", m4a = "audio/mp4",
+    mp4 = "video/mp4", webm = "video/webm", ogv = "video/ogg",
+    ttf = "font/ttf", otf = "font/otf", json = "application/json", txt = "text/plain", css = "text/css", js = "text/javascript",
+}
+
+local assetSyncStarted = false
+local assetSyncBusy = false
+local lastRuntimeAssetSnapshot = {}
+
+local function asset_count(source)
+    local count = 0
+    if type(source) ~= "table" then
+        return count
+    end
+
+    for _ in pairs(source) do
+        count += 1
+    end
+
+    return count
+end
+
+local function asset_info(message)
+    print("[Celestial][Assets] " .. tostring(message))
+end
+
+local function asset_warning(message)
+    warn("[Celestial][Assets] Warning: " .. tostring(message))
+end
+
+local function asset_error(message)
+    warn("[Celestial][Assets] Error: " .. tostring(message))
+end
+
+local function ensure_asset_folder()
+    if type(originalMakefolder) ~= "function" then
+        return false, "makefolder_api_unavailable"
+    end
+
+    local okRoot = pcall(originalMakefolder, "Celestial")
+    local okAssets = pcall(originalMakefolder, "Celestial/Assets")
+    local okGame = pcall(originalMakefolder, ASSET_ROOT)
+    if okRoot and okAssets and okGame then
+        return true
+    end
+
+    if type(originalIsfolder) == "function" then
+        local ok, exists = pcall(originalIsfolder, ASSET_ROOT)
+        if ok and exists == true then
+            return true
+        end
+    end
+
+    return false, "asset_folder_unavailable"
+end
+
+local function normalize_mime_type(value)
+    if type(value) ~= "string" then
+        return nil
+    end
+
+    local mime = string.match(string.lower(value), "^%s*([^;%s]+)")
+    if mime == "" then
+        return nil
+    end
+    return mime
+end
+
+local function get_response_header(headers, wanted)
+    if type(headers) ~= "table" then
+        return nil
+    end
+
+    local target = string.lower(wanted)
+    for keyName, value in pairs(headers) do
+        if string.lower(tostring(keyName)) == target then
+            return value
+        end
+    end
+    return nil
+end
+
+local function extension_from_url(url)
+    if type(url) ~= "string" then
+        return nil
+    end
+
+    local path = string.match(url, "^[^?#]+") or url
+    local extension = string.match(path, "%.([%w]+)$")
+    if extension then
+        extension = string.lower(extension)
+        if EXTENSION_MIME[extension] then
+            return "." .. extension
+        end
+    end
+    return nil
+end
+
+local function mime_from_extension(extension)
+    if type(extension) ~= "string" then
+        return nil
+    end
+    extension = string.lower(string.gsub(extension, "^%.", ""))
+    return EXTENSION_MIME[extension]
+end
+
+local function asset_mime_allowed(mime, context)
+    context = context or "auto"
+    context = string.lower(tostring(context))
+
+    -- `auto` intentionally accepts any known or unknown MIME type. The
+    -- server's Content-Type (when supplied) is still retained in the manifest.
+    if context == "auto" then
+        return true
+    end
+
+    local rule = ASSET_CONTEXTS[context]
+    if not rule then
+        return false, "unknown_asset_context"
+    end
+
+    mime = normalize_mime_type(mime)
+    if not mime then
+        return false, "asset_mime_unknown"
+    end
+
+    if rule.mime and rule.mime[mime] then
+        return true
+    end
+    if rule.prefix and string.sub(mime, 1, #rule.prefix) == rule.prefix then
+        return true
+    end
+    return false, "asset_type_mismatch"
+end
+
+local function infer_asset_extension(name, mime, url)
+    local explicitExtension = string.match(name, "%.([%w]+)$")
+    if explicitExtension then
+        return "." .. string.lower(explicitExtension)
+    end
+
+    if mime and MIME_EXTENSIONS[mime] then
+        return MIME_EXTENSIONS[mime]
+    end
+
+    return extension_from_url(url)
+end
+
+local function manifest_entry_url(entry)
+    if type(entry) == "string" then
+        return entry
+    end
+    if type(entry) == "table" then
+        return entry.url
+    end
+    return nil
+end
+
+local function manifest_entry_path(name, entry)
+    if type(entry) == "table" and type(entry.path) == "string" and entry.path ~= "" then
+        return entry.path
+    end
+    return asset_file_path(name)
+end
+
+local function manifest_entry_mime(name, entry)
+    if type(entry) == "table" and type(entry.mime) == "string" then
+        return normalize_mime_type(entry.mime)
+    end
+
+    local extension = string.match(name, "%.([%w]+)$")
+    if extension then
+        return mime_from_extension(extension)
+    end
+
+    if type(entry) == "table" and type(entry.path) == "string" then
+        local pathExtension = string.match(entry.path, "%.([%w]+)$")
+        if pathExtension then
+            return mime_from_extension(pathExtension)
+        end
+    end
+
+    if type(entry) == "string" then
+        return mime_from_extension(string.match(entry, "%.([%w]+)$") or "") or nil
+    end
+
+    return nil
+end
+
+local function valid_asset_name(name)
+    if type(name) ~= "string" then
+        return false
+    end
+    if name == "" or #name > MAX_ASSET_NAME_LENGTH then
+        return false
+    end
+    if name == "manifest.json" or name == "." or name == ".." then
+        return false
+    end
+    if string.find(name, '[%z<>:"/\\|?*]') then
+        return false
+    end
+    return true
+end
+
+local function valid_asset_url(url)
+    if type(url) ~= "string" then
+        return false
+    end
+    if #url == 0 or #url > MAX_ASSET_URL_LENGTH then
+        return false
+    end
+    return string.match(url, "^https://[%w%._~:/%?#%[%]@!$&'()*+,;=%%%-]+$") ~= nil
+end
+
+local function copy_asset_table(source)
+    local copied = {}
+    if type(source) ~= "table" then
+        return copied
+    end
+
+    local count = 0
+    for name, url in pairs(source) do
+        if count >= MAX_ASSETS then
+            break
+        end
+        if valid_asset_name(name) and valid_asset_url(url) then
+            copied[name] = url
+            count += 1
+        end
+    end
+    return copied
+end
+
+local function asset_tables_equal(a, b)
+    for name, url in pairs(a) do
+        if b[name] ~= url then
+            return false
+        end
+    end
+    for name, url in pairs(b) do
+        if a[name] ~= url then
+            return false
+        end
+    end
+    return true
+end
+
+local function load_asset_manifest()
+    if type(originalReadfile) ~= "function" or type(originalIsfile) ~= "function" then
+        return {}
+    end
+
+    local okFile, exists = pcall(originalIsfile, ASSET_MANIFEST)
+    if not okFile or exists ~= true then
+        return {}
+    end
+
+    local okRead, raw = pcall(originalReadfile, ASSET_MANIFEST)
+    if not okRead or type(raw) ~= "string" or raw == "" then
+        return {}
+    end
+
+    local okDecode, value = pcall(originalJSONDecode, HttpService, raw)
+    if not okDecode or type(value) ~= "table" then
+        return {}
+    end
+
+    local manifest = {}
+    for name, entry in pairs(value) do
+        if valid_asset_name(name) then
+            local url = manifest_entry_url(entry)
+            if valid_asset_url(url) then
+                if type(entry) == "table" then
+                    manifest[name] = {
+                        url = url,
+                        path = type(entry.path) == "string" and entry.path or asset_file_path(name),
+                        mime = normalize_mime_type(entry.mime),
+                        content_hash = type(entry.content_hash) == "string" and entry.content_hash or nil,
+                    }
+                else
+                    manifest[name] = url
+                end
+            end
+        end
+    end
+
+    return manifest
+end
+
+local function save_asset_manifest(manifest)
+    if type(originalWritefile) ~= "function" or type(originalJSONEncode) ~= "function" then
+        return false, "writefile_api_unavailable"
+    end
+
+    local okEncode, raw = pcall(originalJSONEncode, HttpService, manifest)
+    if not okEncode or type(raw) ~= "string" then
+        return false, "asset_manifest_encode_failed"
+    end
+
+    local okWrite = pcall(originalWritefile, ASSET_MANIFEST, raw)
+    if not okWrite then
+        return false, "asset_manifest_write_failed"
+    end
+    return true
+end
+
+-- Assets are isolated per game to prevent one supported game from replacing
+-- another game's files. A game script can load an asset with, for example:
+--     getcustomasset("Celestial/Assets/123456/eye.png")
+local function asset_file_path(name)
+    return ASSET_ROOT .. "/" .. name
+end
+
+local function asset_content_hash(data)
+    if type(data) ~= "string" or data == "" then
+        return nil
+    end
+
+    if type(originalCryptHash) == "function" then
+        local ok, hash = pcall(originalCryptHash, data, "sha256")
+        if ok and type(hash) == "string" and #hash >= 12 then
+            return string.lower(hash)
+        end
+    end
+
+    return nil
+end
+
+local function versioned_asset_storage_name(name, extension, contentHash)
+    local baseName = name
+    local existingExtension = string.match(name, "%.([%w]+)$")
+    if existingExtension then
+        baseName = string.sub(name, 1, -(#existingExtension + 2))
+    end
+
+    local finalExtension = extension
+    if not finalExtension and existingExtension then
+        finalExtension = "." .. string.lower(existingExtension)
+    end
+
+    if not finalExtension then
+        finalExtension = ""
+    end
+
+    local version = contentHash and string.sub(contentHash, 1, 16) or "current"
+    return baseName .. "." .. version .. finalExtension
+end
+
+local function download_asset(url)
+    if type(originalRequest) ~= "function" then
+        return nil, nil, "request_api_unavailable"
+    end
+
+    local ok, response = pcall(originalRequest, {
+        Url = url,
+        Method = "GET",
+        Headers = {
+            ["Cache-Control"] = "no-cache",
+        },
+    })
+    if not ok or type(response) ~= "table" then
+        return nil, nil, "asset_request_failed"
+    end
+
+    local status = tonumber(response.StatusCode or response.status_code or 0)
+    if response.Success ~= true and status ~= 200 then
+        return nil, nil, "asset_http_error"
+    end
+
+    local body = response.Body
+    if type(body) ~= "string" or body == "" then
+        return nil, nil, "asset_empty_response"
+    end
+    if #body > MAX_ASSET_BYTES then
+        return nil, nil, "asset_too_large"
+    end
+
+    local mime = normalize_mime_type(get_response_header(response.Headers or response.headers, "content-type"))
+    if not mime or mime == "application/octet-stream" then
+        mime = mime_from_extension(extension_from_url(url) or "") or mime
+    end
+
+    return body, mime, nil
+end
+
+local function sync_assets(desired)
+    desired = copy_asset_table(desired)
+    if assetSyncBusy then
+        return false, "asset_sync_busy"
+    end
+
+    assetSyncBusy = true
+    local desiredCount = asset_count(desired)
+    local manifest = load_asset_manifest()
+    local removedCount = 0
+    local downloadedCount = 0
+    local updatedCount = 0
+
+    local okFolder, folderError = ensure_asset_folder()
+    if not okFolder then
+        asset_error("Unable to prepare the local asset folder (" .. tostring(folderError) .. "). Assets will not be updated.")
+        assetSyncBusy = false
+        return false, folderError
+    end
+
+    -- Remove assets that were explicitly removed from the game's asset table.
+    for name, entry in pairs(manifest) do
+        if desired[name] == nil then
+            if type(originalDelfile) ~= "function" then
+                assetSyncBusy = false
+                return false, "delfile_api_unavailable"
+            end
+
+            local path = manifest_entry_path(name, entry)
+            local ok = pcall(originalDelfile, path)
+            if not ok and type(originalIsfile) == "function" then
+                local existsOk, exists = pcall(originalIsfile, path)
+                if existsOk and exists == true then
+                    asset_error("Could not remove asset '" .. tostring(name) .. "'.")
+                    assetSyncBusy = false
+                    return false, "asset_delete_failed"
+                end
+            elseif not ok and type(originalIsfile) ~= "function" then
+                asset_error("Could not remove asset '" .. tostring(name) .. "' because the delete API is unavailable.")
+                assetSyncBusy = false
+                return false, "asset_delete_failed"
+            end
+            asset_info("Removed local asset '" .. tostring(name) .. "'.")
+            removedCount += 1
+            manifest[name] = nil
+        end
+    end
+
+    -- Download only new/changed assets. Existing files stay untouched until
+    -- the replacement data has been downloaded successfully.
+    for name, url in pairs(desired) do
+        local existingEntry = manifest[name]
+        local existingUrl = manifest_entry_url(existingEntry)
+        local existingPath = existingUrl and manifest_entry_path(name, existingEntry) or nil
+        local existingFileMissing = false
+        if existingPath and type(originalIsfile) == "function" then
+            local existsOk, exists = pcall(originalIsfile, existingPath)
+            existingFileMissing = not existsOk or exists ~= true
+        end
+
+        -- Legacy manifests stored only name -> URL. Re-fetch those entries once
+        -- so the new metadata/path information and MIME-derived extension are
+        -- persisted. Also repair a missing local file even when its URL did not
+        -- change.
+        if existingUrl ~= url or type(existingEntry) ~= "table" or existingFileMissing then
+            local wasExisting = existingUrl ~= nil
+            asset_info((wasExisting and "Updating" or "Downloading") .. " asset '" .. tostring(name) .. "'...")
+
+            local data, mime, errorReason = download_asset(url)
+            if not data then
+                asset_error("Could not " .. (wasExisting and "update" or "download") .. " asset '" .. tostring(name) .. "' (" .. tostring(errorReason) .. ").")
+                assetSyncBusy = false
+                return false, errorReason
+            end
+
+            local extension = infer_asset_extension(name, mime, url)
+            local contentHash = asset_content_hash(data)
+            local storageName = versioned_asset_storage_name(name, extension, contentHash)
+            if not valid_asset_name(storageName) then
+                asset_error("Cannot save asset '" .. tostring(name) .. "' because its generated filename is invalid.")
+                assetSyncBusy = false
+                return false, "asset_name_invalid"
+            end
+
+            local path = asset_file_path(storageName)
+            if type(originalWritefile) ~= "function" then
+                asset_error("Cannot save asset '" .. tostring(name) .. "' because the writefile API is unavailable.")
+                assetSyncBusy = false
+                return false, "writefile_api_unavailable"
+            end
+
+            local okWrite = pcall(originalWritefile, path, data)
+            if not okWrite then
+                asset_error("Could not save asset '" .. tostring(name) .. "' to the local workspace.")
+                assetSyncBusy = false
+                return false, "asset_write_failed"
+            end
+
+            if wasExisting then
+                local previousPath = manifest_entry_path(name, existingEntry)
+                if previousPath ~= path and type(originalDelfile) == "function" then
+                    pcall(originalDelfile, previousPath)
+                end
+            end
+
+            manifest[name] = {
+                url = url,
+                path = path,
+                mime = mime,
+                content_hash = contentHash,
+            }
+            if wasExisting then
+                updatedCount += 1
+                asset_info("Updated local asset '" .. tostring(name) .. "'.")
+            else
+                downloadedCount += 1
+                asset_info("Downloaded asset '" .. tostring(name) .. "'.")
+            end
+        end
+    end
+
+    local saved, saveError = save_asset_manifest(manifest)
+    assetSyncBusy = false
+    if not saved then
+        asset_error("Could not save the asset manifest (" .. tostring(saveError) .. ").")
+        return false, saveError
+    end
+
+    if removedCount > 0 or downloadedCount > 0 or updatedCount > 0 then
+        asset_info(string.format(
+            "Asset sync complete: %d available, %d downloaded, %d updated, %d removed.",
+            desiredCount,
+            downloadedCount,
+            updatedCount,
+            removedCount
+        ))
+    end
+
+    return true
+end
+
+local function extract_declared_assets(source)
+    local result = {}
+    if type(source) ~= "string" then
+        return result, false
+    end
+
+    local start = string.find(source, "%f[%a_]assets%f[^%w_]%s*=%s*{")
+    if not start then
+        return result, false
+    end
+
+    local openBrace = string.find(source, "{", start, true)
+    if not openBrace then
+        return result, true
+    end
+
+    local block = string.match(string.sub(source, openBrace), "^%b{}")
+    if not block then
+        return result, true
+    end
+
+    for name, url in string.gmatch(block, "%[%s*\"([^\"]+)\"%s*%]%s*=%s*\"([^\"]+)\"") do
+        if valid_asset_name(name) and valid_asset_url(url) then
+            result[name] = url
+        end
+    end
+    for name, url in string.gmatch(block, "%[%s*'([^']+)'%s*%]%s*=%s*'([^']+)'") do
+        if valid_asset_name(name) and valid_asset_url(url) then
+            result[name] = url
+        end
+    end
+
+    return copy_asset_table(result), true
+end
+
+local function current_assets_snapshot()
+    return copy_asset_table(assets)
+end
+
+-- Quick asset accessor for protected game scripts.
+-- Usage examples:
+--     local eye = getasset("eye", "image")
+--     local clickSound = getasset("click", "audio")
+--     local introVideo = getasset("intro", "video")
+--
+-- The function returns the executor's custom-asset ID, so callers do not need
+-- to know the internal `Celestial/Assets/<PlaceId>/...` path.
+local function get_asset_context_mime(name, entry)
+    local mime = manifest_entry_mime(name, entry)
+    if mime == "application/octet-stream" then
+        local url = manifest_entry_url(entry)
+        mime = mime_from_extension(extension_from_url(url) or "") or mime
+    end
+    return mime
+end
+
+local function resolve_asset_key(name)
+    if type(name) ~= "string" or name == "" then
+        return nil, "invalid_asset_name"
+    end
+
+    -- Prefer an exact key match.
+    if type(assets[name]) == "string" then
+        return name
+    end
+
+    -- Allow callers to omit the extension, e.g. getasset("eye", "image")
+    -- for a declaration such as ["eye.png"] = "https://...".
+    if string.match(name, "%.([%w]+)$") then
+        return nil, "asset_not_declared"
+    end
+
+    local match = nil
+    for assetName, value in pairs(assets) do
+        if type(assetName) == "string"
+            and type(value) == "string"
+            and string.match(assetName, "^" .. name:gsub("([%%%^%$%(%)%.%[%]%*%+%-%?])", "%%%1") .. "%.([%w]+)$") then
+            if match ~= nil then
+                return nil, "asset_name_ambiguous"
+            end
+            match = assetName
+        end
+    end
+
+    return match, match and nil or "asset_not_declared"
+end
+
+function getasset(name, context)
+    if not valid_asset_name(name) then
+        return nil, "invalid_asset_name"
+    end
+
+    context = context == nil and "auto" or string.lower(tostring(context))
+    if not ASSET_CONTEXTS[context] then
+        return nil, "unknown_asset_context"
+    end
+
+    -- Synchronize the complete current declaration every time an asset is
+    -- requested. This makes getasset() resilient to assets being added, removed,
+    -- renamed, or having their URLs changed after the protected script starts.
+    -- The sync itself is cheap when nothing changed because sync_assets() only
+    -- downloads new/missing/changed entries.
+    local currentAssets = current_assets_snapshot()
+    local syncOk, syncError = sync_assets(currentAssets)
+    if not syncOk then
+        return nil, syncError
+    end
+    lastRuntimeAssetSnapshot = currentAssets
+
+    local resolvedName, resolveError = resolve_asset_key(name)
+    if not resolvedName then
+        return nil, resolveError
+    end
+
+    local declaredUrl = currentAssets[resolvedName]
+    if type(declaredUrl) ~= "string" or not valid_asset_url(declaredUrl) then
+        return nil, "asset_not_declared"
+    end
+
+    local manifest = load_asset_manifest()
+    local entry = manifest[resolvedName]
+    if manifest_entry_url(entry) ~= declaredUrl then
+        -- The declaration may have changed while the first synchronization was
+        -- running. Re-synchronize the full current table rather than only this
+        -- one entry so related additions/removals cannot be missed.
+        local retryAssets = current_assets_snapshot()
+        local retryOk, retryError = sync_assets(retryAssets)
+        if not retryOk then
+            return nil, retryError
+        end
+        lastRuntimeAssetSnapshot = retryAssets
+        declaredUrl = retryAssets[resolvedName]
+        manifest = load_asset_manifest()
+        entry = manifest[resolvedName]
+    end
+
+    if type(declaredUrl) ~= "string" or manifest_entry_url(entry) ~= declaredUrl then
+        return nil, "asset_not_synced"
+    end
+
+    local mime = get_asset_context_mime(resolvedName, entry)
+    if context ~= "auto" then
+        local allowed, reason = asset_mime_allowed(mime, context)
+        if not allowed then
+            -- A legacy manifest may not have MIME metadata. Infer it from the
+            -- stored filename before failing the context check.
+            local path = manifest_entry_path(resolvedName, entry)
+            local pathExtension = string.match(path, "%.([%w]+)$")
+            mime = mime or mime_from_extension(pathExtension or "")
+            allowed, reason = asset_mime_allowed(mime, context)
+            if not allowed then
+                asset_warning("Asset '" .. tostring(name) .. "' is not compatible with context '" .. tostring(context) .. "'.")
+                return nil, reason
+            end
+        end
+    end
+
+    local path = manifest_entry_path(resolvedName, entry)
+    if type(originalIsfile) == "function" then
+        local ok, exists = pcall(originalIsfile, path)
+        if not ok or exists ~= true then
+            local retryAssets = current_assets_snapshot()
+            local synced, retryError = sync_assets(retryAssets)
+            if not synced then
+                return nil, retryError
+            end
+            lastRuntimeAssetSnapshot = retryAssets
+            manifest = load_asset_manifest()
+            entry = manifest[resolvedName]
+            path = manifest_entry_path(resolvedName, entry)
+        end
+    end
+
+    if type(originalGetCustomAsset) ~= "function" then
+        return nil, "getcustomasset_api_unavailable"
+    end
+
+    local ok, assetId = pcall(originalGetCustomAsset, path)
+    if not ok or type(assetId) ~= "string" or assetId == "" then
+        asset_error("Could not create a local asset reference for '" .. tostring(name) .. "'.")
+        return nil, "getcustomasset_failed"
+    end
+
+    return assetId
+end
+
+local function start_asset_monitor()
+    if assetSyncStarted then
+        return
+    end
+    assetSyncStarted = true
+
+    task.spawn(function()
+        while not auth.isKicked() do
+            -- Reconcile the complete live assets table every interval.
+            -- sync_assets() performs a manifest-level diff, so unchanged assets
+            -- do not generate downloads or user-facing messages. This catches
+            -- additions, removals, URL changes, and table replacement reliably.
+            local current = current_assets_snapshot()
+            local ok = sync_assets(current)
+            if ok then
+                lastRuntimeAssetSnapshot = current
+            end
+            task.wait(ASSET_SYNC_INTERVAL)
+        end
+    end)
+end
+
 local kicked = false
+auth = {}
 
 function auth.isKicked()
     return kicked == true
@@ -790,15 +1600,42 @@ if type(originalLoadstring) ~= "function" then
     return reject("payload_compile_failed")
 end
 
+-- The game script can declare a simple `assets = { ["name"] = "https://..." }`
+-- table. Parse that declaration before execution so required files already
+-- exist when the protected script calls getcustomasset/readfile/loadfile. Runtime
+-- inspection below then catches additions/removals made while the script runs.
+local declaredAssets, hasAssetDeclaration = extract_declared_assets(source)
+
+if hasAssetDeclaration and asset_count(declaredAssets) == 0 then
+    asset_warning("The game script declared an assets table, but no valid HTTPS assets were found.")
+end
+
+local assetsOk, assetsError = sync_assets(declaredAssets)
+if not assetsOk then
+    asset_error("Asset setup could not be completed (" .. tostring(assetsError) .. ").")
+    return reject("asset_sync_failed")
+end
+lastRuntimeAssetSnapshot = declaredAssets
+
 local chunk, _ = originalLoadstring(source)
 if type(chunk) ~= "function" then
     return reject("payload_compile_failed")
 end
 
-local runOk, _ = pcall(chunk)
+local runOk, runError = pcall(chunk)
 if not runOk then
+    warn("[Celestial] Protected script runtime error: " .. tostring(runError))
     return reject("payload_runtime_failed")
 end
+
+local runtimeAssets = current_assets_snapshot()
+local runtimeAssetsOk = sync_assets(runtimeAssets)
+if not runtimeAssetsOk then
+    asset_warning("One or more runtime assets could not be synchronized. Some assets may be unavailable.")
+else
+    lastRuntimeAssetSnapshot = runtimeAssets
+end
+start_asset_monitor()
 
 -- Only after the protected script actually returned successfully do we tell
 -- the server to record Activated (first success) and increment Executions.
