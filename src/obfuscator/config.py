@@ -31,8 +31,15 @@ class ObfuscationConfig:
     strip_comments: bool = False
 
     virtualize: bool = True
+    # VM values below are baseline intensity anchors. build_vm derives a
+    # source-complexity profile and converts each anchor into a randomized
+    # per-build range before selecting the actual budget.
     junk_instructions: int = 14
     noise_blocks: int = 0
+    control_flow_decoys: int = 16
+    dead_code_blocks: int = 12
+    anti_tamper_checks: int = 4
+    payload_layers: int = 2
     string_min_length: int = 1
     max_input_bytes: int = 5 * 1024 * 1024
 

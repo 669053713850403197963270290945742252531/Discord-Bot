@@ -38,6 +38,11 @@ class ObfuscationStats:
     noise_blocks: int = 0
     string_decoder_variants: int = 0
     string_pool_parts: int = 0
+    control_flow_decoys: int = 0
+    dead_code_blocks: int = 0
+    anti_tamper_checks: int = 0
+    payload_layers: int = 0
+    source_complexity: int = 0
 
 
 @dataclass(slots=True)
@@ -309,8 +314,18 @@ def obfuscate(source_text: str | bytes, *, config: ObfuscationConfig = DEFAULT_C
 
     vm_instructions = 0
     runtime_layers = decoder_variants = opaque_edges = payload_blocks = micro_ops = 0
+    control_flow_decoys = dead_code_blocks = anti_tamper_checks = payload_layers = 0
+    source_complexity = 0
     if config.virtualize:
-        vm = build_vm(current_source, seed=seed, junk=config.junk_instructions)
+        vm = build_vm(
+            current_source,
+            seed=seed,
+            junk=config.junk_instructions,
+            control_flow_decoys=config.control_flow_decoys,
+            dead_code_blocks=config.dead_code_blocks,
+            anti_tamper_checks=config.anti_tamper_checks,
+            payload_layers=config.payload_layers,
+        )
         output = vm.source.encode("utf-8")
         vm_instructions = vm.instruction_count
         runtime_layers = vm.runtime_layers
@@ -318,6 +333,11 @@ def obfuscate(source_text: str | bytes, *, config: ObfuscationConfig = DEFAULT_C
         opaque_edges = vm.opaque_edges
         payload_blocks = vm.payload_blocks
         micro_ops = vm.micro_ops
+        control_flow_decoys = vm.control_flow_decoys
+        dead_code_blocks = vm.dead_code_blocks
+        anti_tamper_checks = vm.anti_tamper_checks
+        payload_layers = vm.payload_layers
+        source_complexity = vm.complexity_score
     else:
         output = current_source
 
@@ -338,6 +358,11 @@ def obfuscate(source_text: str | bytes, *, config: ObfuscationConfig = DEFAULT_C
         noise_blocks=noise_count,
         string_decoder_variants=3 if string_payloads else 0,
         string_pool_parts=len(string_payloads),
+        control_flow_decoys=control_flow_decoys,
+        dead_code_blocks=dead_code_blocks,
+        anti_tamper_checks=anti_tamper_checks,
+        payload_layers=payload_layers,
+        source_complexity=source_complexity,
     )
     return ObfuscationResult(output, seed, stats)
 

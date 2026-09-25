@@ -126,6 +126,7 @@ class Obfuscate(commands.Cog):
                 ("📄 Source File", f"`{original_name}`", True),
                 ("📦 Protected File", f"`{filename}`", True),
                 ("📏 Size", f"{result.stats.input_bytes:,} B → {result.stats.output_bytes:,} B", True),
+                ("🧠 Source Complexity", f"{result.stats.source_complexity}/100", True),
                 ("🔤 Local Renaming", f"{result.stats.renamed_locals:,}", True),
                 ("🔐 Encrypted Strings", f"{result.stats.encrypted_strings:,}", True),
                 ("🧮 Obfuscated Constants", f"{result.stats.obfuscated_constants:,}", True),
@@ -134,15 +135,20 @@ class Obfuscate(commands.Cog):
                 ("🧩 Runtime Layers", f"{result.stats.runtime_layers:,}", True),
                 ("🧬 Decoder Variants", f"{result.stats.decoder_variants:,}", True),
                 ("🕸️ Opaque Edges", f"{result.stats.opaque_edges:,}", True),
+                ("🌐 Control-Flow Decoys", f"{result.stats.control_flow_decoys:,}", True),
                 ("📚 Payload Blocks", f"{result.stats.payload_blocks:,}", True),
                 ("⚡ VM Micro-Ops", f"{result.stats.micro_ops:,}", True),
-                ("🧱 Noise Blocks", f"{result.stats.noise_blocks:,}", True),
+                ("🧱 Dead-Code Blocks", f"{result.stats.dead_code_blocks:,}", True),
+                ("🛡️ Anti-Tamper Checks", f"{result.stats.anti_tamper_checks:,}", True),
+                ("🧬 Payload Layers", f"{result.stats.payload_layers:,}", True),
                 ("🔐 String Pool Entries", f"{result.stats.string_pool_parts:,}", True),
                 ("🧪 String Decoders", f"{result.stats.string_decoder_variants:,}", True),
                 (
                     "🔒 Protection Pipeline",
-                    "AST validation → byte-preserving payload capture → graph-virtualized runtime → "
-                    "per-build payload encryption → integrity verification",
+                    "AST validation → source complexity profiling → adaptive build-budget selection → "
+                    "byte-preserving payload capture → state-machine virtualization → "
+                    "control-flow decoys → dead-code insertion → multi-layer payload encryption → "
+                    "distributed anti-tamper validation → integrity verification",
                     False,
                 ),
             ],
