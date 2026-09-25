@@ -10,3 +10,5 @@ Pillow>=10.0.0
 opencv-python-headless>=4.9.0
 numpy>=1.26.0
 supabase
+tree-sitter==0.22.3
+tree-sitter-luau==1.2.0

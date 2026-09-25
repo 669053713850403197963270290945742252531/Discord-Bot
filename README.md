@@ -73,7 +73,16 @@ Discord-Bot/
 │       ├── qrcode.py            # /qrcode (generate/decode/help subcommands) -- QR code generator + scanner
 │       ├── warnings.py          # /warnings (add/inspect/clear/delete subcommands) -- durable member warning history
 │       ├── url.py               # /url (shorten/update/unshorten/clear subcommands), /paste, /file -- see "Multi-provider..." below
+│       ├── obfuscate.py         # /obfuscate -- AST-based Luau source protection
 │       └── context_menus.py     # the 15 right-click "user" context menu commands
+│   └── obfuscator/               # AST/compiler backend used by /obfuscate
+│       ├── parser.py             # Tree-sitter Luau parser adapter
+│       ├── ast.py                # lossless source-range AST helpers
+│       ├── lexer.py              # lexical safety utilities
+│       ├── generator.py          # validated non-overlapping source edits
+│       ├── pipeline.py           # staged/reparsed compiler pipeline
+│       ├── virtual_machine.py    # polymorphic per-build source VM backend
+│       └── transforms/            # scope rename, strings, MBA, CF, semantic noise
 ├── storage/                      # permittedKeys.txt, storedscript.lua, test scripts for createpanel
 ├── .env.example
 ├── requirements.txt
@@ -218,3 +227,14 @@ never sets one just can't use that specific provider, and gets a clear,
 named error the moment someone actually picks it, not a startup failure:
 `TINYURL_API_KEY`, `CATBOX_USERHASH` (optional even when using Catbox --
 uploads are anonymous by default), and `PASTE_EE_API_KEY`
+## Luau source obfuscation
+
+`/obfuscate` accepts a required Luau source-file attachment and returns a newly randomized `protected_<random>.luau` attachment. The command is a thin Discord layer; the compiler lives under `src/obfuscator/` and uses a real Luau Tree-sitter grammar rather than regex/string replacement.
+
+The pipeline is staged and reparsed after structural transformations. The current default profile performs scope-aware local renaming, build-polymorphic semantic-noise injection, randomized MBA-style integer identities, multiple forms of truthiness-preserving control-flow expression rewriting, and a polymorphic string pool whose literals are split into independently encoded fragments.
+
+The VM layer is intentionally a source VM rather than a claim to reproduce Luau's native bytecode. Every build gets a new instruction graph and a new runtime surface: physical instruction order is shuffled, the eight-field record schema is permuted, virtual opcode values are randomized, program-counter edges are masked, reachable shadow operations and opaque branches are inserted, four decoder families are emitted, payload words are permuted and lane-masked, and the dispatcher shape is selected from multiple generated templates. The generated runtime performs keyed integrity verification before invoking Luau's native `loadstring`/`load`.
+
+This architecture is deliberately closer to the style of dense interpreter-based obfuscators: the runtime is a generated handler table plus a private state machine rather than one fixed bootstrap block. The goal is to remove stable signatures across builds, not to claim impossible-to-reverse-engineer code. A runtime-controlled attacker can still instrument the process after plaintext reconstruction.
+
+The obfuscator requires `tree-sitter==0.22.3` and `tree-sitter-luau==1.2.0`.
