@@ -1,7 +1,7 @@
 """
 Entry point. Everything else in this package is a library (api/) or an
 extension (commands/); this is the only file that actually constructs the
-Client, wires the 17 extensions into it, and calls bot.run().
+Client, wires the command extensions into it, and calls bot.run().
 
 Run from the repo root with `python src/start.py` (after `pip install -r
 requirements.txt` and filling in `.env`).
@@ -89,6 +89,7 @@ EXTENSIONS = (
     "commands.qrcode",
     "commands.warnings",
     "commands.url",
+    "commands.obfuscate",
 )
 
 # Guards the BotState.json reconciliation block in on_ready() so it only
