@@ -1,8 +1,9 @@
 """Configuration for the Celestial Luau source protection pipeline.
 
 The default Discord profile is intentionally semantic-safe: it does not rewrite
-user identifiers, conditions, numeric literals, strings, or comments. The
-polymorphic VM still virtualizes and encrypts the complete original source.
+user identifiers, conditions, numeric literals, strings, or comments. Virtualization
+uses the comprehensive custom Luau-to-bytecode backend first; only constructs that
+require runtime semantics outside the VM fall back to the legacy encrypted source VM.
 Experimental source transforms remain available for controlled/offline use.
 """
 
@@ -13,11 +14,10 @@ from dataclasses import dataclass
 class ObfuscationConfig:
     """Build-time switches.
 
-    `semantic_safe=True` is the default because arbitrary Luau can contain
-    dynamic callbacks, metatables, overloaded operators, executor globals,
-    debug-sensitive code, and other constructs that cannot be proven safe by a
-    syntax-only rewrite. In that profile the source is kept byte-for-byte
-    intact and protection happens in the polymorphic VM layer.
+    `semantic_safe=True` is the default because the source itself is not rewritten.
+    The VM backend lowers normal Luau syntax into custom bytecode; only runtime
+    facilities that cannot be represented without changing semantics use the legacy
+    source VM.
     """
 
     semantic_safe: bool = True
