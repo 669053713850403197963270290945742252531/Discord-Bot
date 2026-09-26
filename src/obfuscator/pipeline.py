@@ -43,6 +43,12 @@ class ObfuscationStats:
     anti_tamper_checks: int = 0
     payload_layers: int = 0
     source_complexity: int = 0
+    vm_compression_requested: bool = False
+    vm_compression_applied: bool = False
+    vm_compression_source_bytes: int = 0
+    vm_compression_payload_bytes: int = 0
+    vm_compression_baseline_output_bytes: int = 0
+    vm_compression_saved_bytes: int = 0
 
 
 @dataclass(slots=True)
@@ -255,13 +261,13 @@ def obfuscate(source_text: str | bytes, *, config: ObfuscationConfig = DEFAULT_C
     # custom environments, and debug-sensitive code. When semantic_safe is
     # disabled, the experimental AST passes below can be enabled individually.
     source_phase = not config.semantic_safe
+    current_source = source
 
     if source_phase and config.strip_comments:
-        edits = _comment_edits(current)
-        current_source = SourceGenerator(source).apply(edits)
+        parsed_stage = parse(current_source).syntax
+        edits = _comment_edits(parsed_stage)
+        current_source = SourceGenerator(current_source).apply(edits)
         all_edit_count += len(edits)
-    else:
-        current_source = source
 
     # Synthetic noise is deliberately kept outside the AST rewrite pipeline.
     # Parsing a large generated wrapper together with user code makes a parser
@@ -316,6 +322,12 @@ def obfuscate(source_text: str | bytes, *, config: ObfuscationConfig = DEFAULT_C
     runtime_layers = decoder_variants = opaque_edges = payload_blocks = micro_ops = 0
     control_flow_decoys = dead_code_blocks = anti_tamper_checks = payload_layers = 0
     source_complexity = 0
+    vm_compression_requested = bool(config.vm_compression)
+    vm_compression_applied = False
+    vm_compression_source_bytes = 0
+    vm_compression_payload_bytes = 0
+    vm_compression_baseline_output_bytes = 0
+    vm_compression_saved_bytes = 0
     if config.virtualize:
         vm = build_vm(
             current_source,
@@ -325,6 +337,7 @@ def obfuscate(source_text: str | bytes, *, config: ObfuscationConfig = DEFAULT_C
             dead_code_blocks=config.dead_code_blocks,
             anti_tamper_checks=config.anti_tamper_checks,
             payload_layers=config.payload_layers,
+            vm_compression=config.vm_compression,
         )
         output = vm.source.encode("utf-8")
         vm_instructions = vm.instruction_count
@@ -338,6 +351,28 @@ def obfuscate(source_text: str | bytes, *, config: ObfuscationConfig = DEFAULT_C
         anti_tamper_checks = vm.anti_tamper_checks
         payload_layers = vm.payload_layers
         source_complexity = vm.complexity_score
+        vm_compression_applied = vm.compression_applied
+        vm_compression_source_bytes = vm.compression_input_bytes
+        vm_compression_payload_bytes = vm.compressed_payload_bytes
+
+        # Build an identical non-compressed artifact with the same seed so the
+        # command can report whether compression actually reduced the final
+        # protected file, rather than merely reporting that the payload codec
+        # found a shorter intermediate representation. The disabled build uses
+        # the same source and complexity profile.
+        if config.vm_compression:
+            baseline_vm = build_vm(
+                current_source,
+                seed=seed,
+                junk=config.junk_instructions,
+                control_flow_decoys=config.control_flow_decoys,
+                dead_code_blocks=config.dead_code_blocks,
+                anti_tamper_checks=config.anti_tamper_checks,
+                payload_layers=config.payload_layers,
+                vm_compression=False,
+            )
+            vm_compression_baseline_output_bytes = len(baseline_vm.source.encode("utf-8"))
+            vm_compression_saved_bytes = vm_compression_baseline_output_bytes - len(output)
     else:
         output = current_source
 
@@ -363,6 +398,12 @@ def obfuscate(source_text: str | bytes, *, config: ObfuscationConfig = DEFAULT_C
         anti_tamper_checks=anti_tamper_checks,
         payload_layers=payload_layers,
         source_complexity=source_complexity,
+        vm_compression_requested=vm_compression_requested,
+        vm_compression_applied=vm_compression_applied,
+        vm_compression_source_bytes=vm_compression_source_bytes,
+        vm_compression_payload_bytes=vm_compression_payload_bytes,
+        vm_compression_baseline_output_bytes=vm_compression_baseline_output_bytes,
+        vm_compression_saved_bytes=vm_compression_saved_bytes,
     )
     return ObfuscationResult(output, seed, stats)
 

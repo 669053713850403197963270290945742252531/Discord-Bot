@@ -34,6 +34,10 @@ class VMArtifact:
     anti_tamper_checks: int
     payload_layers: int
     complexity_score: int
+    compression_requested: bool
+    compression_applied: bool
+    compression_input_bytes: int
+    compressed_payload_bytes: int
 
 
 @dataclass(frozen=True, slots=True)
@@ -440,6 +444,72 @@ def _num(value: int) -> str:
     return str(_u32(value))
 
 
+def _lua_string_literal(value: str) -> str:
+    """Emit a safe quoted Luau string literal for generated metadata."""
+    escaped = (
+        value.replace("\\", "\\\\")
+        .replace('"', '\\"')
+        .replace("\r", "\\r")
+        .replace("\n", "\\n")
+    )
+    return f'"{escaped}"'
+
+
+def _compress_lz(source: bytes) -> bytes:
+    """Small lossless LZ-style codec used by the optional VM compression layer."""
+    if not source:
+        return b""
+
+    out = bytearray()
+    positions: dict[bytes, int] = {}
+    literal_start = 0
+    i = 0
+
+    def flush_literals(end: int) -> None:
+        nonlocal literal_start
+        cursor = literal_start
+        while cursor < end:
+            length = min(128, end - cursor)
+            out.append(length - 1)
+            out.extend(source[cursor : cursor + length])
+            cursor += length
+        literal_start = end
+
+    while i < len(source):
+        best_pos = -1
+        best_len = 0
+        if i + 3 <= len(source):
+            key = source[i : i + 3]
+            candidate = positions.get(key)
+            if candidate is not None and i - candidate <= 4095:
+                max_len = min(131, len(source) - i)
+                length = 3
+                while length < max_len and source[candidate + length] == source[i + length]:
+                    length += 1
+                if length >= 4:
+                    best_pos = candidate
+                    best_len = length
+
+        if best_len >= 4:
+            flush_literals(i)
+            out.append(0x80 | (best_len - 4))
+            offset = i - best_pos
+            out.append(offset & 0xFF)
+            out.append((offset >> 8) & 0x0F)
+            for p in range(i, min(len(source) - 2, i + best_len)):
+                positions[source[p : p + 3]] = p
+            i += best_len
+            literal_start = i
+            continue
+
+        if i + 3 <= len(source):
+            positions[source[i : i + 3]] = i
+        i += 1
+
+    flush_literals(len(source))
+    return bytes(out)
+
+
 def build_vm(
     source: bytes,
     *,
@@ -449,6 +519,7 @@ def build_vm(
     dead_code_blocks: int = 12,
     anti_tamper_checks: int = 4,
     payload_layers: int = 2,
+    vm_compression: bool = False,
 ) -> VMArtifact:
     rng = random.Random(seed ^ 0xC0DE5A17)
     root_key = rng.randrange(1, MASK32)
@@ -473,6 +544,28 @@ def build_vm(
         value = byte ^ (recovery_stream & 0xFF)
         value ^= ((i * recovery_step + recovery_salt) & 0xFF)
         recovery_payload.append(value & 0xFF)
+    compressed_source = _compress_lz(source) if vm_compression else source
+    compression_applied = bool(vm_compression and len(compressed_source) < len(source))
+    payload_source = compressed_source if compression_applied else source
+    if compression_applied:
+        recovery_payload = []
+        recovery_stream = _u32(recovery_key ^ recovery_seed)
+        for i, byte in enumerate(payload_source):
+            recovery_stream = _xorshift32(
+                _u32(recovery_stream ^ ((i + 1) * 0x9E3779B9) ^ recovery_salt),
+                recovery_shifts,
+            )
+            value = byte ^ (recovery_stream & 0xFF)
+            value ^= ((i * recovery_step + recovery_salt) & 0xFF)
+            recovery_payload.append(value & 0xFF)
+    recovery_length = len(recovery_payload)
+    if vm_compression:
+        recovery_words = [
+            sum(recovery_payload[i + lane] << (lane * 8) for lane in range(4) if i + lane < recovery_length)
+            for i in range(0, recovery_length, 4)
+        ] or [0]
+    else:
+        recovery_words = []
 
     # First derive the source's structural complexity and then choose a fresh
     # randomized budget range for every major VM subsystem. The configured
@@ -504,7 +597,7 @@ def build_vm(
     decoder_shifts = decoder_shifts[:selected_decoder_variants]
 
     chunk_size = budget.selected_chunk_size
-    chunks = [source[i : i + chunk_size] for i in range(0, len(source), chunk_size)] or [b""]
+    chunks = [payload_source[i : i + chunk_size] for i in range(0, len(payload_source), chunk_size)] or [b""]
 
     # Random build-level masks.
     op_mask = rng.randrange(1, 256)
@@ -526,7 +619,7 @@ def build_vm(
     # are still masked with op_mask.
     virtual_ops: dict[str, int] = {}
     used_ops: set[int] = set()
-    for logical in ("init", "decode", "mix", "branch", "verify", "exec", "halt"):
+    for logical in ("init", "decode", "mix", "relay", "branch", "verify", "exec", "halt"):
         value = rng.randrange(3, 253)
         while value in used_ops:
             value = rng.randrange(3, 253)
@@ -587,6 +680,24 @@ def build_vm(
         )
         graph[previous - 1]["next"] = decode_idx
         previous = decode_idx
+
+        # Automatic Intense VM Structure: every real payload block passes through
+        # multiple opaque relay layers before any ordinary VM junk/branch island.
+        # These layers mutate only the private VM shadow state, never the payload.
+        intense_layers = rng.randint(2, 2 + min(2, budget.score // 50))
+        for _ in range(intense_layers):
+            relay_idx = add(
+                op=virtual_ops["relay"],
+                next=0,
+                alt=0,
+                a0=rng.randrange(1, MASK32),
+                a1=rng.randrange(1, MASK32),
+                meta=rng.randrange(1, MASK32),
+                payload=[],
+                check=0,
+            )
+            graph[previous - 1]["next"] = relay_idx
+            previous = relay_idx
 
         # A randomized number of reachable shadow operations follows real work.
         # They mutate only an opaque accumulator, so the reconstructed source
@@ -736,15 +847,16 @@ def build_vm(
         "word", "lane", "original", "stream", "value", "next", "target", "variant", "meta", "rotate",
         "add", "step", "inverse", "permadd", "key", "len", "check", "plaintext", "fieldop", "fieldnext",
         "fieldalt", "fielda0", "fielda1", "fieldmeta", "fieldpayload", "fieldcheck", "entry", "counter", "loader", "pack", "unpack", "returns", "lane_mask",
-        "active", "tamper", "guard", "boot", "schema_guard", "record_seal", "sample_table", "sample_index", "sample_record", "check_tick", "layer_seed", "layer_mode", "layer_rotate", "layer_add", "layer_step", "layer_sa", "layer_sb", "layer_sc", "stream2", "keybyte", "posadd", "decoy", "recovery", "recovery_payload", "executed",
+        "active", "tamper", "guard", "boot", "schema_guard", "record_seal", "sample_table", "sample_index", "sample_record", "check_tick", "layer_seed", "layer_mode", "layer_rotate", "layer_add", "layer_step", "layer_sa", "layer_sb", "layer_sc", "stream2", "keybyte", "posadd", "decoy", "recovery", "recovery_payload", "recovery_words", "recovery_length", "chunk_name", "error", "byte", "sub", "decompress", "relay", "executed",
     )}
 
     # Runtime uses these aliases in deliberately non-obvious combinations.
     alias_setup = (
         f"local {n['bit']}=bit32;local {n['bxor']}={n['bit']}.bxor;local {n['band']}={n['bit']}.band;"
         f"local {n['bor']}={n['bit']}.bor;local {n['lshift']}={n['bit']}.lshift;local {n['rshift']}={n['bit']}.rshift;"
-        f"local {n['char']}=string.char;local {n['concat']}=table.concat;local {n['loader']}=loadstring;"
+        f"local {n['char']}=string.char;local {n['byte']}=string.byte;local {n['sub']}=string.sub;local {n['concat']}=table.concat;local {n['loader']}=loadstring or load;"
         f"local {n['pack']}=table.pack or function(...)return {{n=select('#',...),...}}end;local {n['unpack']}=table.unpack or unpack;"
+        f"local {n['error']}=error;"
     )
 
     # Encode physical records with randomized field placement.
@@ -886,20 +998,33 @@ def build_vm(
         f"{n['shadow']}={n['bxor']}({n['shadow']},{n['lshift']}(a,3),{n['rshift']}(b,5));"
         f"return r[{field['next']}] end"
     )
+    handler_defs["relay"] = (
+        f"function(r)local a={n['bxor']}(r[{field['a0']}],{_num(arg_mask)});local b={n['bxor']}(r[{field['a1']}],{_num(arg_mask)});local m={n['bxor']}(r[{field['meta']}],{_num(meta_mask)});"
+        f"local x={n['bxor']}({n['shadow']},a,m);x={n['bxor']}(x,{n['lshift']}(a,5),{n['rshift']}(b,7));"
+        f"x={n['bxor']}(x,{n['lshift']}(x,13));x={n['bxor']}(x,{n['rshift']}(x,11));"
+        f"{n['shadow']}={n['bxor']}(x,b,{n['lshift']}(m,3),{_num(shadow_salt)});return r[{field['next']}] end"
+    )
     handler_defs["branch"] = (
         f"function(r)local q={n['bxor']}({n['shadow']},{_num(shadow_salt)});local choose={n['band']}(q,1)==0;"
         f"local target=choose and r[{field['next']}] or r[{field['alt']}];return target end"
     )
     handler_defs["verify"] = (
         f"function(r)local expected={n['bxor']}(r[{field['a0']}],{_num(arg_mask)});if #{n['out']}~={len(chunks)} then return {n['tamper']}() end;"
-        f"local bytes=0;for i=1,#{n['out']} do bytes=bytes+#({n['out']}[i]) end;if bytes~={len(source)} then return {n['tamper']}() end;"
-        f"local got={n['hash']}({n['concat']}({n['out']}),{_num(root_key)});if got~=expected then return {n['tamper']}() end;"
+        f"local packed={n['concat']}({n['out']});local code=packed;"
+        + (f"code={n['decompress']}(packed);" if compression_applied else "") +
+        f"if #code~={len(source)} then return {n['tamper']}() end;"
+        f"local got={n['hash']}(code,{_num(root_key)});if got~=expected then return {n['tamper']}() end;"
         f"return r[{field['next']}] end"
     )
-    handler_defs["exec"] = (
-        f"function(r)if not {n['loader']} then error({n['concat']}({n['char']}({rng.randrange(97,122)},{rng.randrange(97,122)}))) end;"
-        f"local fn,err={n['loader']}({n['concat']}({n['out']}));if not fn then error(err)end;{n['executed']}=true;{n['returns']}={n['pack']}(fn());return 0 end"
+    generated_chunk_name = f"=CelestialProtected_{rng.randrange(0x1000000):06x}"
+    exec_body = (
+        f"function(r)if not {n['loader']} then {n['error']}({n['concat']}({n['char']}({rng.randrange(97,122)},{rng.randrange(97,122)}))) end;"
+        f"local code={n['concat']}({n['out']});"
+        + (f"code={n['decompress']}(code);" if compression_applied else "") +
+        f"local fn,err={n['loader']}(code,{n['chunk_name']});if not fn then {n['error']}(err) end;"
+        f"{n['executed']}=true;{n['returns']}={n['pack']}(fn());return 0 end"
     )
+    handler_defs["exec"] = exec_body
     handler_defs["halt"] = "function(r)return 0 end"
 
     handler_order = list(handler_defs)
@@ -961,8 +1086,13 @@ def build_vm(
         + f"local {n['records']}={records_literal};local {n['handlers']}={{}};local {n['schema']}={schema_literal};"
         + f"local {n['active']}={active_ops_literal};local {n['out']}={{}};local {n['state']}={_num(pc_mask ^ entry_physical)};local {n['shadow']}={_num(root_key ^ shadow_salt)};"
         + f"local {n['returns']}=nil;local {n['counter']}=0;local {n['check_tick']}=0;local {n['executed']}=false;"
-        + f"local {n['recovery_payload']}={{{','.join(_num(v) for v in recovery_payload)}}};"
-        + f"local function {n['tamper']}() error({n['concat']}({n['char']}({rng.randrange(84,91)},{rng.randrange(97,123)},{rng.randrange(97,123)},{rng.randrange(97,123)}))) end;"
+        + (
+            f"local {n['recovery_words']}={{{','.join(_num(v) for v in recovery_words)}}};local {n['recovery_length']}={_num(recovery_length)};"
+            if vm_compression else
+            f"local {n['recovery_payload']}={{{','.join(_num(v) for v in recovery_payload)}}};"
+        )
+        + f"local {n['chunk_name']}={_lua_string_literal(generated_chunk_name)};"
+        + f"local function {n['tamper']}() {n['error']}({n['concat']}({n['char']}({rng.randrange(84,91)},{rng.randrange(97,123)},{rng.randrange(97,123)},{rng.randrange(97,123)}))) end;"
         + f"local function {n['guard']}(opv,np,ap,a0v,a1v,mv)local h={n['bxor']}({_num(root_key ^ 0xA1B2C3D4)},0);"
         + f"h={n['bxor']}(h,opv);h={n['bxor']}(h,{n['lshift']}(h,5));h={n['bxor']}(h,{n['rshift']}(h,7));h={n['bxor']}(h,{n['lshift']}(h,11));h=(h+{_num(0x7F4A7C15)})%4294967296;"
         + f"h={n['bxor']}(h,np);h={n['bxor']}(h,{n['lshift']}(h,5));h={n['bxor']}(h,{n['rshift']}(h,7));h={n['bxor']}(h,{n['lshift']}(h,11));h=(h+{_num(0x7F4A7C15)})%4294967296;"
@@ -975,11 +1105,25 @@ def build_vm(
         + f"{hash_fn}"
     )
 
+    compression_runtime = (
+        f"local function {n['decompress']}(data)local out={{}};local pos=1;while pos<=#data do "
+        f"local control={n['byte']}(data,pos);pos=pos+1;"
+        f"if control<128 then local length=control+1;if pos+length-1>#data then {n['error']}('Corrupt compressed payload',0) end;"
+        f"for j=0,length-1 do out[#out+1]={n['char']}({n['byte']}(data,pos+j)) end;pos=pos+length;"
+        f"else local length={n['band']}({n['band']}(control,127),127)+4;if pos+1>#data then {n['error']}('Corrupt compressed payload',0) end;"
+        f"local offset={n['byte']}(data,pos)+{n['byte']}(data,pos+1)*256;pos=pos+2;local start=#out-offset+1;"
+        f"if offset<1 or start<1 then {n['error']}('Corrupt compressed payload',0) end;"
+        f"for j=0,length-1 do out[#out+1]=out[start+j] end;end;end;"
+        f"return {n['concat']}(out)end;"
+    ) if compression_applied else ""
+
     # Distribute inactive handler bodies through the runtime. Decoder locals must
     # remain before the active decode handler, but dead handlers can safely appear
     # between decoder/handler sections because they only depend on aliases from
     # the header.
     runtime_parts: list[str] = [header]
+    if compression_runtime:
+        runtime_parts.append(compression_runtime)
     remaining_dead = list(dead_parts)
     for decoder in decoder_functions:
         runtime_parts.append(decoder)
@@ -1049,16 +1193,35 @@ def build_vm(
         f"if {n['fail']}~=0 then {n['shadow']}={n['fail']} end;"
     )
 
+    if vm_compression:
+        recovery_decode_loop = (
+            f"for wi=1,#{n['recovery_words']} do local raw={n['recovery_words']}[wi];"
+            f"for lane=0,3 do local i=(wi-1)*4+lane+1;if i<={n['recovery_length']} then "
+            f"stream={n['bxor']}(stream,((i*{_num(0x9E3779B9)})%4294967296),{_num(recovery_salt)});"
+            f"stream={n['bxor']}(stream,{n['lshift']}(stream,17));stream={n['bxor']}(stream,{n['rshift']}(stream,7));stream={n['bxor']}(stream,{n['lshift']}(stream,11));"
+            f"local v={n['band']}({n['rshift']}(raw,lane*8),255);v={n['bxor']}(v,(((i-1)*{_num(recovery_step)}+{_num(recovery_salt)})%256));"
+            f"chars[i]={n['char']}({n['bxor']}(v,{n['band']}(stream,255)));end;end;end;"
+        )
+    else:
+        recovery_decode_loop = (
+            f"for i=1,#{n['recovery_payload']} do "
+            f"stream={n['bxor']}(stream,((i*{_num(0x9E3779B9)})%4294967296),{_num(recovery_salt)});"
+            f"stream={n['bxor']}(stream,{n['lshift']}(stream,17));stream={n['bxor']}(stream,{n['rshift']}(stream,7));stream={n['bxor']}(stream,{n['lshift']}(stream,11));"
+            f"local v={n['recovery_payload']}[i];v={n['bxor']}(v,(((i-1)*{_num(recovery_step)}+{_num(recovery_salt)})%256));"
+            f"chars[i]={n['char']}({n['bxor']}(v,{n['band']}(stream,255))) end;"
+        )
+    recovery_exec = (
+        f"local code={n['concat']}(chars);"
+        + (f"code={n['decompress']}(code);" if compression_applied else "") +
+        f"local fn,err={n['loader']}(code,{n['chunk_name']});if not fn then {n['error']}(err) end;"
+        f"{n['executed']}=true;{n['returns']}={n['pack']}(fn());"
+    )
     recovery_fn = (
         f"local function {n['recovery']}()"
         f"local stream={n['bxor']}({_num(recovery_key)},{_num(recovery_seed)});local chars={{}};"
-        f"for i=1,#{n['recovery_payload']} do "
-        f"stream={n['bxor']}(stream,((i*{_num(0x9E3779B9)})%4294967296),{_num(recovery_salt)});"
-        f"stream={n['bxor']}(stream,{n['lshift']}(stream,17));stream={n['bxor']}(stream,{n['rshift']}(stream,7));stream={n['bxor']}(stream,{n['lshift']}(stream,11));"
-        f"local v={n['recovery_payload']}[i];v={n['bxor']}(v,(((i-1)*{_num(recovery_step)}+{_num(recovery_salt)})%256));"
-        f"chars[i]={n['char']}({n['bxor']}(v,{n['band']}(stream,255))) end;"
-        f"local fn,err={n['loader']}({n['concat']}(chars));if not fn then error(err)end;"
-        f"{n['executed']}=true;{n['returns']}={n['pack']}(fn());end;"
+        + recovery_decode_loop +
+        recovery_exec +
+        f"end;"
     )
     runtime += recovery_fn
     exit_values = f"if not {n['executed']} then {n['recovery']}() end;if {n['returns']}~=nil then return {n['unpack']}({n['returns']},1,{n['returns']}.n) end;"
@@ -1073,6 +1236,7 @@ def build_vm(
         virtual_ops["init"]: 3,
         virtual_ops["decode"]: 12,
         virtual_ops["mix"]: 4,
+        virtual_ops["relay"]: 10,
         virtual_ops["branch"]: 6,
         virtual_ops["verify"]: 14,
         virtual_ops["exec"]: 7,
@@ -1087,6 +1251,7 @@ def build_vm(
     runtime_layer_count += 1  # records/schema layer
     runtime_layer_count += len(decoder_functions)
     runtime_layer_count += 1  # handler layer
+    runtime_layer_count += 1  # automatic Intense VM Structure relay layer
     if dead_opcodes:
         runtime_layer_count += 1
     if branch_nodes:
@@ -1097,6 +1262,8 @@ def build_vm(
         runtime_layer_count += 1
     runtime_layer_count += 1  # native execution layer
     runtime_layer_count += 1  # independent recovery execution layer
+    if compression_applied:
+        runtime_layer_count += 1  # source compression/decompression layer
 
     emitted_tamper_sites = 0
     emitted_tamper_sites += 1  # schema guard
@@ -1125,4 +1292,8 @@ def build_vm(
         anti_tamper_checks=emitted_tamper_sites,
         payload_layers=selected_payload_layers,
         complexity_score=budget.score,
+        compression_requested=bool(vm_compression),
+        compression_applied=compression_applied,
+        compression_input_bytes=len(source),
+        compressed_payload_bytes=len(payload_source),
     )
