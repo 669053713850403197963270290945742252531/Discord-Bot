@@ -23,7 +23,8 @@ class ObfuscationConfig:
     semantic_safe: bool = True
 
     # Experimental source transforms. These are ignored while semantic_safe is
-    # enabled and can be enabled together for controlled testing.
+    # enabled. Experimental source transforms remain opt-in for controlled
+    # offline use.
     rename_locals: bool = False
     encrypt_strings: bool = False
     obfuscate_integer_constants: bool = False
@@ -31,6 +32,7 @@ class ObfuscationConfig:
     strip_comments: bool = False
 
     virtualize: bool = True
+    vm_compression: bool = False
     # VM values below are baseline intensity anchors. build_vm derives a
     # source-complexity profile and converts each anchor into a randomized
     # per-build range before selecting the actual budget.
