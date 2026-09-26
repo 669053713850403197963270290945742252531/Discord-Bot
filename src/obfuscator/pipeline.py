@@ -1,4 +1,4 @@
-"""Obfuscation pipeline: parse -> AST transforms -> source generation -> VM."""
+"""Obfuscation pipeline: parse -> optional AST transforms -> custom bytecode VM, with source-VM fallback."""
 
 from __future__ import annotations
 
@@ -8,6 +8,8 @@ import re
 from dataclasses import dataclass
 
 from .ast import Edit
+from .bytecode_compiler import UnsupportedLuau, compile_luau
+from .bytecode_vm import build_bytecode_vm
 from .config import DEFAULT_CONFIG, ObfuscationConfig
 from .generator import SourceGenerator
 from .lexer import scan_tokens
@@ -49,6 +51,12 @@ class ObfuscationStats:
     vm_compression_payload_bytes: int = 0
     vm_compression_baseline_output_bytes: int = 0
     vm_compression_saved_bytes: int = 0
+    vm_backend: str = "Source Payload VM"
+    vm_fallback: bool = False
+    vm_fallback_reason: str = ""
+    bytecode_functions: int = 0
+    bytecode_constants: int = 0
+    bytecode_registers: int = 0
 
 
 @dataclass(slots=True)
@@ -328,17 +336,68 @@ def obfuscate(source_text: str | bytes, *, config: ObfuscationConfig = DEFAULT_C
     vm_compression_payload_bytes = 0
     vm_compression_baseline_output_bytes = 0
     vm_compression_saved_bytes = 0
+    vm_backend = "Source Payload VM"
+    vm_fallback = False
+    vm_fallback_reason = ""
+    bytecode_functions = 0
+    bytecode_constants = 0
+    bytecode_registers = 0
+    compiled_program = None
+
     if config.virtualize:
-        vm = build_vm(
-            current_source,
-            seed=seed,
-            junk=config.junk_instructions,
-            control_flow_decoys=config.control_flow_decoys,
-            dead_code_blocks=config.dead_code_blocks,
-            anti_tamper_checks=config.anti_tamper_checks,
-            payload_layers=config.payload_layers,
-            vm_compression=config.vm_compression,
-        )
+        # First attempt real program virtualization. The compiler is grammar-driven
+        # and covers the normal Luau statement/expression surface, including
+        # closures, methods, multiple returns, tables, loops, assignments,
+        # compound assignments, casts, interpolation, and Luau type syntax.
+        # Only genuinely unsupported runtime semantics use the legacy backend.
+        try:
+            parsed_for_vm = parse(current_source)
+            compiled_program = compile_luau(parsed_for_vm.syntax)
+            vm = build_bytecode_vm(
+                compiled_program,
+                source=current_source,
+                seed=seed,
+                junk=config.junk_instructions,
+                control_flow_decoys=config.control_flow_decoys,
+                dead_code_blocks=config.dead_code_blocks,
+                anti_tamper_checks=config.anti_tamper_checks,
+                payload_layers=config.payload_layers,
+                vm_compression=config.vm_compression,
+            )
+            vm_backend = "Custom Bytecode VM"
+            bytecode_functions = vm.compiled_functions
+            bytecode_constants = vm.constant_pool_entries
+            bytecode_registers = vm.max_registers
+        except UnsupportedLuau as exc:
+            vm_fallback = True
+            vm_fallback_reason = str(exc)
+            vm = build_vm(
+                current_source,
+                seed=seed,
+                junk=config.junk_instructions,
+                control_flow_decoys=config.control_flow_decoys,
+                dead_code_blocks=config.dead_code_blocks,
+                anti_tamper_checks=config.anti_tamper_checks,
+                payload_layers=config.payload_layers,
+                vm_compression=config.vm_compression,
+            )
+        except (TypeError, ValueError) as exc:
+            # Keep command reliability, but do not mislabel an internal compiler
+            # defect as a source-language limitation. Genuine unsupported source
+            # reaches the UnsupportedLuau branch above.
+            vm_fallback = True
+            vm_fallback_reason = f"custom bytecode compiler internal error: {type(exc).__name__}: {exc}"
+            vm = build_vm(
+                current_source,
+                seed=seed,
+                junk=config.junk_instructions,
+                control_flow_decoys=config.control_flow_decoys,
+                dead_code_blocks=config.dead_code_blocks,
+                anti_tamper_checks=config.anti_tamper_checks,
+                payload_layers=config.payload_layers,
+                vm_compression=config.vm_compression,
+            )
+
         output = vm.source.encode("utf-8")
         vm_instructions = vm.instruction_count
         runtime_layers = vm.runtime_layers
@@ -355,22 +414,30 @@ def obfuscate(source_text: str | bytes, *, config: ObfuscationConfig = DEFAULT_C
         vm_compression_source_bytes = vm.compression_input_bytes
         vm_compression_payload_bytes = vm.compressed_payload_bytes
 
-        # Build an identical non-compressed artifact with the same seed so the
-        # command can report whether compression actually reduced the final
-        # protected file, rather than merely reporting that the payload codec
-        # found a shorter intermediate representation. The disabled build uses
-        # the same source and complexity profile.
         if config.vm_compression:
-            baseline_vm = build_vm(
-                current_source,
-                seed=seed,
-                junk=config.junk_instructions,
-                control_flow_decoys=config.control_flow_decoys,
-                dead_code_blocks=config.dead_code_blocks,
-                anti_tamper_checks=config.anti_tamper_checks,
-                payload_layers=config.payload_layers,
-                vm_compression=False,
-            )
+            if compiled_program is not None and vm_backend == "Custom Bytecode VM":
+                baseline_vm = build_bytecode_vm(
+                    compiled_program,
+                    source=current_source,
+                    seed=seed,
+                    junk=config.junk_instructions,
+                    control_flow_decoys=config.control_flow_decoys,
+                    dead_code_blocks=config.dead_code_blocks,
+                    anti_tamper_checks=config.anti_tamper_checks,
+                    payload_layers=config.payload_layers,
+                    vm_compression=False,
+                )
+            else:
+                baseline_vm = build_vm(
+                    current_source,
+                    seed=seed,
+                    junk=config.junk_instructions,
+                    control_flow_decoys=config.control_flow_decoys,
+                    dead_code_blocks=config.dead_code_blocks,
+                    anti_tamper_checks=config.anti_tamper_checks,
+                    payload_layers=config.payload_layers,
+                    vm_compression=False,
+                )
             vm_compression_baseline_output_bytes = len(baseline_vm.source.encode("utf-8"))
             vm_compression_saved_bytes = vm_compression_baseline_output_bytes - len(output)
     else:
@@ -404,6 +471,12 @@ def obfuscate(source_text: str | bytes, *, config: ObfuscationConfig = DEFAULT_C
         vm_compression_payload_bytes=vm_compression_payload_bytes,
         vm_compression_baseline_output_bytes=vm_compression_baseline_output_bytes,
         vm_compression_saved_bytes=vm_compression_saved_bytes,
+        vm_backend=vm_backend,
+        vm_fallback=vm_fallback,
+        vm_fallback_reason=vm_fallback_reason,
+        bytecode_functions=bytecode_functions,
+        bytecode_constants=bytecode_constants,
+        bytecode_registers=bytecode_registers,
     )
     return ObfuscationResult(output, seed, stats)
 

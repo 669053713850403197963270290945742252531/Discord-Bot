@@ -179,6 +179,33 @@ async def _run_obfuscation(
         )
     else:
         compression_summary = "Disabled. No compression codec was added to the VM payload."
+
+    backend_name = result.stats.vm_backend
+    if result.stats.vm_fallback:
+        backend_details = (
+            "Legacy semantic-safe source VM was used. "
+            f"Compiler fallback reason: {result.stats.vm_fallback_reason}"
+        )
+    else:
+        backend_details = (
+            f"Functions: {result.stats.bytecode_functions:,} • "
+            f"Constants: {result.stats.bytecode_constants:,} • "
+            f"Registers: {result.stats.bytecode_registers:,}"
+        )
+    if result.stats.vm_fallback:
+        pipeline_description = (
+            "AST validation → source complexity profiling → adaptive build-budget selection → "
+            "byte-preserving payload capture → adaptive Intense VM Structure → state-machine virtualization → "
+            "control-flow decoys → dead-code insertion → multi-layer payload encryption → "
+            "distributed anti-tamper validation → integrity verification"
+        )
+    else:
+        pipeline_description = (
+            "AST validation → Luau-to-custom-bytecode compilation → encrypted constant pool → "
+            "adaptive Intense VM Structure → randomized register/stack VM → randomized dispatch → "
+            "control-flow decoys → dead-code insertion → encrypted bytecode payload → integrity verification"
+        )
+
     embed = build_embed(
         title="🛡️ Luau Protection Complete",
         description=(
@@ -191,6 +218,7 @@ async def _run_obfuscation(
             ("📦 Protected File", f"`{filename}`", True),
             ("📏 Size", f"{result.stats.input_bytes:,} B → {result.stats.output_bytes:,} B", True),
             ("🧠 Source Complexity", f"{result.stats.source_complexity}/100", True),
+            ("⚙️ VM Backend", backend_name, True),
             (
                 "🗜️ VM Compression",
                 compression_summary,
@@ -202,6 +230,7 @@ async def _run_obfuscation(
             ("🔀 Scrambled Conditions", f"{result.stats.scrambled_conditions:,}", True),
             ("⚙️ VM Instructions", f"{result.stats.vm_instructions:,}", True),
             ("🧩 Runtime Layers", f"{result.stats.runtime_layers:,}", True),
+            ("🧾 Bytecode Details", backend_details, False),
             ("🧬 Decoder Variants", f"{result.stats.decoder_variants:,}", True),
             ("🕸️ Opaque Edges", f"{result.stats.opaque_edges:,}", True),
             ("🌐 Control-Flow Decoys", f"{result.stats.control_flow_decoys:,}", True),
@@ -213,11 +242,6 @@ async def _run_obfuscation(
             ("🔐 String Pool Entries", f"{result.stats.string_pool_parts:,}", True),
             ("🧪 String Decoders", f"{result.stats.string_decoder_variants:,}", True),
             (
-                "⚙️ Build Options",
-                f"VM Compression: {'Enabled' if options.vm_compression else 'Disabled'}",
-                False,
-            ),
-            (
                 "ℹ️ Option Details",
                 (
                     f"**VM Compression:** {VM_COMPRESSION_DESCRIPTION}"
@@ -228,10 +252,7 @@ async def _run_obfuscation(
             ),
             (
                 "🔒 Protection Pipeline",
-                "AST validation → source complexity profiling → adaptive build-budget selection → "
-                "byte-preserving payload capture → Intense VM Structure → state-machine virtualization → "
-                "control-flow decoys → dead-code insertion → multi-layer payload encryption → "
-                "distributed anti-tamper validation → integrity verification",
+                pipeline_description,
                 False,
             ),
         ],
