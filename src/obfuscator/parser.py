@@ -34,18 +34,36 @@ def _build_parser():
     if language_fn is None:
         raise ParserDependencyError("Installed tree-sitter-luau package does not expose language().")
 
+    # `tree-sitter-luau` exposes its grammar as a PyCapsule. The capsule must
+    # be wrapped by the matching `tree_sitter.Language` binding before it is
+    # assigned to a parser. Passing the capsule directly produces:
+    # `set_language() argument must tree_sitter.Language, not PyCapsule`.
     language_obj = language_fn()
     try:
         language = Language(language_obj)
-    except TypeError:
-        language = language_obj
+    except (TypeError, ValueError) as exc:
+        raise ParserDependencyError(
+            "The installed tree-sitter and tree-sitter-luau packages are "
+            "incompatible. Install the pinned versions from requirements.txt: "
+            "tree-sitter==0.25.2 and tree-sitter-luau==1.2.0."
+        ) from exc
 
-    parser = Parser()
-    if hasattr(parser, "set_language"):
-        parser.set_language(language)
-    else:
+    if not isinstance(language, Language):
+        raise ParserDependencyError(
+            "tree-sitter-luau returned a language handle that could not be "
+            "converted into tree_sitter.Language. Install the pinned versions "
+            "from requirements.txt: tree-sitter==0.25.2 and "
+            "tree-sitter-luau==1.2.0."
+        )
+
+    # Parser(language) is the modern API and avoids accidentally handing a
+    # PyCapsule to `set_language()`.
+    try:
+        return Parser(language)
+    except TypeError:
+        parser = Parser()
         parser.language = language
-    return parser
+        return parser
 
 
 def parse(source: bytes) -> ParsedLuau:
