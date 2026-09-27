@@ -163,6 +163,31 @@ def _is_type(node: object) -> bool:
     }
 
 
+
+
+def _looks_like_string_literal(raw: str) -> bool:
+    """Return True when raw source text is one complete Luau string literal.
+
+    Tree-sitter normally labels quoted literals as ``string``.  Keep a lexical
+    fallback because grammar wrappers/aliases can occasionally expose the
+    literal through another node kind; compiling a quoted literal as an
+    identifier changes ``print("x")`` into a global lookup for ``x``.
+    """
+    raw = raw.strip()
+    if len(raw) < 2:
+        return False
+    if raw[0] in {"'", '"', "`"} and raw[-1] == raw[0]:
+        # A trailing quote is enough here because the parser has already
+        # validated the source; this helper only protects the compiler's node
+        # classification.
+        return True
+    if raw[0] == "[":
+        j = 1
+        while j < len(raw) and raw[j] == "=":
+            j += 1
+        return j < len(raw) and raw[j] == "[" and raw.endswith("]" + raw[1:j] + "]")
+    return False
+
 def _is_call(node: object) -> bool:
     return getattr(node, "type", "") == "function_call"
 
@@ -993,6 +1018,12 @@ class _Compiler:
     # -------------------------------- expressions ---------------------------
     def _compile_expr(self, ctx: _FunctionContext, node: object) -> int:
         typ = getattr(node, "type", "")
+        raw = _text(node, self.source).strip()
+        # Grammar revisions can wrap/alias literals differently.  Never let a
+        # quoted value fall through to the identifier path: ``print("x")`` must
+        # produce LOAD_CONST for the second operand, not LOAD_GLOBAL.
+        if typ != "string" and _looks_like_string_literal(raw):
+            return self._compile_string(ctx, node)
         if typ in {"expression", "primary_expression"}:
             children = [c for c in _named_children(node) if not _is_type(c)]
             if len(children) == 1:
@@ -1273,7 +1304,13 @@ class _Compiler:
         args = [c for c in args if not _is_type(c) and getattr(c, "type", "") not in {"comment", ","}]
         method = getattr(name_node, "type", "") == "method_index_expression"
 
-        final_expands = bool(args and (_is_call(args[-1]) or _is_vararg(args[-1])))
+        # Do not trust only the tree-sitter node kind when deciding whether the
+        # final argument expands.  In particular, wrapper/grammar revisions can
+        # expose an argument node with an unexpected type.  The Luau syntax that
+        # actually denotes a variadic argument is exactly `...`; all other source
+        # text (including string literals) must stay a normal single-value arg.
+        final_arg_is_vararg = bool(args and _text(args[-1], self.source).strip() == "...")
+        final_expands = bool(args and (_is_call(args[-1]) or final_arg_is_vararg))
         if final_expands:
             # The call frame starts with a private marker. This is essential for
             # Lua's multiple-return adjustment rules: the final call/vararg can

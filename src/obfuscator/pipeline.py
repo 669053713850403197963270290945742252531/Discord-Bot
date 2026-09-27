@@ -6,6 +6,7 @@ import hashlib
 import random
 import re
 from dataclasses import dataclass
+from collections.abc import Callable
 
 from .ast import Edit
 from .bytecode_compiler import UnsupportedLuau, compile_luau
@@ -247,14 +248,29 @@ def _u32_literal(value: int) -> str:
     return str(value & 0xFFFFFFFF)
 
 
-def obfuscate(source_text: str | bytes, *, config: ObfuscationConfig = DEFAULT_CONFIG) -> ObfuscationResult:
+def obfuscate(
+    source_text: str | bytes,
+    *,
+    config: ObfuscationConfig = DEFAULT_CONFIG,
+    progress_callback: Callable[[str, str], None] | None = None,
+) -> ObfuscationResult:
     source = source_text.encode("utf-8") if isinstance(source_text, str) else bytes(source_text)
+    def progress(stage: str, detail: str) -> None:
+        if progress_callback is not None:
+            try:
+                progress_callback(stage, detail)
+            except Exception:
+                # Progress reporting is intentionally non-critical. A Discord/UI
+                # update must never make the actual obfuscation fail.
+                pass
+
     if len(source) > config.max_input_bytes:
         raise ValueError(f"Input exceeds the {config.max_input_bytes:,}-byte obfuscation limit.")
     if b"\x00" in source:
         raise ValueError("Luau source contains a NUL byte and cannot be safely processed as text.")
 
     seed = int.from_bytes(hashlib.blake2b(source + random.randbytes(16), digest_size=8).digest(), "big")
+    progress("Parsing & validating Luau", "Validating the uploaded source before protection begins.")
     parsed = parse(source)
     current = parsed.syntax
     all_edit_count = 0
@@ -270,6 +286,9 @@ def obfuscate(source_text: str | bytes, *, config: ObfuscationConfig = DEFAULT_C
     # disabled, the experimental AST passes below can be enabled individually.
     source_phase = not config.semantic_safe
     current_source = source
+
+    if source_phase:
+        progress("Preparing source transformations", "Applying the enabled source-level protection passes before virtualization.")
 
     if source_phase and config.strip_comments:
         parsed_stage = parse(current_source).syntax
@@ -318,12 +337,15 @@ def obfuscate(source_text: str | bytes, *, config: ObfuscationConfig = DEFAULT_C
         all_edit_count += len(edits)
         current_source = _replace_markers(current_source, string_payloads, seed)
 
+    progress("Re-validating protected source", "Checking the transformed source before it enters the VM backend.")
+
     # Always validate the actual user payload before handing it to the VM. In
     # semantic-safe mode this is the original source; in experimental mode it
     # is the transformed source.
     parse(current_source)
 
     if noise_source:
+        progress("Injecting protected scaffolding", "Adding the generated runtime scaffolding around the user payload.")
         current_source = noise_source.encode() + b"\n" + current_source
 
     vm_instructions = 0
@@ -345,6 +367,7 @@ def obfuscate(source_text: str | bytes, *, config: ObfuscationConfig = DEFAULT_C
     compiled_program = None
 
     if config.virtualize:
+        progress("Compiling & virtualizing", "Compiling Luau into the custom bytecode representation and selecting the VM backend.")
         # First attempt real program virtualization. The compiler is grammar-driven
         # and covers the normal Luau statement/expression surface, including
         # closures, methods, multiple returns, tables, loops, assignments,
@@ -353,6 +376,7 @@ def obfuscate(source_text: str | bytes, *, config: ObfuscationConfig = DEFAULT_C
         try:
             parsed_for_vm = parse(current_source)
             compiled_program = compile_luau(parsed_for_vm.syntax)
+            progress("Building randomized VM", "Constructing the register/stack runtime, randomized dispatch, decoys, and integrity guards.")
             vm = build_bytecode_vm(
                 compiled_program,
                 source=current_source,
@@ -369,6 +393,7 @@ def obfuscate(source_text: str | bytes, *, config: ObfuscationConfig = DEFAULT_C
             bytecode_constants = vm.constant_pool_entries
             bytecode_registers = vm.max_registers
         except UnsupportedLuau as exc:
+            progress("Falling back safely", "The custom compiler does not support part of this source, so the semantic-safe VM backend is being used.")
             vm_fallback = True
             vm_fallback_reason = str(exc)
             vm = build_vm(
@@ -382,6 +407,7 @@ def obfuscate(source_text: str | bytes, *, config: ObfuscationConfig = DEFAULT_C
                 vm_compression=config.vm_compression,
             )
         except (TypeError, ValueError) as exc:
+            progress("Falling back safely", "The custom compiler encountered an internal limitation, so the semantic-safe VM backend is being used.")
             # Keep command reliability, but do not mislabel an internal compiler
             # defect as a source-language limitation. Genuine unsupported source
             # reaches the UnsupportedLuau branch above.
@@ -415,6 +441,7 @@ def obfuscate(source_text: str | bytes, *, config: ObfuscationConfig = DEFAULT_C
         vm_compression_payload_bytes = vm.compressed_payload_bytes
 
         if config.vm_compression:
+            progress("Evaluating VM compression", "Building the compressed payload variant and comparing it with the uncompressed artifact.")
             if compiled_program is not None and vm_backend == "Custom Bytecode VM":
                 baseline_vm = build_bytecode_vm(
                     compiled_program,
@@ -442,6 +469,8 @@ def obfuscate(source_text: str | bytes, *, config: ObfuscationConfig = DEFAULT_C
             vm_compression_saved_bytes = vm_compression_baseline_output_bytes - len(output)
     else:
         output = current_source
+
+    progress("Finalizing protected payload", "Finalizing output statistics, encrypted payload metadata, and integrity information.")
 
     stats = ObfuscationStats(
         input_bytes=len(source),
