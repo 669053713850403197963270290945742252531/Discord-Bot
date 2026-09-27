@@ -2,6 +2,7 @@
 
 from __future__ import annotations
 
+import asyncio
 import os
 import re
 import secrets
@@ -17,7 +18,7 @@ from api.discord_helpers import (
     build_embed,
     has_role,
     is_in_guild,
-    safe_defer,
+    edit_or_send_error,
     send_error,
 )
 from obfuscator import obfuscate
@@ -70,9 +71,78 @@ async def _run_obfuscation(
     original_filename: str,
     options: ObfuscationOptions,
 ) -> None:
-    """Run the obfuscation pipeline with the selected command options."""
-    if not await safe_defer(interaction, ephemeral=True):
-        return
+    """Run the obfuscation pipeline while updating one message in place."""
+    loop = asyncio.get_running_loop()
+    original_name = _safe_stem(original_filename)
+
+    def _progress_step(stage: str, explicit_step: str | None = None) -> str:
+        if explicit_step:
+            return explicit_step
+
+        stage_steps = {
+            "Preparing source": "1 / 5",
+            "Parsing & validating Luau": "2 / 5",
+            "Preparing source transformations": "2 / 5",
+            "Re-validating protected source": "2 / 5",
+            "Injecting protected scaffolding": "3 / 5",
+            "Compiling & virtualizing": "3 / 5",
+            "Building randomized VM": "3 / 5",
+            "Falling back safely": "3 / 5",
+            "Evaluating VM compression": "4 / 5",
+            "Finalizing protected payload": "4 / 5",
+            "Uploading protected file": "5 / 5",
+        }
+        return stage_steps.get(stage, "3 / 5")
+
+    async def update_progress(stage: str, detail: str, *, step: str | None = None) -> None:
+        fields = [
+            ("📊 Progress", _progress_step(stage, step), True),
+            ("📄 Source File", f"`{original_name}`", True),
+            ("⚙️ Current Stage", stage, False),
+            ("ℹ️ Details", detail, False),
+        ]
+        embed = build_embed(
+            title="🛡️ Obfuscating...",
+            description=(
+                f"`{original_name}` is being processed by the **Celestial Luau Obfuscator**.\n\n"
+                "This message will update in place as each major stage completes."
+            ),
+            color=discord.Color.blurple(),
+            fields=fields,
+            footer="Celestial Obfuscator • Processing in progress",
+        )
+        if interaction.client.user:
+            embed.set_author(
+                name="Celestial Security",
+                icon_url=interaction.client.user.display_avatar.url,
+            )
+        else:
+            embed.set_author(name="Celestial Security")
+        embed.timestamp = discord.utils.utcnow()
+        try:
+            await interaction.edit_original_response(content=None, embed=embed)
+        except discord.NotFound:
+            print(f"/obfuscate progress message disappeared while processing {original_filename!r}")
+        except discord.HTTPException as exc:
+            print(f"/obfuscate progress edit failed for {original_filename!r}: {exc!r}")
+
+    def pipeline_progress(stage: str, detail: str) -> None:
+        """Bridge synchronous pipeline progress back onto the bot event loop."""
+        future = asyncio.run_coroutine_threadsafe(
+            update_progress(stage, detail),
+            loop,
+        )
+        try:
+            future.result(timeout=15)
+        except Exception:
+            # Progress must never make the actual obfuscation fail.
+            pass
+
+    await update_progress(
+        "Preparing source",
+        "The uploaded attachment is being read and decoded before validation begins.",
+        step="1 / 5",
+    )
 
     selected_config = DEFAULT_CONFIG.__class__(
         **{
@@ -81,25 +151,45 @@ async def _run_obfuscation(
         }
     )
 
+    await update_progress(
+        "Parsing & validating Luau",
+        "Checking syntax before any protection transforms or VM generation are performed.",
+        step="2 / 5",
+    )
+
     try:
-        result = obfuscate(source, config=selected_config)
+        result = await asyncio.to_thread(
+            obfuscate,
+            source,
+            config=selected_config,
+            progress_callback=pipeline_progress,
+        )
     except (LuauSyntaxError, ParserDependencyError, ValueError) as exc:
-        return await send_error(interaction, str(exc))
+        return await edit_or_send_error(interaction, str(exc))
     except Exception as exc:
         # Do not leak parser internals or source content into a Discord
         # response, but keep the traceback in the bot process logs.
         print(f"/obfuscate failed for {original_filename!r}: {exc!r}")
-        return await send_error(interaction, "Obfuscation failed unexpectedly. Check the bot logs for details.")
+        return await edit_or_send_error(
+            interaction,
+            "Obfuscation failed unexpectedly. Check the bot logs for details.",
+        )
+
+    await update_progress(
+        "Generating protected artifact",
+        "The VM payload, encrypted constants, anti-tamper data, and integrity metadata are being finalized.",
+        step="4 / 5",
+    )
 
     filename = _random_output_name()
     output_bytes = bytes(result.source)
     if not output_bytes:
-        return await send_error(interaction, "Obfuscation produced an empty output file.")
+        return await edit_or_send_error(interaction, "Obfuscation produced an empty output file.")
 
-    # Use a real temporary file rather than a shared BytesIO in the
-    # interaction response. discord.File objects are single-use, and a
-    # retry/follow-up path can otherwise leave a previously-consumed buffer
-    # at EOF and make Discord receive a 0-byte attachment.
+    # Use a real temporary file rather than a shared BytesIO in the interaction
+    # response. discord.File objects are single-use, and a retry path can
+    # otherwise leave a previously-consumed buffer at EOF and make Discord
+    # receive a 0-byte attachment.
     temp_path: str | None = None
     try:
         fd, temp_path = tempfile.mkstemp(prefix="celestial-obf-", suffix=".luau")
@@ -114,9 +204,10 @@ async def _run_obfuscation(
             except OSError:
                 pass
             temp_path = None
-            return await send_error(interaction, "Failed to stage the protected file for upload.")
-
-        discord_file = discord.File(temp_path, filename=filename)
+            return await edit_or_send_error(
+                interaction,
+                "Failed to stage the protected file for upload.",
+            )
     except OSError as exc:
         if temp_path:
             try:
@@ -124,9 +215,19 @@ async def _run_obfuscation(
             except OSError:
                 pass
         print(f"/obfuscate staging failed for {original_filename!r}: {exc!r}")
-        return await send_error(interaction, "Failed to prepare the protected file for upload.")
+        return await edit_or_send_error(
+            interaction,
+            "Failed to prepare the protected file for upload.",
+        )
 
-    original_name = _safe_stem(original_filename)
+    await update_progress(
+        "Uploading protected file",
+        f"`{filename}` is staged ({len(output_bytes):,} bytes) and is being added to this message.",
+        step="5 / 5",
+    )
+
+    discord_file = discord.File(temp_path, filename=filename)
+
     if options.vm_compression:
         payload_source_bytes = result.stats.vm_compression_source_bytes
         payload_bytes = result.stats.vm_compression_payload_bytes
@@ -219,11 +320,7 @@ async def _run_obfuscation(
             ("📏 Size", f"{result.stats.input_bytes:,} B → {result.stats.output_bytes:,} B", True),
             ("🧠 Source Complexity", f"{result.stats.source_complexity}/100", True),
             ("⚙️ VM Backend", backend_name, True),
-            (
-                "🗜️ VM Compression",
-                compression_summary,
-                False,
-            ),
+            ("🗜️ VM Compression", compression_summary, False),
             ("🔤 Local Renaming", f"{result.stats.renamed_locals:,}", True),
             ("🔐 Encrypted Strings", f"{result.stats.encrypted_strings:,}", True),
             ("🧮 Obfuscated Constants", f"{result.stats.obfuscated_constants:,}", True),
@@ -250,11 +347,7 @@ async def _run_obfuscation(
                 ),
                 False,
             ),
-            (
-                "🔒 Protection Pipeline",
-                pipeline_description,
-                False,
-            ),
+            ("🔒 Protection Pipeline", pipeline_description, False),
         ],
         footer="Celestial Obfuscator • Protected output generated uniquely for this build",
     )
@@ -268,52 +361,43 @@ async def _run_obfuscation(
     embed.timestamp = discord.utils.utcnow()
 
     try:
-        # The interaction has already been deferred above, so use the
-        # follow-up webhook directly. This avoids the generic responder's
-        # retry path reusing a single-use discord.File object.
-        message = await interaction.followup.send(
+        # Replace the same ephemeral progress message with the finalized
+        # embed + attachment. Discord.py supports adding new files through the
+        # attachments parameter of edit_original_response().
+        await interaction.edit_original_response(
+            content=None,
             embed=embed,
-            file=discord_file,
-            ephemeral=True,
-            wait=True,
+            attachments=[discord_file],
         )
 
-        # Discord returns the uploaded attachment metadata on webhook
-        # messages. Verify that the server received the expected number of
-        # bytes rather than silently accepting a 0-byte attachment.
-        attachments = getattr(message, "attachments", ())
+        # Verify that Discord accepted the expected file size. If it reports
+        # an unexpected 0-byte attachment, retry the edit with a fresh File
+        # object rather than creating a second message.
+        try:
+            message = await interaction.original_response()
+            attachments = getattr(message, "attachments", ())
+        except (discord.NotFound, discord.HTTPException):
+            attachments = ()
+
         if attachments and getattr(attachments[0], "size", len(output_bytes)) == 0:
             print(
                 f"/obfuscate Discord reported a 0-byte attachment for {filename!r}; "
-                f"expected {len(output_bytes):,} bytes; retrying upload once"
+                f"expected {len(output_bytes):,} bytes; retrying in-place edit once"
             )
-
-            # Never reuse a discord.File instance: discord.py documents
-            # File objects as single-use. Re-open the staged path so the
-            # retry starts with a fresh file object at byte 0.
-            try:
-                await message.delete()
-            except (discord.NotFound, discord.HTTPException):
-                pass
-
             retry_file = discord.File(temp_path, filename=filename)
-            message = await interaction.followup.send(
+            await interaction.edit_original_response(
+                content=None,
                 embed=embed,
-                file=retry_file,
-                ephemeral=True,
-                wait=True,
+                attachments=[retry_file],
             )
-            retry_attachments = getattr(message, "attachments", ())
-            if retry_attachments and getattr(retry_attachments[0], "size", len(output_bytes)) == 0:
-                print(
-                    f"/obfuscate retry still reported a 0-byte attachment for {filename!r}; "
-                    "Discord upload did not accept the staged payload"
-                )
     except discord.NotFound:
         return
     except discord.HTTPException as exc:
-        print(f"/obfuscate upload failed for {filename!r}: {exc!r}")
-        return await send_error(interaction, "The protected file could not be uploaded to Discord.")
+        print(f"/obfuscate upload/edit failed for {filename!r}: {exc!r}")
+        return await edit_or_send_error(
+            interaction,
+            "The protected file could not be uploaded to Discord.",
+        )
     finally:
         if temp_path:
             try:
@@ -354,15 +438,44 @@ class Obfuscate(commands.Cog):
                 f"the limit is {MAX_SOURCE_ATTACHMENT_SIZE:,} bytes).",
             )
 
+        progress_embed = build_embed(
+            title="🛡️ Obfuscating...",
+            description=(
+                f"`{_safe_stem(file.filename)}` is being processed by the **Celestial Luau Obfuscator**.\n\n"
+                "The message will update in place as the source is validated, virtualized, and packaged."
+            ),
+            color=discord.Color.blurple(),
+            fields=[
+                ("📊 Progress", "1 / 5", True),
+                ("📄 Source File", f"`{_safe_stem(file.filename)}`", True),
+                ("⚙️ Current Stage", "Downloading source", False),
+                ("ℹ️ Details", "Reading the uploaded attachment and preparing it for validation.", False),
+            ],
+            footer="Celestial Obfuscator • Processing in progress",
+        )
+        if interaction.client.user:
+            progress_embed.set_author(
+                name="Celestial Security",
+                icon_url=interaction.client.user.display_avatar.url,
+            )
+        else:
+            progress_embed.set_author(name="Celestial Security")
+        progress_embed.timestamp = discord.utils.utcnow()
+
+        try:
+            await interaction.response.send_message(embed=progress_embed, ephemeral=True)
+        except (discord.NotFound, discord.HTTPException):
+            return
+
         try:
             raw = await file.read()
         except discord.HTTPException as exc:
-            return await send_error(interaction, f"Failed to download `{file.filename}`: {exc}")
+            return await edit_or_send_error(interaction, f"Failed to download `{file.filename}`: {exc}")
 
         try:
             source = raw.decode("utf-8-sig")
         except UnicodeDecodeError:
-            return await send_error(interaction, "The uploaded file is not valid UTF-8 Luau source.")
+            return await edit_or_send_error(interaction, "The uploaded file is not valid UTF-8 Luau source.")
 
         options = ObfuscationOptions(
             vm_compression=bool(vm_compression),
