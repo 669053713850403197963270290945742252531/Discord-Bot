@@ -1,9 +1,9 @@
 """
 /warnings -- durable warning records for members.
 
-Persisted to BotState.json's "warnings" list, the same "fetch -> mutate ->
+Persisted to Supabase bot_state's "warnings" list, the same "fetch -> mutate ->
 commit" shape moderation.py's temp_bans and access.py's temp_bot_access
-use (see api.github.update_botstate). Unlike those two, a warning carries
+use (see api.bot_state.update_botstate). Unlike those two, a warning carries
 no timer/expiry -- it's just an append/read/delete record -- so there's no
 reconcile_*() timer-rescheduling step here. reconcile_warnings_cache()
 below exists purely to warm the in-memory autocomplete cache back up after
@@ -12,7 +12,7 @@ cache exists at all.
 
 Each entry looks like:
     {
-        "id": "warn_9f2a1c",          # short random id, see api.github.new_state_id
+        "id": "warn_9f2a1c",          # short random id, see api.bot_state.new_state_id
         "guild_id": "123456789",
         "discord_id": "987654321",     # the warned member
         "reason": "...",
@@ -39,14 +39,14 @@ from api.alerts import (
     send_moderation_alert, alert_embed,
     ALERT_COLOR_REMOVE, ALERT_COLOR_EDIT,
 )
-from api.github import GitHubAPIError, fetch_botstate_with_sha, update_botstate, new_state_id
+from api.bot_state import BotStateError, fetch_botstate, update_botstate, new_state_id
 from api.time_utils import format_iso, parse_iso
 from commands.moderation import _add_banned_user_to_cache, _persist_banned_user
 
 GUILD = discord.Object(id=config.GUILD_ID)
 
 # =========================================================================
-# In-memory warnings cache -- mirrors BotState.json's "warnings" list purely
+# In-memory warnings cache -- mirrors Supabase bot_state's "warnings" list purely
 # so /warnings delete's autocomplete (which, like every Discord autocomplete
 # callback, has to answer well inside a ~3s window) has something fast to
 # read instead of a live GitHub API call -- same reasoning as Users.json's
@@ -74,22 +74,22 @@ def _user_warnings(discord_id) -> List[Dict[str, Any]]:
 
 async def reconcile_warnings_cache(bot: commands.Bot, state: Optional[Dict[str, Any]] = None):
     """Called once from on_ready: warms the in-memory autocomplete cache
-    from BotState.json's "warnings" list. No timer to reschedule here
+    from Supabase bot_state's "warnings" list. No timer to reschedule here
     (unlike reconcile_temp_bans() etc.) -- this exists purely so
     /warnings delete's autocomplete has real suggestions immediately after
     a restart instead of sitting empty until the first /warnings
     add|inspect|clear happens to populate it.
 
-    `state` lets a caller that's already fetched BotState.json (e.g.
+    `state` lets a caller that's already fetched Supabase bot_state (e.g.
     start.py's on_ready, reconciling several categories back to back) hand
     it over directly instead of this making its own redundant fetch of the
     exact same file. Falls back to fetching it itself when called on its
     own with nothing passed in."""
     if state is None:
         try:
-            state, _sha = await fetch_botstate_with_sha()
-        except GitHubAPIError as e:
-            print(f"Failed to fetch BotState.json for warnings cache reconciliation: {e}")
+            state = await fetch_botstate()
+        except BotStateError as e:
+            print(f"Failed to fetch Supabase bot_state for warnings cache reconciliation: {e}")
             return
     _set_warnings_cache(state.get("warnings", []))
 
@@ -99,11 +99,11 @@ async def reconcile_warnings_cache(bot: commands.Bot, state: Optional[Dict[str, 
 #
 # Controls whether reaching a set warning count *also* does something to
 # the member (timeout/kick/ban) beyond just recording the warning, same
-# "in-memory for fast access + mirrored to BotState.json's 'warning_config'
+# "in-memory for fast access + mirrored to Supabase bot_state's 'warning_config'
 # key on every change" pattern as autorole.py's _autorole_enabled/
 # _autorole_role_id or discord_helpers.py's _dms_enabled -- see either of
 # those for the full reasoning. reconcile_warning_config() below warms it
-# back up from BotState.json on restart, same as every other reconcile_*().
+# back up from Supabase bot_state on restart, same as every other reconcile_*().
 # =========================================================================
 
 WARNING_ACTION_NONE = "none"
@@ -174,7 +174,7 @@ def warning_config() -> Dict[str, Any]:
 
 
 async def _persist_warning_config(message: str):
-    """Mirrors the in-memory config to BotState.json. Best-effort -- logged
+    """Mirrors the in-memory config to Supabase bot_state. Best-effort -- logged
     rather than raised, since /warnings config's Save button has already
     updated the in-memory copy (and therefore already taken effect) by the
     time this runs; a failure here only means it would fall back to the
@@ -185,32 +185,32 @@ async def _persist_warning_config(message: str):
         return state
     try:
         await update_botstate(_mutate, message)
-    except GitHubAPIError as e:
-        print(f"Failed to persist warning config to BotState.json: {e}")
+    except BotStateError as e:
+        print(f"Failed to persist warning config to Supabase bot_state: {e}")
 
 
 async def reconcile_warning_config(bot: commands.Bot, state: Optional[Dict[str, Any]] = None):
     """Called once from on_ready: restores the auto-action config from
-    BotState.json, so a restart resumes whatever staff last saved via
+    Supabase bot_state, so a restart resumes whatever staff last saved via
     /warnings config instead of silently reverting to the (disabled-by-
     default) defaults.
 
-    `state` lets a caller that's already fetched BotState.json hand it over
+    `state` lets a caller that's already fetched Supabase bot_state hand it over
     directly instead of this making its own redundant fetch -- see
     commands.moderation.reconcile_temp_bans() for the full reasoning."""
     global _warning_config
     if state is None:
         try:
-            state, _sha = await fetch_botstate_with_sha()
-        except GitHubAPIError as e:
-            print(f"Failed to fetch BotState.json for warning config reconciliation: {e}")
+            state = await fetch_botstate()
+        except BotStateError as e:
+            print(f"Failed to fetch Supabase bot_state for warning config reconciliation: {e}")
             return
 
     saved = state.get("warning_config") or {}
     merged = dict(DEFAULT_WARNING_CONFIG)
     merged.update({k: v for k, v in saved.items() if k in DEFAULT_WARNING_CONFIG})
 
-    # Defensive validation -- a hand-edited BotState.json (or a future
+    # Defensive validation -- a hand-edited Supabase bot_state (or a future
     # schema change) could hand back something out of range; clamp/replace
     # rather than let a bad value crash the next /warnings add.
     if merged["action"] not in WARNING_ACTIONS:
@@ -227,7 +227,7 @@ async def reconcile_warning_config(bot: commands.Bot, state: Optional[Dict[str, 
 
     _warning_config = merged
     print(
-        "Reconciled warning auto-action config from BotState.json "
+        "Reconciled warning auto-action config from Supabase bot_state "
         f"(enabled={_warning_config['enabled']}, threshold={_warning_config['threshold']}, "
         f"action={_warning_config['action']})."
     )
@@ -316,7 +316,7 @@ async def _apply_warning_threshold_action(
             new_state = await update_botstate(_mutate, f"Warnings auto-cleared for {user} ({user.id}) after auto-action")
             _set_warnings_cache(new_state.get("warnings", []))
             summary += " Their warning count has been reset to **0**."
-        except GitHubAPIError as e:
+        except BotStateError as e:
             print(f"Failed to auto-clear warnings for {user} ({user.id}) after an auto-action: {e}")
             summary += " (Couldn't reset their warning count -- see server logs.)"
 
@@ -337,7 +337,7 @@ class WarningConfigView(LayoutView):
     Edits happen against `self.draft` -- a working copy of the live
     config -- so Cancel can discard in-progress changes and Reset to
     Defaults can restore the out-of-the-box values without touching the
-    real `_warning_config` (or making any BotState.json write) until Save
+    real `_warning_config` (or making any Supabase bot_state write) until Save
     is actually pressed. Same "clear_items() then fully rebuild" approach
     as whitelist.py's WhitelistView.build(), called after every change and
     followed by an edit_message(view=self) to reflect it live."""
@@ -614,7 +614,7 @@ async def _warn_add_impl(interaction: discord.Interaction, user: discord.Member,
 
     try:
         new_state = await update_botstate(_mutate, f"Warning added: {user} ({user.id})")
-    except GitHubAPIError as e:
+    except BotStateError as e:
         return await send_error(interaction, f"Failed to save warning: {e}")
 
     _set_warnings_cache(new_state.get("warnings", []))
@@ -661,8 +661,8 @@ async def _warn_inspect_impl(interaction: discord.Interaction, user: discord.Use
     await safe_defer(interaction, ephemeral=True)
 
     try:
-        state, _sha = await fetch_botstate_with_sha()
-    except GitHubAPIError as e:
+        state = await fetch_botstate()
+    except BotStateError as e:
         return await send_error(interaction, f"Failed to fetch warnings: {e}")
 
     # Live fetch above is already authoritative -- refresh the autocomplete
@@ -713,7 +713,7 @@ async def _warn_clear_impl(interaction: discord.Interaction, user: discord.User)
 
     try:
         new_state = await update_botstate(_mutate, f"Warnings cleared: {user} ({user.id})")
-    except GitHubAPIError as e:
+    except BotStateError as e:
         return await send_error(interaction, f"Failed to clear warnings: {e}")
 
     _set_warnings_cache(new_state.get("warnings", []))
@@ -740,7 +740,7 @@ async def warning_autocomplete(interaction: discord.Interaction, current: str) -
     well inside Discord's ~3s autocomplete window -- same as
     whitelisted_user_autocomplete() in whitelist.py leaning on
     the stored warnings snapshot instead of a fresh fetch. Unlike that cache though,
-    an empty result here falls back to one live BotState.json fetch before
+    an empty result here falls back to one live Supabase bot_state fetch before
     concluding "no warnings" -- see the cache-miss handling below for why.
 
     Reads `user` off interaction.namespace since Discord fills a command's
@@ -765,15 +765,15 @@ async def warning_autocomplete(interaction: discord.Interaction, current: str) -
     # Self-heal against a stale/cold cache -- most commonly right after a
     # restart, if this fires before reconcile_warnings_cache() has finished
     # warming it back up -- rather than confidently telling staff someone
-    # has zero warnings when BotState.json actually still has some. Only
+    # has zero warnings when Supabase bot_state actually still has some. Only
     # pays the extra network round trip when the cache comes up *empty*
     # for this specific user, not on every keystroke, so the normal
     # (already-warm cache) case stays exactly as fast as before. Mirrors
     # _warn_inspect_impl()'s "live fetch is authoritative" refresh above.
     if not matches:
         try:
-            state, _sha = await fetch_botstate_with_sha()
-        except GitHubAPIError:
+            state = await fetch_botstate()
+        except BotStateError:
             return []  # Still nothing to suggest -- fail quiet, same as any other empty result.
         _set_warnings_cache(state.get("warnings", []))
         matches = _user_warnings(target.id)
@@ -802,8 +802,8 @@ async def _warn_delete_impl(interaction: discord.Interaction, user: discord.User
         return await send_error(interaction, "Provide the warning to delete -- an id, or part of its reason.")
 
     try:
-        state, _sha = await fetch_botstate_with_sha()
-    except GitHubAPIError as e:
+        state = await fetch_botstate()
+    except BotStateError as e:
         return await send_error(interaction, f"Failed to fetch warnings: {e}")
 
     user_warnings = [w for w in state.get("warnings", []) if str(w.get("discord_id")) == str(user.id)]
@@ -836,7 +836,7 @@ async def _warn_delete_impl(interaction: discord.Interaction, user: discord.User
 
     try:
         new_state = await update_botstate(_mutate, f"Warning deleted for {user} ({user.id}): {target_id}")
-    except GitHubAPIError as e:
+    except BotStateError as e:
         return await send_error(interaction, f"Failed to delete warning: {e}")
 
     _set_warnings_cache(new_state.get("warnings", []))
@@ -903,7 +903,7 @@ class Warnings(commands.Cog):
     @has_role(config.REQUIRED_ROLE_ID)
     @is_in_guild(config.GUILD_ID)
     async def warnings_config(self, interaction: discord.Interaction):
-        # Re-syncs the in-memory config from BotState.json before building
+        # Re-syncs the in-memory config from Supabase bot_state before building
         # the view, rather than trusting this process's copy blind -- same
         # "in-memory cache came up looking wrong -> one live fetch before
         # trusting it" convention as warning_autocomplete()'s cache-miss

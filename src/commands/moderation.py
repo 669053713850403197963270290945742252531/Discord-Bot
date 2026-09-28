@@ -17,7 +17,7 @@ from api.alerts import (
     send_moderation_alert, alert_embed,
     ALERT_COLOR_ADD, ALERT_COLOR_REMOVE, ALERT_COLOR_EDIT, ALERT_COLOR_TEMP, ALERT_COLOR_CAUTION,
 )
-from api.github import GitHubAPIError, fetch_botstate_with_sha, update_botstate, new_state_id
+from api.bot_state import BotStateError, fetch_botstate, update_botstate, new_state_id
 from api.time_utils import format_iso, parse_iso, seconds_until
 
 GUILD = discord.Object(id=config.GUILD_ID)
@@ -29,16 +29,16 @@ GUILD = discord.Object(id=config.GUILD_ID)
 # =========================================================================
 
 # =========================================================================
-# /ban's temp-ban duration -- persisted to BotState.json's "temp_bans" list
+# /ban's temp-ban duration -- persisted to Supabase bot_state's "temp_bans" list
 # so a restart before the countdown fires reschedules the auto-unban
 # instead of the "temp" ban silently becoming permanent forever. Keyed by a
-# short random id (see api.github.new_state_id) rather than discord_id
+# short random id (see api.bot_state.new_state_id) rather than discord_id
 # alone, since -- unlike temp whitelist/temp access -- nothing stops the
 # same user from theoretically being temp-banned again after an earlier
 # temp ban already resolved.
 # =========================================================================
 
-# Running unban tasks, keyed by the BotState entry's id -- lets a manual
+# Running unban tasks, keyed by the bot-state entry's id -- lets a manual
 # /unban cancel a still-pending auto-unban instead of leaving it to fire
 # harmlessly-but-uselessly against an already-unbanned user later.
 _temp_ban_tasks: dict = {}
@@ -46,21 +46,21 @@ _temp_ban_tasks: dict = {}
 
 async def _clear_temp_ban_state(entry_id: str):
     """Removes a resolved (fired or manually reversed) temp ban entry from
-    BotState.json. Best-effort -- logged rather than raised, since the
+    Supabase bot_state. Best-effort -- logged rather than raised, since the
     Discord-side ban/unban has already happened by the time this runs."""
     def _mutate(state):
         state["temp_bans"] = [e for e in state.get("temp_bans", []) if e.get("id") != entry_id]
         return state
     try:
         await update_botstate(_mutate, f"Temp ban resolved: {entry_id}")
-    except GitHubAPIError as e:
-        print(f"Failed to clear resolved temp ban {entry_id} from BotState.json: {e}")
+    except BotStateError as e:
+        print(f"Failed to clear resolved temp ban {entry_id} from Supabase bot_state: {e}")
 
 
 async def _run_temp_ban_unban(bot: commands.Bot, entry: dict):
     """Sleeps until `entry`'s unban_at (or fires almost immediately if
     that's already in the past -- e.g. the bot was down past it), then
-    unbans and clears the BotState entry. Shared by both a fresh /ban
+    unbans and clears the bot-state entry. Shared by both a fresh /ban
     duration grant and startup reconciliation, so there's exactly one code
     path for "what happens when a temp ban's timer goes off.\""""
     entry_id = entry["id"]
@@ -105,13 +105,13 @@ def _schedule_temp_ban(bot: commands.Bot, entry: dict):
 async def _cancel_temp_ban_for(discord_id, guild_id) -> bool:
     """Cancels and clears any pending temp-ban auto-unban entry for
     `discord_id` in `guild_id` -- called from /unban so a manual early
-    unban doesn't leave a stale (harmless, but confusing) BotState entry
+    unban doesn't leave a stale (harmless, but confusing) bot-state entry
     and in-memory task sitting around until its original timer fires.
     Returns True if an entry was found and cleared."""
     try:
-        state, _sha = await fetch_botstate_with_sha()
-    except GitHubAPIError as e:
-        print(f"Failed to fetch BotState.json while checking for a temp ban to cancel: {e}")
+        state = await fetch_botstate()
+    except BotStateError as e:
+        print(f"Failed to fetch Supabase bot_state while checking for a temp ban to cancel: {e}")
         return False
 
     match = next(
@@ -129,7 +129,7 @@ async def _cancel_temp_ban_for(discord_id, guild_id) -> bool:
 
 
 # =========================================================================
-# In-memory banned-users cache -- mirrors BotState.json's "banned_users"
+# In-memory banned-users cache -- mirrors Supabase bot_state's "banned_users"
 # list purely so /checkban and /unban's autocomplete (like every Discord
 # autocomplete callback, answered well inside a ~3s window) has something
 # fast to search instead of a live guild.bans() call -- same reasoning as
@@ -172,7 +172,7 @@ def _remove_banned_user_from_cache(discord_id) -> None:
 
 
 async def _persist_banned_user(entry: Dict[str, Any]):
-    """Best-effort BotState.json append for a fresh ban -- same
+    """Best-effort Supabase bot_state append for a fresh ban -- same
     log-don't-raise handling as _clear_temp_ban_state() above, since the
     actual Discord-side ban has already happened by the time this runs and
     shouldn't be rolled back over a bookkeeping failure."""
@@ -182,12 +182,12 @@ async def _persist_banned_user(entry: Dict[str, Any]):
         return state
     try:
         await update_botstate(_mutate, f"Ban recorded: {entry.get('tag')} ({entry['discord_id']})")
-    except GitHubAPIError as e:
-        print(f"Failed to persist ban record for {entry.get('tag')} to BotState.json: {e}")
+    except BotStateError as e:
+        print(f"Failed to persist ban record for {entry.get('tag')} to Supabase bot_state: {e}")
 
 
 async def _unpersist_banned_user(discord_id):
-    """Best-effort BotState.json removal once someone's no longer banned
+    """Best-effort Supabase bot_state removal once someone's no longer banned
     (manual /unban, a temp ban expiring, or a stale cache entry /unban
     discovered was already cleared outside the bot)."""
     def _mutate(state, discord_id=str(discord_id)):
@@ -195,24 +195,24 @@ async def _unpersist_banned_user(discord_id):
         return state
     try:
         await update_botstate(_mutate, f"Ban record cleared: {discord_id}")
-    except GitHubAPIError as e:
-        print(f"Failed to remove ban record for {discord_id} from BotState.json: {e}")
+    except BotStateError as e:
+        print(f"Failed to remove ban record for {discord_id} from Supabase bot_state: {e}")
 
 
 async def reconcile_banned_users_cache(bot: commands.Bot, state: Optional[Dict[str, Any]] = None):
     """Called once from on_ready: rebuilds the banned-users autocomplete
-    cache from a live guild.bans() sync rather than trusting BotState.json's
+    cache from a live guild.bans() sync rather than trusting Supabase bot_state's
     "banned_users" list alone -- unlike temp_bans, the guild's real ban list
     can change outside the bot entirely (a native Discord-UI ban/unban)
     while it was offline, so only a fresh guild.bans() call can actually
     catch that drift. The resynced list is written straight back to
-    BotState.json too, so autocomplete stays warm across the *next* restart
+    Supabase bot_state too, so autocomplete stays warm across the *next* restart
     even if guild.bans() itself is unreachable at that point.
 
     Falls back to whatever `state` already has recorded if the guild can't
     be found or guild.bans() fails (missing permission, API hiccup, etc.),
     so autocomplete still has *something* rather than sitting empty --
-    `state` lets a caller that's already fetched BotState.json (e.g.
+    `state` lets a caller that's already fetched Supabase bot_state (e.g.
     start.py's on_ready) hand it over directly rather than this making a
     redundant fetch, same as every other reconcile_*() here."""
     guild = bot.get_guild(config.GUILD_ID)
@@ -227,7 +227,7 @@ async def reconcile_banned_users_cache(bot: commands.Bot, state: Optional[Dict[s
                 async for ban in guild.bans(limit=None)
             ]
         except discord.Forbidden:
-            print("Missing permission to view bans -- banned-users autocomplete cache left as BotState.json's last snapshot.")
+            print("Missing permission to view bans -- banned-users autocomplete cache left as Supabase bot_state's last snapshot.")
         except Exception as e:
             print(f"Failed to sync banned-users cache from guild.bans(): {e}")
         else:
@@ -238,15 +238,15 @@ async def reconcile_banned_users_cache(bot: commands.Bot, state: Optional[Dict[s
                     state["banned_users"] = entries
                     return state
                 await update_botstate(_mutate, "Banned-users cache resynced from guild.bans()")
-            except GitHubAPIError as e:
-                print(f"Failed to persist resynced banned-users list to BotState.json: {e}")
+            except BotStateError as e:
+                print(f"Failed to persist resynced banned-users list to Supabase bot_state: {e}")
             return
 
     if state is None:
         try:
-            state, _sha = await fetch_botstate_with_sha()
-        except GitHubAPIError as e:
-            print(f"Failed to fetch BotState.json for banned-users cache reconciliation: {e}")
+            state = await fetch_botstate()
+        except BotStateError as e:
+            print(f"Failed to fetch Supabase bot_state for banned-users cache reconciliation: {e}")
             return
     _set_banned_users_cache(state.get("banned_users", []))
 
@@ -297,22 +297,22 @@ async def _resolve_user(client: commands.Bot, raw: str) -> discord.User:
 
 async def reconcile_temp_bans(bot: commands.Bot, state: Optional[Dict[str, Any]] = None):
     """Called once from on_ready: re-schedules every temp ban's auto-unban
-    timer using the durable unban_at recorded in BotState.json, so a
+    timer using the durable unban_at recorded in Supabase bot_state, so a
     restart before the original timer fired no longer leaves a "temp" ban
     permanent. Entries whose unban_at has already passed fire (almost)
     immediately via seconds_until()'s clamp-to-zero, rather than staying
     banned indefinitely until someone notices.
 
-    `state` lets a caller that's already fetched BotState.json (e.g.
+    `state` lets a caller that's already fetched Supabase bot_state (e.g.
     start.py's on_ready, reconciling several categories back to back) hand
     it over directly instead of this making its own redundant fetch of the
     exact same file. Falls back to fetching it itself when called on its
     own with nothing passed in."""
     if state is None:
         try:
-            state, _sha = await fetch_botstate_with_sha()
-        except GitHubAPIError as e:
-            print(f"Failed to fetch BotState.json for temp ban reconciliation: {e}")
+            state = await fetch_botstate()
+        except BotStateError as e:
+            print(f"Failed to fetch Supabase bot_state for temp ban reconciliation: {e}")
             return
 
     entries = state.get("temp_bans", [])
@@ -320,7 +320,7 @@ async def reconcile_temp_bans(bot: commands.Bot, state: Optional[Dict[str, Any]]
         _schedule_temp_ban(bot, entry)
 
     if entries:
-        print(f"Reconciled {len(entries)} temp ban(s) from BotState.json.")
+        print(f"Reconciled {len(entries)} temp ban(s) from Supabase bot_state.")
 
 
 async def _ban_impl(interaction: discord.Interaction, target: discord.User, reason: str = "None", duration: int = None, preserve_messages: bool = True):
@@ -331,7 +331,7 @@ async def _ban_impl(interaction: discord.Interaction, target: discord.User, reas
 
         # Computed once up front (rather than inside the `if member:` DM
         # block below) so the same value backs the DM, the summary embed,
-        # and the BotState.json entry persisted further down -- regardless
+        # and the Supabase bot_state entry persisted further down -- regardless
         # of whether `target` is a current member.
         unban_time = datetime.now(timezone.utc) + timedelta(minutes=duration) if duration else None
 
@@ -414,19 +414,19 @@ async def _ban_impl(interaction: discord.Interaction, target: discord.User, reas
                     state.setdefault("temp_bans", []).append(entry)
                     return state
                 await update_botstate(_mutate, f"Temp ban recorded: {target} ({target.id})")
-            except GitHubAPIError as e:
+            except BotStateError as e:
                 # The ban itself already succeeded (guild.ban() above) --
                 # this only means the auto-unban timer won't survive a
-                # restart until BotState.json can be reached again. Still
+                # restart until Supabase bot_state can be reached again. Still
                 # schedule the in-memory task below so this process's own
                 # timer works regardless, and flag it to staff since a
                 # "temp" ban silently becoming permanent on the next
                 # restart is exactly the failure mode this persistence
                 # exists to prevent.
-                print(f"Failed to persist temp ban for {target} to BotState.json: {e}")
+                print(f"Failed to persist temp ban for {target} to Supabase bot_state: {e}")
                 await send_moderation_alert(interaction.client, alert_embed(
                     "⚠️ Temp Ban Not Persisted",
-                    f"{target.mention}'s temporary ban couldn't be saved to BotState.json ({e}). "
+                    f"{target.mention}'s temporary ban couldn't be saved to Supabase bot_state ({e}). "
                     "It will still auto-unban on schedule *this session*, but would become permanent "
                     "if the bot restarts before then.",
                     color=ALERT_COLOR_CAUTION,
@@ -570,10 +570,10 @@ async def _unmute_impl(interaction: discord.Interaction, target: discord.Member,
 # The pending-removal timer used to live only in process memory -- a
 # restart mid-duration meant that particular auto-removal simply never
 # fired again, silently leaving the role on the member until someone
-# noticed and removed it by hand. Persisted to BotState.json's
+# noticed and removed it by hand. Persisted to Supabase bot_state's
 # "temp_roles" list now, same "fetch -> mutate -> commit" shape as
 # moderation.py's temp_bans -- see that section's comments for the full
-# reasoning. Keyed by a short random id (see api.github.new_state_id)
+# reasoning. Keyed by a short random id (see api.bot_state.new_state_id)
 # rather than (member_id, role_id) alone, since nothing stops the same
 # member+role pair from theoretically getting a fresh /temprole grant
 # after an earlier one already resolved.
@@ -583,11 +583,11 @@ async def _unmute_impl(interaction: discord.Interaction, target: discord.Member,
 # /temprole, so a second grant for the same member+role can be rejected
 # instead of stacking timers -- same convention as access.py's
 # _active_temp_access, just keyed on the role too since this isn't scoped
-# to one fixed role. Fast in-memory membership check; BotState.json's
+# to one fixed role. Fast in-memory membership check; Supabase bot_state's
 # "temp_roles" list is the durable source of truth.
 _active_temp_roles: set = set()
 
-# Running removal tasks, keyed by the BotState entry's id -- mirrors
+# Running removal tasks, keyed by the bot-state entry's id -- mirrors
 # moderation.py's _temp_ban_tasks / access.py's _temp_access_tasks, so a
 # reconciled (post-restart) task can be tracked the same way as a
 # freshly-granted one.
@@ -596,7 +596,7 @@ _temp_role_tasks: dict = {}
 
 async def _clear_temp_role_state(entry_id: str):
     """Removes a resolved (fired, or the role/member disappeared) temp role
-    entry from BotState.json. Best-effort -- logged rather than raised,
+    entry from Supabase bot_state. Best-effort -- logged rather than raised,
     since the Discord-side role removal (or the discovery that there was
     nothing left to remove) has already happened by the time this runs."""
     def _mutate(state):
@@ -604,14 +604,14 @@ async def _clear_temp_role_state(entry_id: str):
         return state
     try:
         await update_botstate(_mutate, f"Temp role resolved: {entry_id}")
-    except GitHubAPIError as e:
-        print(f"Failed to clear resolved temp role {entry_id} from BotState.json: {e}")
+    except BotStateError as e:
+        print(f"Failed to clear resolved temp role {entry_id} from Supabase bot_state: {e}")
 
 
 async def _run_temp_role_removal(bot: commands.Bot, entry: dict):
     """Sleeps until `entry`'s expires_at (or fires almost immediately if
     that's already in the past -- e.g. the bot was down past it), then
-    removes the role and clears the BotState entry. Shared by both a fresh
+    removes the role and clears the bot-state entry. Shared by both a fresh
     /temprole grant and startup reconciliation, so there's exactly one code
     path for "what happens when a temp role's timer goes off.\""""
     entry_id = entry["id"]
@@ -680,21 +680,21 @@ def _schedule_temp_role(bot: commands.Bot, entry: dict):
 async def reconcile_temp_roles(bot: commands.Bot, state: Optional[Dict[str, Any]] = None):
     """Called once from on_ready: re-schedules every temp role's
     auto-removal timer using the durable expires_at recorded in
-    BotState.json, so a restart before the original timer fired no longer
+    Supabase bot_state, so a restart before the original timer fired no longer
     leaves the role on the member indefinitely. Entries whose expires_at
     has already passed fire (almost) immediately via seconds_until()'s
     clamp-to-zero, rather than staying granted until someone notices.
 
-    `state` lets a caller that's already fetched BotState.json (e.g.
+    `state` lets a caller that's already fetched Supabase bot_state (e.g.
     start.py's on_ready, reconciling several categories back to back) hand
     it over directly instead of this making its own redundant fetch of the
     exact same file. Falls back to fetching it itself when called on its
     own with nothing passed in."""
     if state is None:
         try:
-            state, _sha = await fetch_botstate_with_sha()
-        except GitHubAPIError as e:
-            print(f"Failed to fetch BotState.json for temp role reconciliation: {e}")
+            state = await fetch_botstate()
+        except BotStateError as e:
+            print(f"Failed to fetch Supabase bot_state for temp role reconciliation: {e}")
             return
 
     entries = state.get("temp_roles", [])
@@ -702,7 +702,7 @@ async def reconcile_temp_roles(bot: commands.Bot, state: Optional[Dict[str, Any]
         _schedule_temp_role(bot, entry)
 
     if entries:
-        print(f"Reconciled {len(entries)} temp role(s) from BotState.json.")
+        print(f"Reconciled {len(entries)} temp role(s) from Supabase bot_state.")
 
 
 async def _temprole_impl(interaction: discord.Interaction, target: discord.Member, role: discord.Role, duration: int, reason: str = "No reason provided"):
@@ -746,18 +746,18 @@ async def _temprole_impl(interaction: discord.Interaction, target: discord.Membe
             state.setdefault("temp_roles", []).append(entry)
             return state
         await update_botstate(_mutate, f"Temp role recorded: {target} <- {role} ({target.id})")
-    except GitHubAPIError as e:
+    except BotStateError as e:
         # The role grant itself already succeeded (add_roles() above) --
         # this only means the auto-removal timer won't survive a restart
-        # until BotState.json can be reached again. Still schedule the
+        # until Supabase bot_state can be reached again. Still schedule the
         # in-memory task below so this process's own timer works
         # regardless, and flag it to staff since a "temp" role silently
         # becoming permanent on the next restart is exactly the failure
         # mode this persistence exists to prevent.
-        print(f"Failed to persist temp role for {target} to BotState.json: {e}")
+        print(f"Failed to persist temp role for {target} to Supabase bot_state: {e}")
         await send_moderation_alert(interaction.client, alert_embed(
             "⚠️ Temp Role Not Persisted",
-            f"{target.mention}'s temporary {role.mention} role couldn't be saved to BotState.json ({e}). "
+            f"{target.mention}'s temporary {role.mention} role couldn't be saved to Supabase bot_state ({e}). "
             "It will still auto-remove on schedule *this session*, but would stay on the member "
             "permanently if the bot restarts before then.",
             color=ALERT_COLOR_CAUTION,
@@ -969,7 +969,7 @@ async def _send_lock_announcement(channel, *, title: str, message: str, duration
 # Pending auto-unlock tasks scheduled by a `duration` on /togglelock, keyed
 # by channel id. Popped and cancelled the moment that channel's lock state
 # changes again for any reason, so a stale timer never fires after someone
-# has already manually toggled it back. Persisted to BotState.json's
+# has already manually toggled it back. Persisted to Supabase bot_state's
 # "channel_locks" list (same shape/reasoning as "temp_bans" above) so a
 # restart mid-timer reschedules the auto-unlock instead of leaving the
 # channel locked forever until someone happens to notice.
@@ -977,7 +977,7 @@ _lock_duration_tasks: dict = {}
 
 
 async def _clear_channel_lock_state(channel_id: int):
-    """Removes the persisted BotState.json entry (if any) for `channel_id`.
+    """Removes the persisted Supabase bot_state entry (if any) for `channel_id`.
     Best-effort -- logged rather than raised, since the Discord-side
     permission change (a manual re-toggle, or the timer itself firing) has
     already happened by the time this runs. Safe to call even when the
@@ -988,14 +988,14 @@ async def _clear_channel_lock_state(channel_id: int):
         return state
     try:
         await update_botstate(_mutate, f"Channel lock resolved: {channel_id}")
-    except GitHubAPIError as e:
-        print(f"Failed to clear resolved channel lock for channel {channel_id} from BotState.json: {e}")
+    except BotStateError as e:
+        print(f"Failed to clear resolved channel lock for channel {channel_id} from Supabase bot_state: {e}")
 
 
 async def _run_channel_lock_auto_unlock(bot: commands.Bot, channel_id: int, unlock_at: datetime):
     """Sleeps until `unlock_at` (or fires almost immediately if that's
     already passed), then restores the channel's @everyone overwrite and
-    clears the persisted BotState entry. Shared by both a fresh /togglelock
+    clears the persisted bot-state entry. Shared by both a fresh /togglelock
     duration grant and startup reconciliation."""
     try:
         await asyncio.sleep(seconds_until(unlock_at))
@@ -1028,7 +1028,7 @@ async def _run_channel_lock_auto_unlock(bot: commands.Bot, channel_id: int, unlo
 
 
 def _schedule_channel_lock(bot: commands.Bot, channel_id: int, entry: dict):
-    """(Re)schedules the auto-unlock task for `entry` (a BotState.json
+    """(Re)schedules the auto-unlock task for `entry` (a Supabase bot_state
     "channel_locks" entry). Cancels whatever task was already tracked for
     this channel first -- shouldn't normally happen (each entry only gets
     scheduled once, at lock time or at startup), but keeps this safe to
@@ -1043,18 +1043,18 @@ def _schedule_channel_lock(bot: commands.Bot, channel_id: int, entry: dict):
 async def reconcile_channel_locks(bot: commands.Bot, state: Optional[Dict[str, Any]] = None):
     """Called once from on_ready: re-schedules every per-channel lock's
     auto-unlock timer using the durable unlock_at recorded in
-    BotState.json, so a restart before the original timer fired no longer
+    Supabase bot_state, so a restart before the original timer fired no longer
     leaves the channel locked forever until someone happens to notice and
     manually toggles it.
 
-    `state` lets a caller that's already fetched BotState.json hand it
+    `state` lets a caller that's already fetched Supabase bot_state hand it
     over directly instead of this making its own redundant fetch -- see
     reconcile_temp_bans() above for the full reasoning."""
     if state is None:
         try:
-            state, _sha = await fetch_botstate_with_sha()
-        except GitHubAPIError as e:
-            print(f"Failed to fetch BotState.json for channel lock reconciliation: {e}")
+            state = await fetch_botstate()
+        except BotStateError as e:
+            print(f"Failed to fetch Supabase bot_state for channel lock reconciliation: {e}")
             return
 
     entries = state.get("channel_locks", [])
@@ -1068,7 +1068,7 @@ async def reconcile_channel_locks(bot: commands.Bot, state: Optional[Dict[str, A
         reconciled += 1
 
     if reconciled:
-        print(f"Reconciled {reconciled} channel lock(s) from BotState.json.")
+        print(f"Reconciled {reconciled} channel lock(s) from Supabase bot_state.")
 
 
 async def _togglelock_impl(
@@ -1095,7 +1095,7 @@ async def _togglelock_impl(
 
     # Whatever timer was previously scheduled for this channel no longer
     # applies once its lock state is about to change again -- cancel the
-    # in-memory task and clear any persisted BotState.json entry so a stale
+    # in-memory task and clear any persisted Supabase bot_state entry so a stale
     # timer can't resurrect itself (or clash with a fresh one below) on the
     # next restart.
     pending_task = _lock_duration_tasks.pop(target.id, None)
@@ -1169,18 +1169,18 @@ async def _togglelock_impl(
                 state.setdefault("channel_locks", []).append(entry)
                 return state
             await update_botstate(_mutate, f"Channel lock recorded: {getattr(target, 'name', target.id)} ({target.id})")
-        except GitHubAPIError as e:
+        except BotStateError as e:
             # The lock itself already succeeded (set_permissions() above) --
             # this only means the auto-unlock timer won't survive a restart
-            # until BotState.json can be reached again. Still schedule the
+            # until Supabase bot_state can be reached again. Still schedule the
             # in-memory task below so this process's own timer works
             # regardless, and flag it to staff since a timed lock silently
             # becoming permanent on the next restart is exactly the failure
             # mode this persistence exists to prevent.
-            print(f"Failed to persist channel lock for {getattr(target, 'name', target.id)} to BotState.json: {e}")
+            print(f"Failed to persist channel lock for {getattr(target, 'name', target.id)} to Supabase bot_state: {e}")
             await send_moderation_alert(interaction.client, alert_embed(
                 "⚠️ Channel Lock Not Persisted",
-                f"{target.mention}'s timed lock couldn't be saved to BotState.json ({e}). "
+                f"{target.mention}'s timed lock couldn't be saved to Supabase bot_state ({e}). "
                 "It will still auto-unlock on schedule *this session*, but would stay locked "
                 "permanently if the bot restarts before then.",
                 color=ALERT_COLOR_CAUTION,
@@ -1282,7 +1282,7 @@ async def _persist_lockdown_state(
     announce_channel_id=None,
     message: str,
 ):
-    """Writes (or clears) BotState.json's "lockdown" key. `active=True`
+    """Writes (or clears) Supabase bot_state's "lockdown" key. `active=True`
     snapshots the *current* in-memory _lockdown_snapshots dict (so this must
     be called right after _lockdown_apply() populates it); `active=False`
     just clears it back to null."""
@@ -1303,8 +1303,8 @@ async def _persist_lockdown_state(
 
     try:
         await update_botstate(_mutate, message)
-    except GitHubAPIError as e:
-        print(f"Failed to persist lockdown state to BotState.json: {e}")
+    except BotStateError as e:
+        print(f"Failed to persist lockdown state to Supabase bot_state: {e}")
 
 
 async def _run_lockdown_auto_unlock(bot: commands.Bot, guild_id: int, unlock_at: datetime, announce_channel_id: Optional[int]):
@@ -1348,7 +1348,7 @@ def _schedule_lockdown_auto_unlock(bot: commands.Bot, guild_id: int, unlock_at: 
 
 async def reconcile_lockdown(bot: commands.Bot, state: Optional[Dict[str, Any]] = None):
     """Called once from on_ready: restores _lockdown_snapshots from
-    BotState.json if a lockdown was active when the bot last stopped (so
+    Supabase bot_state if a lockdown was active when the bot last stopped (so
     /togglelockdown correctly recognizes it's still active and can restore
     each channel's exact prior state), and reschedules the auto-lift timer
     if one was running. Without this, a restart mid-lockdown would forget
@@ -1356,14 +1356,14 @@ async def reconcile_lockdown(bot: commands.Bot, state: Optional[Dict[str, Any]] 
     there's no way left to restore each channel's original per-channel
     state short of reconstructing it by hand.
 
-    `state` lets a caller that's already fetched BotState.json hand it
+    `state` lets a caller that's already fetched Supabase bot_state hand it
     over directly instead of this making its own redundant fetch -- see
     reconcile_temp_bans() above for the full reasoning."""
     if state is None:
         try:
-            state, _sha = await fetch_botstate_with_sha()
-        except GitHubAPIError as e:
-            print(f"Failed to fetch BotState.json for lockdown reconciliation: {e}")
+            state = await fetch_botstate()
+        except BotStateError as e:
+            print(f"Failed to fetch Supabase bot_state for lockdown reconciliation: {e}")
             return
 
     lockdown = state.get("lockdown")
@@ -1385,11 +1385,11 @@ async def reconcile_lockdown(bot: commands.Bot, state: Optional[Dict[str, Any]] 
         # Indefinite lockdown (no duration was set) -- the snapshot restore
         # above is all reconciliation needs to do; there's no timer to
         # reschedule, same as it would've had no timer before the restart.
-        print("Reconciled an active indefinite lockdown from BotState.json.")
+        print("Reconciled an active indefinite lockdown from Supabase bot_state.")
         return
 
     _schedule_lockdown_auto_unlock(bot, config.GUILD_ID, unlock_at, announce_channel_id)
-    print(f"Reconciled an active lockdown from BotState.json (auto-lift at {lockdown.get('unlock_at')}).")
+    print(f"Reconciled an active lockdown from Supabase bot_state (auto-lift at {lockdown.get('unlock_at')}).")
 
 
 async def _togglelockdown_impl(
@@ -1503,14 +1503,14 @@ GHOSTPING_MODE_NOTHING = "nothing"
 GHOSTPING_MODE_ANNOUNCED = "announced"
 
 # Detection mode for /ghostping toggle. Kept in-memory for fast access from
-# on_message_delete below, mirrored to BotState.json's "ghostping_mode" key
+# on_message_delete below, mirrored to Supabase bot_state's "ghostping_mode" key
 # on every toggle so it survives a restart instead of silently resetting to
 # Nothing -- reconcile_ghostping_mode() reads it back in on_ready.
 _ghostping_mode = GHOSTPING_MODE_NOTHING
 
 
 async def _persist_ghostping_mode(message: str):
-    """Mirrors the in-memory `_ghostping_mode` to BotState.json. Best-effort
+    """Mirrors the in-memory `_ghostping_mode` to Supabase bot_state. Best-effort
     -- logged rather than raised, since the toggle itself has already taken
     effect in-process by the time this runs; a failure here only means the
     mode would fall back to Nothing on the next restart instead of resuming
@@ -1520,24 +1520,24 @@ async def _persist_ghostping_mode(message: str):
         return state
     try:
         await update_botstate(_mutate, message)
-    except GitHubAPIError as e:
-        print(f"Failed to persist ghost ping detection mode to BotState.json: {e}")
+    except BotStateError as e:
+        print(f"Failed to persist ghost ping detection mode to Supabase bot_state: {e}")
 
 
 async def reconcile_ghostping_mode(bot: commands.Bot, state: Optional[Dict[str, Any]] = None):
     """Called once from on_ready: restores `_ghostping_mode` from
-    BotState.json, so a restart resumes whichever mode staff last set via
+    Supabase bot_state, so a restart resumes whichever mode staff last set via
     /ghostping toggle instead of silently reverting to Nothing.
 
-    `state` lets a caller that's already fetched BotState.json hand it over
+    `state` lets a caller that's already fetched Supabase bot_state hand it over
     directly instead of this making its own redundant fetch -- see
     reconcile_temp_bans() above for the full reasoning."""
     global _ghostping_mode
     if state is None:
         try:
-            state, _sha = await fetch_botstate_with_sha()
-        except GitHubAPIError as e:
-            print(f"Failed to fetch BotState.json for ghost ping mode reconciliation: {e}")
+            state = await fetch_botstate()
+        except BotStateError as e:
+            print(f"Failed to fetch Supabase bot_state for ghost ping mode reconciliation: {e}")
             return
 
     mode = state.get("ghostping_mode", GHOSTPING_MODE_NOTHING)
@@ -1546,7 +1546,7 @@ async def reconcile_ghostping_mode(bot: commands.Bot, state: Optional[Dict[str, 
 
     _ghostping_mode = mode
     if _ghostping_mode != GHOSTPING_MODE_NOTHING:
-        print(f"Reconciled ghost ping detection mode from BotState.json: {_ghostping_mode}.")
+        print(f"Reconciled ghost ping detection mode from Supabase bot_state: {_ghostping_mode}.")
 
 
 async def _find_message_deleter(message: discord.Message) -> Optional[discord.abc.User]:
@@ -1658,7 +1658,7 @@ async def _ghostping_user_impl(interaction: discord.Interaction, user: discord.U
 
 async def _ghostping_toggle_impl(interaction: discord.Interaction):
     """Flips between GHOSTPING_MODE_NOTHING and GHOSTPING_MODE_ANNOUNCED,
-    persisting the new mode to BotState.json so it survives a restart --
+    persisting the new mode to Supabase bot_state so it survives a restart --
     see _ghostping_mode above."""
     global _ghostping_mode
     _ghostping_mode = GHOSTPING_MODE_ANNOUNCED if _ghostping_mode == GHOSTPING_MODE_NOTHING else GHOSTPING_MODE_NOTHING
@@ -1693,7 +1693,7 @@ class Moderation(commands.Cog):
         self.bot = bot
 
     async def cog_load(self):
-        """Warms _banned_users_cache from BotState.json's last snapshot the
+        """Warms _banned_users_cache from Supabase bot_state's last snapshot the
         moment this Cog loads -- i.e. during setup_hook, before the bot has
         even connected to the gateway. Without this there's a real window
         (confirmed via diagnostic: cache_size=0 at query time despite a
@@ -1705,7 +1705,7 @@ class Moderation(commands.Cog):
 
         Calls reconcile_banned_users_cache() with no live guild available
         yet (bot.guilds is always empty pre-connect), so it deterministically
-        takes the BotState.json fallback path -- same file, so this is
+        takes the Supabase bot_state fallback path -- same file, so this is
         exactly what on_ready's real reconcile would show if you queried it
         right this second. on_ready's later call still runs as before and
         does the authoritative guild.bans() live sync, overwriting this
@@ -1798,9 +1798,9 @@ class Moderation(commands.Cog):
             await interaction.guild.unban(banned_entry.user, reason=f"Unbanned by {interaction.user}")
 
             # If this was a temp ban, cancel its still-pending auto-unban
-            # timer and clear the BotState entry -- otherwise it's harmless
+            # timer and clear the bot-state entry -- otherwise it's harmless
             # (the scheduled unban() would just hit a NotFound and no-op)
-            # but leaves a confusing stray entry sitting in BotState.json
+            # but leaves a confusing stray entry sitting in Supabase bot_state
             # until its original timer eventually fires.
             await _cancel_temp_ban_for(target.id, interaction.guild.id)
 

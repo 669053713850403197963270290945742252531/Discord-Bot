@@ -6,7 +6,7 @@ from discord.ext import commands
 
 from api import config
 from api.discord_helpers import has_role, is_in_guild, send_success, send_error
-from api.github import GitHubAPIError, fetch_botstate_with_sha, update_botstate
+from api.bot_state import BotStateError, fetch_botstate, update_botstate
 
 GUILD = discord.Object(id=config.GUILD_ID)
 
@@ -15,7 +15,7 @@ GUILD = discord.Object(id=config.GUILD_ID)
 # currently applied to new members).
 #
 # Both pieces of state are kept in-memory for fast access from
-# on_member_join below, and mirrored to BotState.json's "autorole" key
+# on_member_join below, and mirrored to Supabase bot_state's "autorole" key
 # ({"enabled": ..., "role_id": ...}) on every /autorole set or /autorole
 # toggle so a restart resumes whatever was configured instead of silently
 # clearing it -- reconcile_autorole() below reads it back in on_ready.
@@ -27,7 +27,7 @@ _autorole_role_id: Optional[int] = None
 
 async def _persist_autorole_state(message: str):
     """Mirrors the in-memory `_autorole_enabled`/`_autorole_role_id` to
-    BotState.json. Best-effort -- logged rather than raised, since the
+    Supabase bot_state. Best-effort -- logged rather than raised, since the
     setting itself has already taken effect in-process by the time this
     runs; a failure here only means it would fall back to disabled/unset on
     the next restart instead of resuming where it left off."""
@@ -39,25 +39,25 @@ async def _persist_autorole_state(message: str):
         return state
     try:
         await update_botstate(_mutate, message)
-    except GitHubAPIError as e:
-        print(f"Failed to persist autorole state to BotState.json: {e}")
+    except BotStateError as e:
+        print(f"Failed to persist autorole state to Supabase bot_state: {e}")
 
 
 async def reconcile_autorole(bot: commands.Bot, state: Optional[Dict[str, Any]] = None):
     """Called once from on_ready: restores `_autorole_enabled` and
-    `_autorole_role_id` from BotState.json, so a restart resumes whatever
+    `_autorole_role_id` from Supabase bot_state, so a restart resumes whatever
     was configured via /autorole set + /autorole toggle instead of silently
     reverting to disabled/unset.
 
-    `state` lets a caller that's already fetched BotState.json hand it over
+    `state` lets a caller that's already fetched Supabase bot_state hand it over
     directly instead of this making its own redundant fetch -- see
     commands.moderation.reconcile_temp_bans() for the full reasoning."""
     global _autorole_enabled, _autorole_role_id
     if state is None:
         try:
-            state, _sha = await fetch_botstate_with_sha()
-        except GitHubAPIError as e:
-            print(f"Failed to fetch BotState.json for autorole reconciliation: {e}")
+            state = await fetch_botstate()
+        except BotStateError as e:
+            print(f"Failed to fetch Supabase bot_state for autorole reconciliation: {e}")
             return
 
     saved = state.get("autorole") or {}
@@ -69,7 +69,7 @@ async def reconcile_autorole(bot: commands.Bot, state: Optional[Dict[str, Any]] 
         _autorole_role_id = None
 
     if _autorole_enabled or _autorole_role_id is not None:
-        print(f"Reconciled autorole from BotState.json (enabled={_autorole_enabled}, role_id={_autorole_role_id}).")
+        print(f"Reconciled autorole from Supabase bot_state (enabled={_autorole_enabled}, role_id={_autorole_role_id}).")
 
 
 def _autorole_assignability_warning(guild: discord.Guild, role: discord.Role) -> Optional[str]:

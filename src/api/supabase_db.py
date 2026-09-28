@@ -1173,6 +1173,3 @@ async def complete_successful_execution(
 
 
 
-
-async def get_botstate_placeholder(*args, **kwargs):
-    return None

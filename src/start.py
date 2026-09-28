@@ -49,7 +49,7 @@ from discord import app_commands
 from discord.app_commands import errors as app_errors
 
 from api import config
-from api.github import GitHubAPIError, fetch_botstate_with_sha
+from api.bot_state import BotStateError, fetch_botstate
 from api.discord_helpers import send_error, notify_permission_error, reconcile_dms_enabled, safe_respond, error_embed
 from api.alerts import reconcile_alerts_enabled
 from commands.panel import ControlPanelView
@@ -92,7 +92,7 @@ EXTENSIONS = (
     "commands.obfuscate",
 )
 
-# Guards the BotState.json reconciliation block in on_ready() so it only
+# Guards the Supabase bot_state reconciliation block in on_ready() so it only
 # ever runs once per process -- on_ready can fire again on reconnect, and
 # re-running reconciliation would double-schedule every temp ban/lock/
 # access timer it already rescheduled the first time.
@@ -380,7 +380,7 @@ class Client(commands.Bot):
         self.add_view(ControlPanelView())
 
 
-        # Reads storage/BotState.json back and reschedules every timer/
+        # Reads Supabase bot_state back and reschedules every timer/
         # pointer that only ever lived in process memory before -- temp
         # ban auto-unbans, an in-progress lockdown/its auto-lift, per-
         # channel lock auto-unlocks, temp whitelist expiry notifications
@@ -398,9 +398,9 @@ class Client(commands.Bot):
             _botstate_reconciled = True
 
             try:
-                botstate, _sha = await fetch_botstate_with_sha()
-            except GitHubAPIError as e:
-                print(f"Failed to fetch BotState.json for startup reconciliation: {e}")
+                botstate = await fetch_botstate()
+            except BotStateError as e:
+                print(f"Failed to fetch Supabase bot_state for startup reconciliation: {e}")
                 botstate = None
 
             await reconcile_temp_bans(self, botstate)

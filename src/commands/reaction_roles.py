@@ -8,12 +8,12 @@ from discord.ext import commands
 
 from api import config
 from api.discord_helpers import has_role, is_in_guild, send_success, send_error, dms_enabled, safe_defer
-from api.github import GitHubAPIError, fetch_botstate_with_sha, update_botstate
+from api.bot_state import BotStateError, fetch_botstate, update_botstate
 
 GUILD = discord.Object(id=config.GUILD_ID)
 
 # =========================================================================
-# Reaction-role panel message pointer -- persisted to BotState.json's
+# Reaction-role panel message pointer -- persisted to Supabase bot_state's
 # "reaction_role_panel" key.
 #
 # The emoji->role mappings themselves already live durably: they're written
@@ -28,7 +28,7 @@ GUILD = discord.Object(id=config.GUILD_ID)
 
 
 async def _persist_reaction_role_panel(channel_id: int, message_id: int):
-    """Records the panel's current channel/message id in BotState.json.
+    """Records the panel's current channel/message id in Supabase bot_state.
     Best-effort -- logged rather than raised, since the panel message
     itself has already been created/edited by the time this is called."""
     def _mutate(state):
@@ -36,12 +36,12 @@ async def _persist_reaction_role_panel(channel_id: int, message_id: int):
         return state
     try:
         await update_botstate(_mutate, f"Reaction role panel recorded: {message_id}")
-    except GitHubAPIError as e:
-        print(f"Failed to persist reaction role panel pointer to BotState.json: {e}")
+    except BotStateError as e:
+        print(f"Failed to persist reaction role panel pointer to Supabase bot_state: {e}")
 
 
 async def _clear_reaction_role_panel_state():
-    """Clears BotState.json's "reaction_role_panel" key back to null --
+    """Clears Supabase bot_state's "reaction_role_panel" key back to null --
     called once the panel message itself is confirmed gone, so a stale
     pointer to a deleted message doesn't stick around."""
     def _mutate(state):
@@ -49,20 +49,20 @@ async def _clear_reaction_role_panel_state():
         return state
     try:
         await update_botstate(_mutate, "Reaction role panel cleared")
-    except GitHubAPIError as e:
-        print(f"Failed to clear reaction role panel pointer from BotState.json: {e}")
+    except BotStateError as e:
+        print(f"Failed to clear reaction role panel pointer from Supabase bot_state: {e}")
 
 
 async def reconcile_reaction_role_panel(bot: commands.Bot, state: Optional[Dict[str, Any]] = None):
     """Called once from on_ready: restores the ReactionRoles cog's
-    reaction_roles_message_id from BotState.json, so a restart no longer
+    reaction_roles_message_id from Supabase bot_state, so a restart no longer
     permanently silences on_raw_reaction_add/remove or risks
     /reactionrole add creating a duplicate panel next to the still-live
     one. Confirms the message still actually exists first -- if it was
     deleted while the bot was down, blindly trusting a stale pointer would
     just reproduce the same silent-no-op failure this exists to fix.
 
-    `state` lets a caller that's already fetched BotState.json hand it
+    `state` lets a caller that's already fetched Supabase bot_state hand it
     over directly instead of this making its own redundant fetch -- see
     commands.moderation.reconcile_temp_bans() for the full reasoning."""
     cog = bot.get_cog("ReactionRoles")
@@ -71,9 +71,9 @@ async def reconcile_reaction_role_panel(bot: commands.Bot, state: Optional[Dict[
 
     if state is None:
         try:
-            state, _sha = await fetch_botstate_with_sha()
-        except GitHubAPIError as e:
-            print(f"Failed to fetch BotState.json for reaction role panel reconciliation: {e}")
+            state = await fetch_botstate()
+        except BotStateError as e:
+            print(f"Failed to fetch Supabase bot_state for reaction role panel reconciliation: {e}")
             return
 
     panel = state.get("reaction_role_panel")
@@ -94,7 +94,7 @@ async def reconcile_reaction_role_panel(bot: commands.Bot, state: Optional[Dict[
     try:
         await channel.fetch_message(message_id)
     except discord.NotFound:
-        print(f"Reaction role panel message {message_id} no longer exists -- clearing BotState.json entry.")
+        print(f"Reaction role panel message {message_id} no longer exists -- clearing Supabase bot_state entry.")
         await _clear_reaction_role_panel_state()
         return
     except discord.HTTPException as e:
@@ -102,7 +102,7 @@ async def reconcile_reaction_role_panel(bot: commands.Bot, state: Optional[Dict[
         return
 
     cog.reaction_roles_message_id = message_id
-    print(f"Reconciled the reaction role panel (message {message_id}) from BotState.json.")
+    print(f"Reconciled the reaction role panel (message {message_id}) from Supabase bot_state.")
 
 
 class ReactionRoles(commands.Cog):

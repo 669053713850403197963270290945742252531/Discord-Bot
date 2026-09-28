@@ -113,10 +113,10 @@ def hwid_reset_cooldown_remaining(last_reset: Optional[str]) -> Optional[timedel
 
 
 # =========================================================================
-# UTC ISO-8601 timestamps (storage/BotState.json)
+# UTC ISO-8601 timestamps (Supabase bot_state)
 # =========================================================================
 #
-# BotState.json's timestamps (banned_at/unban_at, started_at/unlock_at,
+# Durable bot-state timestamps (banned_at/unban_at, started_at/unlock_at,
 # granted_at/expires_at, etc.) always use this format -- plain UTC with a
 # trailing Z, unlike JoinDate's local-timezone "m/d/yyyy, h:mm:ss AM/PM"
 # above -- since BotState entries are read back by reconcile_*() functions

@@ -8,6 +8,7 @@ stays a manageable size:
     config.py          env-driven constants (Discord IDs, GitHub repo, secrets)
     github.py          GitHub helpers for non-license assets
     supabase_db.py     license/user database access
+    bot_state.py       durable bot-state persistence in Supabase
     supabase_storage.py private Supabase Storage access for protected game scripts
     users.py           Discord-facing user helpers + buyer role revocation
     keys.py            key generation + input validation
@@ -65,6 +66,9 @@ from .supabase_db import (
     create_license, update_license, delete_license, redeem_license, set_license_games,
     get_license_game_ids, list_games, get_game, create_game, delete_game, update_game, game_allowed, complete_successful_execution,
 )
+
+
+from .bot_state import BotStateError, fetch_botstate, update_botstate, new_state_id
 
 from .supabase_storage import SupabaseStorageError, fetch_game_script, fetch_game_script_bytes, upload_game_script, delete_game_script, get_game_script_filename
 

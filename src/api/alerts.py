@@ -30,7 +30,7 @@ from discord.ui import View, LayoutView, Container, TextDisplay, ActionRow, Butt
 
 from . import config
 from .discord_helpers import build_embed
-from .github import GitHubAPIError, fetch_botstate_with_sha, update_botstate
+from .bot_state import BotStateError, fetch_botstate, update_botstate
 
 # Standard colors so every alert's severity reads consistently at a glance,
 # regardless of which channel it ends up in.
@@ -42,7 +42,7 @@ ALERT_COLOR_CAUTION = discord.Color.orange() # force-actions, bulk JSON edits, r
 
 # Runtime mute switches for /togglealerts whitelist and /togglealerts
 # moderation, respectively. Kept in-memory for fast access from every
-# send_alert()/send_moderation_alert() call, and mirrored to BotState.json's
+# send_alert()/send_moderation_alert() call, and mirrored to Supabase bot_state's
 # "alerts_enabled" key ({"whitelist": ..., "moderation": ...}) on every
 # toggle -- see persist_alerts_enabled_state()/reconcile_alerts_enabled()
 # below -- so a restart resumes whichever channel(s) staff last muted
@@ -89,7 +89,7 @@ def set_moderation_alerts_enabled(value: bool) -> bool:
 
 
 async def persist_alerts_enabled_state(message: str):
-    """Mirrors both in-memory mute switches to BotState.json in one commit.
+    """Mirrors both in-memory mute switches to Supabase bot_state in one commit.
     Called after set_alerts_enabled()/set_moderation_alerts_enabled() so
     either toggle's new state survives a restart. Best-effort -- logged
     rather than raised, since the mute switch itself has already taken
@@ -104,24 +104,24 @@ async def persist_alerts_enabled_state(message: str):
         return state
     try:
         await update_botstate(_mutate, message)
-    except GitHubAPIError as e:
-        print(f"Failed to persist alert mute state to BotState.json: {e}")
+    except BotStateError as e:
+        print(f"Failed to persist alert mute state to Supabase bot_state: {e}")
 
 
 async def reconcile_alerts_enabled(bot: commands.Bot, state: Optional[Dict[str, Any]] = None):
     """Called once from on_ready: restores both mute switches from
-    BotState.json, so a restart resumes whichever /togglealerts channel(s)
+    Supabase bot_state, so a restart resumes whichever /togglealerts channel(s)
     staff last muted instead of silently reopening them.
 
-    `state` lets a caller that's already fetched BotState.json hand it over
+    `state` lets a caller that's already fetched Supabase bot_state hand it over
     directly instead of this making its own redundant fetch -- see
     commands.moderation.reconcile_temp_bans() for the full reasoning."""
     global _alerts_enabled, _moderation_alerts_enabled
     if state is None:
         try:
-            state, _sha = await fetch_botstate_with_sha()
-        except GitHubAPIError as e:
-            print(f"Failed to fetch BotState.json for alert mute state reconciliation: {e}")
+            state = await fetch_botstate()
+        except BotStateError as e:
+            print(f"Failed to fetch Supabase bot_state for alert mute state reconciliation: {e}")
             return
 
     saved = state.get("alerts_enabled") or {}
@@ -130,7 +130,7 @@ async def reconcile_alerts_enabled(bot: commands.Bot, state: Optional[Dict[str, 
 
     if not _alerts_enabled or not _moderation_alerts_enabled:
         print(
-            "Reconciled alert mute state from BotState.json "
+            "Reconciled alert mute state from Supabase bot_state "
             f"(whitelist={_alerts_enabled}, moderation={_moderation_alerts_enabled})."
         )
 
@@ -172,7 +172,7 @@ async def send_alert(bot: commands.Bot, embed: discord.Embed, view: Optional[Vie
     else it would otherwise trigger is suppressed.
 
     Returns the sent Message (so a caller that needs its id -- e.g. to
-    persist a breach alert's message_id to BotState.json for reconciliation
+    persist a breach alert's message_id to Supabase bot_state for reconciliation
     on restart -- can capture it), or None if nothing was actually sent
     (muted, missing channel, or a delivery failure)."""
     if not _alerts_enabled and not bypass_mute:

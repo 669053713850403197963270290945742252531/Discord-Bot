@@ -132,7 +132,7 @@ RAW_URL = f"https://raw.githubusercontent.com/{OWNER}/{REPO}/refs/heads/{BRANCH}
 API_URL = f"https://api.github.com/repos/{OWNER}/{REPO}/contents/{FILE_PATH}?ref={BRANCH}"
 
 # Separate GitHub repository used for non-license bot storage such as
-# storedscript.lua, BotState.json, and shortened-urls.json.
+# storedscript.lua and shortened-urls.json.
 STORAGE_REPO = _require("GITHUB_STORAGE_REPO")
 STORAGE_BRANCH = os.getenv("GITHUB_STORAGE_BRANCH", "main")
 
@@ -144,28 +144,15 @@ STORED_SCRIPT_FILE_PATH = "storage/storedscript.lua"
 STORED_SCRIPT_RAW_URL = f"https://raw.githubusercontent.com/{OWNER}/{STORAGE_REPO}/refs/heads/{STORAGE_BRANCH}/{STORED_SCRIPT_FILE_PATH}"
 STORED_SCRIPT_API_URL = f"https://api.github.com/repos/{OWNER}/{STORAGE_REPO}/contents/{STORED_SCRIPT_FILE_PATH}?ref={STORAGE_BRANCH}"
 
-# storage/BotState.json -- durable checkpoint for everything that used to
-# live only in process memory: temp ban unban timers, server lockdown/
-# per-channel lock snapshots+timers, temp Bot Access grants, the reaction-role
-# panel message pointer, temp role
-# auto-removal timers, ghost ping detection mode, the autorole toggle+role,
-# the /togglealerts whitelist/moderation mute switches, and /warnings'
-# warning records. Read back on
-# every startup (see each cog's reconcile_*() function, called from
-# start.py's on_ready) so a restart degrades to "resume where it left off"
-# instead of "silently forget this was ever temporary." Lives in this bot's
-# own storage repo, same as storedscript.lua above.
-BOTSTATE_FILE_PATH = "storage/BotState.json"
-BOTSTATE_RAW_URL = f"https://raw.githubusercontent.com/{OWNER}/{STORAGE_REPO}/refs/heads/{STORAGE_BRANCH}/{BOTSTATE_FILE_PATH}"
-BOTSTATE_API_URL = f"https://api.github.com/repos/{OWNER}/{STORAGE_REPO}/contents/{BOTSTATE_FILE_PATH}?ref={STORAGE_BRANCH}"
+# Durable bot state is stored in Supabase public.bot_state.
+# GitHub storage remains used by storedscript.lua and shortened-urls.json.
 
 # storage/shortened-urls.json -- durable record of every link/paste/upload
 # any /url (or future /upload, /paste) command has created, one file
 # shared across every provider (namespaced per-provider inside, e.g.
 # "ez_host") rather than one file per provider. See api/github.py's
 # "Shortened URLs" section for the schema. Lives in this bot's own
-# storage repo, same as BotState.json/storedscript.lua
-# above.
+# storage repo, same as storedscript.lua above.
 SHORTENED_URLS_FILE_PATH = "storage/shortened-urls.json"
 SHORTENED_URLS_RAW_URL = f"https://raw.githubusercontent.com/{OWNER}/{STORAGE_REPO}/refs/heads/{STORAGE_BRANCH}/{SHORTENED_URLS_FILE_PATH}"
 SHORTENED_URLS_API_URL = f"https://api.github.com/repos/{OWNER}/{STORAGE_REPO}/contents/{SHORTENED_URLS_FILE_PATH}?ref={STORAGE_BRANCH}"

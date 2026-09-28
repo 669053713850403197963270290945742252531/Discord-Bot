@@ -1,0 +1,34 @@
+{
+  "schema_version": 1,
+  "temp_bans": [],
+  "banned_users": [],
+  "lockdown": null,
+  "channel_locks": [],
+  "temp_bot_access": [],
+  "pending_breach_alerts": [],
+  "reaction_role_panel": {
+    "channel_id": "1403125677925863484",
+    "message_id": "1536184003361640541"
+  },
+  "temp_roles": [],
+  "ghostping_mode": "announced",
+  "autorole": {
+    "enabled": false,
+    "role_id": "1403129577269760090"
+  },
+  "alerts_enabled": {
+    "whitelist": true,
+    "moderation": true
+  },
+  "dms_enabled": true,
+  "warnings": [],
+  "warning_config": {
+    "enabled": true,
+    "threshold": 3,
+    "action": "timeout",
+    "timeout_minutes": 40320,
+    "reset_after_action": true,
+    "notify_target": true
+  },
+  "hwid_reset_cooldowns": {}
+}

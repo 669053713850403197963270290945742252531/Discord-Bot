@@ -16,7 +16,7 @@ from discord import app_commands
 from discord.ext import commands
 from discord.ui import ActionRow, Button, Container, File, LayoutView, TextDisplay
 
-from api.github import GitHubAPIError, fetch_botstate_with_sha, update_botstate
+from api.bot_state import BotStateError, fetch_botstate, update_botstate
 from api.keys import is_valid_discord_id
 
 # =========================================================================
@@ -152,7 +152,7 @@ def embed_within_limits(embed: discord.Embed) -> bool:
 # member-path DM, temprole grant/expiry, reaction role add/remove -- see
 # each of those modules for their own `if dms_enabled():` guard). Kept
 # in-memory for fast access from every DM call site, and mirrored to
-# BotState.json's "dms_enabled" key on every toggle -- see
+# Supabase bot_state's "dms_enabled" key on every toggle -- see
 # persist_dms_enabled_state()/reconcile_dms_enabled() below -- so a restart
 # resumes whichever state staff last left it in instead of silently
 # reopening DMs. Defaults to enabled so a restart before reconciliation
@@ -181,7 +181,7 @@ def set_dms_enabled(value: bool) -> bool:
 
 
 async def persist_dms_enabled_state(message: str):
-    """Mirrors the in-memory switch to BotState.json. Called after
+    """Mirrors the in-memory switch to Supabase bot_state. Called after
     set_dms_enabled() so the new state survives a restart. Best-effort --
     logged rather than raised, since the mute switch itself has already
     taken effect in-process by the time this runs; a failure here only
@@ -192,30 +192,30 @@ async def persist_dms_enabled_state(message: str):
         return state
     try:
         await update_botstate(_mutate, message)
-    except GitHubAPIError as e:
-        print(f"Failed to persist DM mute state to BotState.json: {e}")
+    except BotStateError as e:
+        print(f"Failed to persist DM mute state to Supabase bot_state: {e}")
 
 
 async def reconcile_dms_enabled(bot: commands.Bot, state: Optional[Dict[str, Any]] = None):
-    """Called once from on_ready: restores the switch from BotState.json,
+    """Called once from on_ready: restores the switch from Supabase bot_state,
     so a restart resumes whatever /toggledms state staff last left it in
     instead of silently reopening DMs.
 
-    `state` lets a caller that's already fetched BotState.json hand it over
+    `state` lets a caller that's already fetched Supabase bot_state hand it over
     directly instead of this making its own redundant fetch -- see
     commands.moderation.reconcile_temp_bans() for the full reasoning."""
     global _dms_enabled
     if state is None:
         try:
-            state, _sha = await fetch_botstate_with_sha()
-        except GitHubAPIError as e:
-            print(f"Failed to fetch BotState.json for DM mute state reconciliation: {e}")
+            state = await fetch_botstate()
+        except BotStateError as e:
+            print(f"Failed to fetch Supabase bot_state for DM mute state reconciliation: {e}")
             return
 
     _dms_enabled = bool(state.get("dms_enabled", True))
 
     if not _dms_enabled:
-        print("Reconciled DM mute state from BotState.json (dms_enabled=False).")
+        print("Reconciled DM mute state from Supabase bot_state (dms_enabled=False).")
 
 
 # =========================================================================

@@ -19,13 +19,13 @@ from api.alerts import (
     moderation_alerts_enabled, set_moderation_alerts_enabled,
     persist_alerts_enabled_state,
 )
-from api.github import GitHubAPIError, fetch_botstate_with_sha, update_botstate, new_state_id
+from api.bot_state import BotStateError, fetch_botstate, update_botstate, new_state_id
 from api.time_utils import format_iso, parse_iso, seconds_until
 
 GUILD = discord.Object(id=config.GUILD_ID)
 
 # =========================================================================
-# /tempaccess -- persisted to BotState.json's "temp_bot_access" list so a
+# /tempaccess -- persisted to Supabase bot_state's "temp_bot_access" list so a
 # restart before the auto-removal timer fires no longer leaves the role on
 # the user permanently, with zero durable trail to notice it later (unlike
 # temp whitelist, which at least records its expiration in Users.json's
@@ -36,7 +36,7 @@ GUILD = discord.Object(id=config.GUILD_ID)
 
 # Discord IDs currently holding the Bot Access role via /tempaccess, so a
 # second grant for the same user can be rejected instead of stacking
-# timers. Fast in-memory membership check; BotState.json's
+# timers. Fast in-memory membership check; Supabase bot_state's
 # "temp_bot_access" list is the durable source of truth.
 _active_temp_access: set = set()
 
@@ -50,7 +50,7 @@ _temp_access_tasks: dict = {}
 
 
 async def _clear_temp_access_state(discord_id: int):
-    """Removes the persisted BotState.json entry (if any) for `discord_id`.
+    """Removes the persisted Supabase bot_state entry (if any) for `discord_id`.
     Best-effort -- logged rather than raised, since the Discord-side role
     change has already happened by the time this runs."""
     def _mutate(state):
@@ -58,14 +58,14 @@ async def _clear_temp_access_state(discord_id: int):
         return state
     try:
         await update_botstate(_mutate, f"Temp Bot Access resolved: {discord_id}")
-    except GitHubAPIError as e:
-        print(f"Failed to clear resolved temp Bot Access for {discord_id} from BotState.json: {e}")
+    except BotStateError as e:
+        print(f"Failed to clear resolved temp Bot Access for {discord_id} from Supabase bot_state: {e}")
 
 
 async def _run_temp_access_removal(bot: commands.Bot, entry: dict):
     """Sleeps until `entry`'s expires_at (or fires almost immediately if
     that's already in the past -- e.g. the bot was down past it), then
-    removes the role and clears the BotState entry. Shared by both a fresh
+    removes the role and clears the bot-state entry. Shared by both a fresh
     /tempaccess grant and startup reconciliation, so there's exactly one
     code path for "what happens when a temp access timer goes off.\""""
     discord_id = int(entry["discord_id"])
@@ -114,22 +114,22 @@ def _schedule_temp_access(bot: commands.Bot, entry: dict):
 async def reconcile_temp_access(bot: commands.Bot, state: Optional[Dict[str, Any]] = None):
     """Called once from on_ready: re-schedules every temp Bot Access
     grant's auto-removal timer using the durable expires_at recorded in
-    BotState.json, so a restart before the original timer fired no longer
+    Supabase bot_state, so a restart before the original timer fired no longer
     leaves the role on the user permanently with nothing anywhere to
     indicate that wasn't intentional. Entries whose expires_at has already
     passed fire (almost) immediately via seconds_until()'s clamp-to-zero,
     rather than staying granted indefinitely until someone notices.
 
-    `state` lets a caller that's already fetched BotState.json (e.g.
+    `state` lets a caller that's already fetched Supabase bot_state (e.g.
     start.py's on_ready, reconciling several categories back to back) hand
     it over directly instead of this making its own redundant fetch of the
     exact same file. Falls back to fetching it itself when called on its
     own with nothing passed in."""
     if state is None:
         try:
-            state, _sha = await fetch_botstate_with_sha()
-        except GitHubAPIError as e:
-            print(f"Failed to fetch BotState.json for temp Bot Access reconciliation: {e}")
+            state = await fetch_botstate()
+        except BotStateError as e:
+            print(f"Failed to fetch Supabase bot_state for temp Bot Access reconciliation: {e}")
             return
 
     entries = state.get("temp_bot_access", [])
@@ -137,7 +137,7 @@ async def reconcile_temp_access(bot: commands.Bot, state: Optional[Dict[str, Any
         _schedule_temp_access(bot, entry)
 
     if entries:
-        print(f"Reconciled {len(entries)} temp Bot Access grant(s) from BotState.json.")
+        print(f"Reconciled {len(entries)} temp Bot Access grant(s) from Supabase bot_state.")
 
 
 async def _toggleaccess_impl(interaction: discord.Interaction, user: discord.Member):
@@ -151,10 +151,10 @@ async def _toggleaccess_impl(interaction: discord.Interaction, user: discord.Mem
         await user.remove_roles(role, reason=f"Toggled off Bot Access role by {interaction.user}")
 
         # If this role came from a still-pending /tempaccess grant, cancel
-        # its auto-removal timer and clear the BotState.json entry -- same
+        # its auto-removal timer and clear the Supabase bot_state entry -- same
         # reasoning as /unban cancelling a temp ban in moderation.py --
         # otherwise the stale timer fires harmlessly-but-uselessly later
-        # and leaves a confusing stray entry in BotState.json until then.
+        # and leaves a confusing stray entry in Supabase bot_state until then.
         task = _temp_access_tasks.pop(user.id, None)
         if task:
             task.cancel()
@@ -215,18 +215,18 @@ async def _tempaccess_impl(interaction: discord.Interaction, user: discord.Membe
             state.setdefault("temp_bot_access", []).append(entry)
             return state
         await update_botstate(_mutate, f"Temp Bot Access recorded: {user} ({user.id})")
-    except GitHubAPIError as e:
+    except BotStateError as e:
         # The role grant itself already succeeded (add_roles() above) --
         # this only means the auto-removal timer won't survive a restart
-        # until BotState.json can be reached again. Still schedule the
+        # until Supabase bot_state can be reached again. Still schedule the
         # in-memory task below so this process's own timer works
         # regardless, and flag it to staff since temp access silently
         # becoming permanent on the next restart is exactly the failure
         # mode this persistence exists to prevent.
-        print(f"Failed to persist temp Bot Access for {user} to BotState.json: {e}")
+        print(f"Failed to persist temp Bot Access for {user} to Supabase bot_state: {e}")
         await send_alert(interaction.client, alert_embed(
             "⚠️ Temp Bot Access Not Persisted",
-            f"{user.mention}'s temporary Bot Access couldn't be saved to BotState.json ({e}). "
+            f"{user.mention}'s temporary Bot Access couldn't be saved to Supabase bot_state ({e}). "
             "It will still auto-remove on schedule *this session*, but would stay on the user "
             "permanently if the bot restarts before then.",
             color=ALERT_COLOR_CAUTION,
@@ -248,7 +248,7 @@ async def _togglealerts_whitelist_impl(interaction: discord.Interaction):
     itself always posts to the Alerts channel (bypass_mute=True) even when
     turning alerts *off*, so there's a visible record of exactly when/why
     the channel went quiet instead of it just stopping with no trace.
-    Persisted to BotState.json so the mute state survives a restart
+    Persisted to Supabase bot_state so the mute state survives a restart
     instead of failing back open."""
     now_enabled = set_alerts_enabled(not alerts_enabled())
     await persist_alerts_enabled_state(
@@ -277,7 +277,7 @@ async def _togglealerts_moderation_impl(interaction: discord.Interaction):
     flips api.alerts's moderation-side mute switch (the separate Moderation
     Alerts channel that /ban, /kick, /mute, lock/lockdown toggles, and the
     rest of commands.moderation post to) instead of the whitelist one. Same
-    always-visible-toggle, persisted-to-BotState.json conventions as the
+    always-visible-toggle, persisted-to-Supabase bot_state conventions as the
     whitelist version -- see that function's docstring for the full
     reasoning."""
     now_enabled = set_moderation_alerts_enabled(not moderation_alerts_enabled())
@@ -309,7 +309,7 @@ async def _toggledms_impl(interaction: discord.Interaction):
     notices, temprole grant/expiry notices, and reaction role add/remove
     notices. Deliberately leaves /dm and /checktemp's tracker alone, since
     those commands' entire purpose is to deliver a DM rather than notify
-    about a side effect of something else. Persisted to BotState.json so
+    about a side effect of something else. Persisted to Supabase bot_state so
     the state survives a restart instead of failing back open."""
     now_enabled = set_dms_enabled(not dms_enabled())
     await persist_dms_enabled_state(
