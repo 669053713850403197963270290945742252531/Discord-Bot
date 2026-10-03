@@ -166,13 +166,14 @@ def _upload_sync(path: str, data: bytes) -> None:
     mime_types = {
         ".luau": "text/x-luau",
         ".lua": "text/x-lua",
+        ".txt": "text/plain",
         ".json": "application/json",
     }
     content_type = mime_types.get(suffix)
     if content_type is None:
         raise SupabaseStorageError(
             f"Unsupported game script file type {suffix or '<none>'!r}; "
-            "expected .luau, .lua, or .json"
+            "expected .luau, .lua, .txt, or .json"
         )
 
     headers = {

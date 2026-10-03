@@ -19,6 +19,44 @@ from api.users import revoke_buyer_role, find_removed_discord_ids
 
 GUILD = discord.Object(id=config.GUILD_ID)
 
+_ALLOWED_GAME_SCRIPT_EXTENSIONS = {".lua", ".luau", ".txt"}
+
+
+def _validate_game_script_attachment(file: discord.Attachment) -> str | None:
+    """Validate a `/games update` attachment before it is read or uploaded.
+
+    The filename is user-controlled, so require one of the explicitly supported
+    source-text extensions and reject names without an extension. The content
+    is validated separately after reading to prevent binary files that merely
+    have a script-looking filename from being stored as a game script.
+    """
+    filename = str(getattr(file, "filename", "") or "").strip()
+    if not filename:
+        return "The uploaded file must have a filename."
+
+    suffix = PurePosixPath(filename).suffix.lower()
+    if suffix not in _ALLOWED_GAME_SCRIPT_EXTENSIONS:
+        allowed = ", ".join(f"`{ext}`" for ext in (".lua", ".luau", ".txt"))
+        return f"Invalid game script file type. Only {allowed} files are accepted."
+
+    return None
+
+
+def _validate_game_script_bytes(data: bytes) -> str | None:
+    """Reject empty, binary, or otherwise non-text upload payloads."""
+    if not data:
+        return "The uploaded script file is empty."
+
+    try:
+        data.decode("utf-8-sig")
+    except UnicodeDecodeError:
+        return "The uploaded game script must be a valid UTF-8 text file."
+
+    if b"\x00" in data:
+        return "The uploaded game script contains binary data and cannot be used."
+
+    return None
+
 
 class GameEditModal(discord.ui.Modal, title="Edit Game"):
         game_id = discord.ui.Label(text="Game ID", component=discord.ui.TextInput(max_length=100))
@@ -496,10 +534,14 @@ class Database(commands.Cog):
     @is_in_guild(config.GUILD_ID)
     @app_commands.describe(
         game_id="The game ID whose configured script should be replaced.",
-        file="The new game script file to upload.",
+        file="The new game script file (.lua, .luau, or .txt).",
     )
     async def games_update(self, interaction, game_id: str, file: discord.Attachment):
         await safe_defer(interaction, ephemeral=True)
+
+        file_error = _validate_game_script_attachment(file)
+        if file_error:
+            return await send_error(interaction, file_error)
 
         try:
             game = await get_game(game_id.strip())
@@ -518,8 +560,9 @@ class Database(commands.Cog):
         except Exception as exc:
             return await send_error(interaction, f"Failed to read the uploaded script file: {exc}")
 
-        if not data:
-            return await send_error(interaction, "The uploaded script file is empty.")
+        content_error = _validate_game_script_bytes(data)
+        if content_error:
+            return await send_error(interaction, content_error)
 
         try:
             await upload_game_script(script_path, data)
