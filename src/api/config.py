@@ -1,12 +1,11 @@
 """
 Central configuration for the bot. Every secret and every deployment-specific
-ID (guild, roles, channels, target GitHub repo) is loaded from the
+ID (guild, roles, channels, database/storage settings) is loaded from the
 environment -- populated from the .env file at the project root via
 python-dotenv -- so nothing here is hardcoded.
 """
 
 import os
-import json
 from zoneinfo import ZoneInfo
 
 from dotenv import load_dotenv
@@ -31,7 +30,6 @@ def _require_int(name: str) -> int:
 
 # Secrets
 DISCORD_TOKEN = _require("DISCORD_TOKEN")
-GITHUB_TOKEN = _require("GITHUB_TOKEN")
 # e-z.host "upload key" (dashboard-issued) -- see api/providers/ez_host.py
 # for the API calls this authenticates. e-z.host is the default provider for
 # /url shorten, /paste, and /file (see api/providers/registry.py), so unlike
@@ -122,46 +120,6 @@ from datetime import timedelta
 RESET_HWID_COOLDOWN = timedelta(days=7)
 
 
-# GitHub repo the whitelist database (Users.json) lives in
-OWNER = _require("GITHUB_OWNER")
-REPO = _require("GITHUB_REPO")
-FILE_PATH = "Users.json"
-BRANCH = os.getenv("GITHUB_BRANCH", "main")
-
-RAW_URL = f"https://raw.githubusercontent.com/{OWNER}/{REPO}/refs/heads/{BRANCH}/{FILE_PATH}"
-API_URL = f"https://api.github.com/repos/{OWNER}/{REPO}/contents/{FILE_PATH}?ref={BRANCH}"
-
-# Separate GitHub repository used for non-license bot storage such as
-# storedscript.lua and shortened-urls.json.
-STORAGE_REPO = _require("GITHUB_STORAGE_REPO")
-STORAGE_BRANCH = os.getenv("GITHUB_STORAGE_BRANCH", "main")
-
-# GitHub-backed stored script used by the Discord control panel. Protected game scripts are stored in Supabase Storage.
-# storedscript.lua -- the base script /createpanel's "Get Script" button hands
-# out, with each user's Key spliced into its global script_key line.
-# /updatescript writes this back via commit_stored_script().
-STORED_SCRIPT_FILE_PATH = "storage/storedscript.lua"
-STORED_SCRIPT_RAW_URL = f"https://raw.githubusercontent.com/{OWNER}/{STORAGE_REPO}/refs/heads/{STORAGE_BRANCH}/{STORED_SCRIPT_FILE_PATH}"
-STORED_SCRIPT_API_URL = f"https://api.github.com/repos/{OWNER}/{STORAGE_REPO}/contents/{STORED_SCRIPT_FILE_PATH}?ref={STORAGE_BRANCH}"
-
-# Durable bot state is stored in Supabase public.bot_state.
-# GitHub storage remains used by storedscript.lua and shortened-urls.json.
-
-# storage/shortened-urls.json -- durable record of every link/paste/upload
-# any /url (or future /upload, /paste) command has created, one file
-# shared across every provider (namespaced per-provider inside, e.g.
-# "ez_host") rather than one file per provider. See api/github.py's
-# "Shortened URLs" section for the schema. Lives in this bot's own
-# storage repo, same as storedscript.lua above.
-SHORTENED_URLS_FILE_PATH = "storage/shortened-urls.json"
-SHORTENED_URLS_RAW_URL = f"https://raw.githubusercontent.com/{OWNER}/{STORAGE_REPO}/refs/heads/{STORAGE_BRANCH}/{SHORTENED_URLS_FILE_PATH}"
-SHORTENED_URLS_API_URL = f"https://api.github.com/repos/{OWNER}/{STORAGE_REPO}/contents/{SHORTENED_URLS_FILE_PATH}?ref={STORAGE_BRANCH}"
-
-HEADERS = {
-    "Authorization": f"Bearer {GITHUB_TOKEN}",
-    "Accept": "application/vnd.github+json",
-}
-
 
 # Public license-service settings. The License Server is always enabled.
 # Render exposes RENDER_EXTERNAL_URL automatically; local development falls
@@ -208,11 +166,6 @@ else:
     SENTIVEL_ENABLED = _SENTIVEL_ENABLED_ENV.strip().lower() not in ("false", "0", "no", "off")
 SENTIVEL_HEARTBEAT_URL = os.getenv("SENTIVEL_HEARTBEAT_URL", "").strip()
 
-# Used by api/webhook_sync.py to figure out where this process is currently
-# reachable, so it can keep the GitHub webhook's Payload URL pointed at the
-# right place without manual editing on every restart. See that module for
-# the full explanation of when each of these is actually used.
-#
 # Render sets RENDER_EXTERNAL_URL itself at runtime for every web service,
 # so this is only a fallback for the (essentially never) case that's unset.
 RENDER_FALLBACK_URL = os.getenv("RENDER_FALLBACK_URL", "https://discord-bot-lee1.onrender.com")

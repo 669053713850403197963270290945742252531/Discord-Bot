@@ -1,6 +1,6 @@
 # Discord-Bot
 
-A Discord bot backed by a GitHub-hosted `Users` whitelist database, with
+A Discord bot backed by Supabase for its license/user, bot-state, and persistent URL data, with
 key generation/redemption, HWID locking, moderation, reaction roles,
 password/passphrase and classic-cipher tools, modern authenticated
 encryption, string entropy analysis, a QR code generator, and a persistent
@@ -22,8 +22,8 @@ Discord-Bot/
 │   ├── keep_alive.py            # tiny Flask server so host platforms see an open port
 │   ├── api/                     # shared library code (no Discord commands live here)
 │   │   ├── __init__.py          # re-exports everything below, so cogs can `from api import X`
-│   │   ├── config.py            # env-driven constants (Discord IDs, GitHub repo, secrets)
-│   │   ├── github.py            # GitHub Contents API + Users cache, valid keys, stored script
+│   │   ├── config.py            # env-driven constants (Discord IDs, Supabase, secrets)
+│   │   ├── shortened_urls.py     # Supabase persistence for links, pastes, and hosted files
 │   │   ├── users.py             # user-record lookups/building + buyer role revocation
 │   │   ├── keys.py              # key generation + input validation
 │   │   ├── time_utils.py        # date formatting/parsing + temp-whitelist expiration
@@ -183,8 +183,8 @@ single-provider behavior.
 | `/paste` | E-Z, paste.ee, pastey.gg, Rubiš | `access_key` (paste.ee, pastey.gg -- bring your own key instead of this bot's configured default); `visibility`; `expires` (paste.ee -- one shared option name, routed to each provider's own differently-formatted field under the hood); `language` gets autocomplete suggestions from `api/providers/languages.py` (~137 entries, Python/Lua/Luau/JS-family prioritized) but isn't a restricted choice -- every provider treats it as an unvalidated passthrough string, so a spelling that isn't in the suggestion list still works fine |
 | `/file` | E-Z, Catbox, Litterbox | `expiry` (Litterbox only, one of `1h`/`12h`/`24h`/`72h` -- Litterbox's API requires one, so it defaults to `1h` if the option's left blank while Litterbox is selected) |
 
-Every successful create is persisted to `storage/shortened-urls.json`
-(`api/github.py`) the moment the provider responds, under that provider's
+Every successful create is persisted to `shortened_urls` in Supabase
+(`api/shortened_urls.py`) the moment the provider responds, under that provider's
 own namespace alongside every other provider that's ever been used --
 most providers only ever hand back a deletion credential once, at
 creation, so it has to be captured immediately or it's gone for good. A

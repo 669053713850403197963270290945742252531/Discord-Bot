@@ -95,11 +95,34 @@ async def _get_json(url: str, params: Dict[str, str], session: Optional[aiohttp.
                     # otherwise there's no way to tell that case apart
                     # from a genuine API-shape change without re-running
                     # the request outside this module.
-                    body = (await resp.text())[:200].strip()
+                    body = (await resp.text()).strip()
                     ct = resp.headers.get("Content-Type", "unknown")
+
+                    # is.gd normally returns JSON when format=json is requested,
+                    # but its current backend can return a plain-text/HTML error
+                    # page instead. In particular, `Error, database insert failed`
+                    # is a service-side creation failure that has been observed
+                    # when is.gd cannot persist the new short-link record. Do not
+                    # make users debug the provider's response format; surface the
+                    # actual provider error cleanly instead.
+                    normalized_body = body.lower()
+                    if normalized_body == "error, database insert failed":
+                        raise IsGdAPIError(
+                            "is.gd could not create the shortened link because its "
+                            "backend failed to save the new record. Please try again "
+                            "later; this is an is.gd service error."
+                        )
+                    if normalized_body.startswith("error:"):
+                        message = body.split(":", 1)[1].strip() or "is.gd rejected the request."
+                        raise IsGdAPIError(message)
+                    if normalized_body.startswith("error,"):
+                        message = body.split(",", 1)[1].strip() or "is.gd rejected the request."
+                        raise IsGdAPIError(message)
+
+                    snippet = body[:200]
                     raise IsGdAPIError(
                         f"is.gd returned a non-JSON response (Content-Type: {ct}). "
-                        f"Body started with: {body!r}"
+                        f"Body started with: {snippet!r}"
                     )
         except (aiohttp.ClientError, TimeoutError) as e:
             raise IsGdAPIError(f"Couldn't reach is.gd: {_describe_network_error(e, _TIMEOUT)}")

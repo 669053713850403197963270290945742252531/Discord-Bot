@@ -9,14 +9,15 @@ feature's pre-multi-provider-expansion behavior (unshorten's live fallback
 aside, which can reach any http(s) host regardless of provider -- see
 api.redirect_resolver / api.ssrf_guard).
 
-Persists every successful create to storage/shortened-urls.json the
-moment the provider's response comes back (see api.github.save_shortened_url)
--- most providers only ever hand back an entry's deletion_url once, at
-creation (some don't hand one back at all -- see registry.py), so it has
-to be captured immediately or it's gone for good.
+Persists every successful create to the Supabase `shortened_urls` table
+the moment the provider's response comes back. Most providers only ever
+hand back an entry's deletion_url once, at creation (some don't hand one
+back at all -- see registry.py), so it has to be captured immediately or
+it's gone for good.
 """
 
 from datetime import datetime, timezone
+import json
 from typing import Any, Callable, Dict, List, Optional, Tuple
 
 import discord
@@ -31,8 +32,8 @@ from api.discord_helpers import (
 )
 from api.alerts import send_alert, alert_embed, ALERT_COLOR_REMOVE
 from api.keys import is_valid_url
-from api.github import (
-    GitHubAPIError, save_shortened_url, find_shortened_url_entry,
+from api.shortened_urls import (
+    ShortenedURLStoreError, save_shortened_url, find_shortened_url_entry,
     find_matching_shortened_urls, clear_shortened_urls,
 )
 from api.providers.errors import ProviderAPIError
@@ -212,13 +213,12 @@ async def _persist_or_degrade(
     kind: str,
     short_code: str,
     entry: Dict[str, Any],
-    commit_message: str,
     success_description: str,
     success_fields: List[Tuple[str, Any, bool]],
     deletion_url: Optional[str],
 ):
     """Shared tail end of /url shorten, /paste, and /file: persist the
-    entry the provider just created, then reply. If the GitHub write
+    entry the provider just created, then reply. If the Supabase write
     fails, the provider call already succeeded by this point -- that
     shouldn't read as the command having failed outright, just that this
     record won't survive a restart, so this degrades to showing the
@@ -231,21 +231,21 @@ async def _persist_or_degrade(
     which case there's nothing to fall back to showing, so that half of
     the warning field is skipped rather than showing a `None`."""
     try:
-        await save_shortened_url(provider, kind, short_code, entry, commit_message)
-    except GitHubAPIError as e:
-        print(f"Failed to persist {provider}/{kind} {short_code} to shortened-urls.json: {e}")
+        await save_shortened_url(provider, kind, short_code, entry)
+    except ShortenedURLStoreError as e:
+        print(f"Failed to persist {provider}/{kind} {short_code} to Supabase: {e}")
         fields = list(success_fields)
         if deletion_url:
             fields.append((
                 "⚠️ Not saved to persistent storage",
-                f"Couldn't record this in shortened-urls.json ({e}). "
+                f"Couldn't record this in the Supabase database ({e}). "
                 f"Save this now if you'll need to delete it later -- it won't be shown again:\n`{deletion_url}`",
                 False,
             ))
         else:
             fields.append((
                 "⚠️ Not saved to persistent storage",
-                f"Couldn't record this in shortened-urls.json ({e}).",
+                f"Couldn't record this in the Supabase database ({e}).",
                 False,
             ))
         return await send_success(interaction, success_description, fields=fields, ephemeral=True)
@@ -285,7 +285,7 @@ async def _url_shorten_impl(
             "is.gd, the only provider with click-statistics logging.",
         )
 
-    # Both the provider call and the GitHub commit that follows are real
+    # Both the provider call and the Supabase write that follows are real
     # network round trips that can easily blow Discord's ~3s ack window,
     # so defer before either one. Ephemeral, matching the ephemeral
     # success reply below -- a deferral's ephemeral flag can't be
@@ -318,7 +318,6 @@ async def _url_shorten_impl(
         kind="shorten",
         short_code=short_code,
         entry=entry,
-        commit_message=f"Shortened URL created by {interaction.user} ({interaction.user.id}) via {provider}: {short_code}",
         success_description=f"Shortened: {result['short_url']}",
         success_fields=[("Original", url, False), ("Provider", provider_info["label"], True)],
         deletion_url=result["deletion_url"],
@@ -718,7 +717,6 @@ async def _url_paste_impl(
         kind="paste",
         short_code=short_code,
         entry=entry,
-        commit_message=f"Paste created by {interaction.user} ({interaction.user.id}) via {provider}: {short_code}",
         success_description="Paste created.",
         success_fields=fields,
         deletion_url=result["deletion_url"],
@@ -772,7 +770,7 @@ async def _url_file_impl(
         expiry = _LITTERBOX_DEFAULT_EXPIRY
 
     # Downloading the attachment from Discord's CDN is itself a network
-    # round trip, on top of the provider upload and GitHub commit that
+    # round trip, on top of the provider upload and Supabase write that
     # follow -- defer before any of them, same ephemeral-from-the-start
     # reasoning as /url shorten and /paste.
     await safe_defer(interaction, ephemeral=True)
@@ -805,7 +803,6 @@ async def _url_file_impl(
         kind="file",
         short_code=short_code,
         entry=entry,
-        commit_message=f"File uploaded by {interaction.user} ({interaction.user.id}) via {provider}: {short_code}",
         success_description=f"Uploaded: {result['file_url']}",
         success_fields=[
             ("Original filename", file.filename, False),
@@ -816,20 +813,51 @@ async def _url_file_impl(
 
 
 def _format_created_at(created_at: Optional[str]) -> str:
-    """Renders a shortened-urls.json entry's created_at (always
-    "%Y-%m-%dT%H:%M:%SZ" UTC -- see _url_shorten_impl/_url_paste_impl/
-    _url_file_impl above, which all stamp it the same way) as a Discord
-    <t:...> timestamp, so it displays in whoever's looking at it's own
-    local time. Not api.time_utils.format_discord_timestamp() -- that
-    one's built around JoinDate's "m/d/yyyy, h:mm:ss AM/PM" format,
-    which this isn't."""
+    """Render a persisted timestamp as a Discord timestamp."""
     if not created_at:
         return "N/A"
     try:
-        dt = datetime.strptime(created_at, "%Y-%m-%dT%H:%M:%SZ").replace(tzinfo=timezone.utc)
+        dt = datetime.fromisoformat(str(created_at).replace("Z", "+00:00"))
+        if dt.tzinfo is None:
+            dt = dt.replace(tzinfo=timezone.utc)
+        else:
+            dt = dt.astimezone(timezone.utc)
     except ValueError:
-        return created_at
+        return str(created_at)
     return f"<t:{int(dt.timestamp())}:f>"
+
+
+def _format_file_size(value: Any) -> str:
+    """Render a stored file size in bytes plus a human-readable size."""
+    if value in (None, ""):
+        return "N/A"
+    try:
+        size = int(value)
+    except (TypeError, ValueError):
+        return str(value)
+
+    units = ("B", "KiB", "MiB", "GiB", "TiB")
+    amount = float(size)
+    unit = units[0]
+    for candidate in units:
+        unit = candidate
+        if amount < 1024 or candidate == units[-1]:
+            break
+        amount /= 1024
+
+    if unit == "B":
+        human = f"{size:,} B"
+    elif amount >= 100:
+        human = f"{amount:.0f} {unit}"
+    elif amount >= 10:
+        human = f"{amount:.1f} {unit}"
+    else:
+        human = f"{amount:.2f} {unit}"
+    return f"{size:,} bytes ({human})"
+
+
+def _format_metadata_label(key: str) -> str:
+    return key.replace("_", " ").strip().title() or "Metadata"
 
 
 # Human-readable label per kind, for /url unshorten's "found locally"
@@ -838,36 +866,72 @@ _KIND_LABELS = {"shorten": "shortened link", "paste": "paste", "file": "file upl
 
 
 def _fields_for_store_entry(kind: str, provider: str, entry: Dict[str, Any]) -> List[Tuple[str, Any, bool]]:
-    """Builds /url unshorten's success-embed fields for a
-    storage/shortened-urls.json entry found locally. Shape differs per
-    kind -- a "shorten" entry, a "paste", and a "file" upload each carry
-    different fields (see api/github.py's schema comment) -- but
-    provider/creator/created_at are common to all three, so those are
-    appended once at the end rather than repeated in each branch."""
+    """Build a complete, database-backed /url unshorten result.
+
+    This helper is used only after a matching record is found in the local
+    Supabase store. The live is.gd Lookup/HTTP redirect paths do not call it.
+    It surfaces the useful persisted columns for the record kind, plus the
+    common database metadata and any provider-specific values stored in the
+    JSONB `metadata` column.
+    """
     creator_id = entry.get("creator_id")
     mention = f"<@{creator_id}>" if creator_id else "Unknown"
+    fields: List[Tuple[str, Any, bool]] = []
 
     if kind == "shorten":
-        fields: List[Tuple[str, Any, bool]] = [
-            ("Original URL", entry.get("original_url", "N/A"), False),
-            ("Shortened URL", entry.get("shortened_url", "N/A"), False),
-        ]
+        fields.extend([
+            ("Original URL", entry.get("original_url") or "N/A", False),
+            ("Shortened URL", entry.get("shortened_url") or "N/A", False),
+        ])
     elif kind == "paste":
-        fields = [
-            ("Paste", entry.get("paste_url", "N/A"), False),
-            ("Raw", entry.get("raw_url", "N/A"), False),
-        ]
-        if entry.get("title"):
-            fields.append(("Title", entry["title"], True))
-    else:  # "file"
-        fields = [
-            ("File URL", entry.get("file_url", "N/A"), False),
-            ("Original filename", entry.get("original_filename", "N/A"), True),
-        ]
+        fields.extend([
+            ("Paste URL", entry.get("paste_url") or "N/A", False),
+            ("Raw URL", entry.get("raw_url") or "N/A", False),
+            ("Title", entry.get("title") or "N/A", True),
+            ("Language", entry.get("language") or "N/A", True),
+        ])
+    elif kind == "file":
+        fields.extend([
+            ("File URL", entry.get("file_url") or "N/A", False),
+            ("Original filename", entry.get("original_filename") or "N/A", True),
+            ("Content type", entry.get("content_type") or "N/A", True),
+            ("Size", _format_file_size(entry.get("size")), True),
+        ])
+    else:
+        fields.append(("Record type", kind or "N/A", True))
 
-    fields.append(("Provider", _provider_label(kind, provider), True))
-    fields.append(("Created by", mention, True))
-    fields.append(("Created at", _format_created_at(entry.get("created_at")), True))
+    # These columns are present for every row and are useful for identifying
+    # exactly which database record was found and when its stored data last
+    # changed.
+    fields.extend([
+        ("Provider", _provider_label(kind, provider), True),
+        ("Short code", entry.get("short_code") or "N/A", True),
+        ("Database ID", str(entry.get("id")) if entry.get("id") is not None else "N/A", True),
+        ("Created by", mention, True),
+        ("Created at", _format_created_at(entry.get("created_at")), True),
+        ("Updated at", _format_created_at(entry.get("updated_at")), True),
+    ])
+
+    deletion_url = entry.get("deletion_url")
+    if deletion_url:
+        fields.append(("Deletion", str(deletion_url), False))
+
+    metadata = entry.get("metadata")
+    if isinstance(metadata, dict):
+        for key, value in metadata.items():
+            if value is None:
+                continue
+            if isinstance(value, (dict, list)):
+                rendered = json.dumps(value, ensure_ascii=False, indent=2)
+            else:
+                rendered = str(value)
+            # Discord fields max out at 1024 characters. Keep provider-
+            # specific metadata useful without allowing one unusually large
+            # value to break the local-store embed.
+            if len(rendered) > 1000:
+                rendered = rendered[:997] + "..."
+            fields.append((_format_metadata_label(str(key)), rendered, False))
+
     return fields
 
 
@@ -876,7 +940,7 @@ async def _url_unshorten_impl(interaction: discord.Interaction, url: str):
     if not is_valid_url(url):
         return await send_error(interaction, f"`{url}` doesn't look like a valid http(s) URL.")
 
-    # The store lookup below is one fast GitHub read; the live-redirect
+    # The store lookup below is one fast Supabase read; the live-redirect
     # fallback further down can be several sequential HTTP round trips
     # (one per hop) -- defer before either path, same ephemeral-from-
     # the-start reasoning as /url shorten, /paste, and /file.
@@ -888,10 +952,10 @@ async def _url_unshorten_impl(interaction: discord.Interaction, url: str):
     # api/providers/util.py), and find_shortened_url_entry() checks every
     # provider and kind in one fetch.
     short_code = extract_short_code(url)
-    store_error: Optional[GitHubAPIError] = None
+    store_error: Optional[ShortenedURLStoreError] = None
     try:
-        found = await find_shortened_url_entry(short_code)
-    except GitHubAPIError as e:
+        found = await find_shortened_url_entry(short_code, url)
+    except ShortenedURLStoreError as e:
         found = None
         store_error = e
 
@@ -923,7 +987,7 @@ async def _url_unshorten_impl(interaction: discord.Interaction, url: str):
             fields.append((
                 "⚠️ Couldn't check the local store first",
                 f"{store_error} -- the result above is from is.gd's own Lookup API, not from "
-                "shortened-urls.json.",
+                "the local Supabase record.",
                 False,
             ))
         return await send_success(interaction, f"Resolved via is.gd's Lookup API: {destination}", fields=fields)
@@ -945,7 +1009,8 @@ async def _url_unshorten_impl(interaction: discord.Interaction, url: str):
     if store_error is not None:
         fields.append((
             "⚠️ Couldn't check the local store first",
-            f"{store_error} -- the result above is from following the link live, not from shortened-urls.json.",
+            f"{store_error} -- the result above is from following the link live, not from the "
+            "local Supabase record.",
             False,
         ))
 
@@ -989,7 +1054,7 @@ def _clear_predicate(
     provider-filterable -- /url clear always sweeps every provider's
     namespace, matching find_matching_shortened_urls()/
     clear_shortened_urls()'s own already-multi-provider-generic design in
-    api/github.py."""
+    api/shortened_urls.py."""
     def _predicate(entry: Dict[str, Any], kind: str, provider: str) -> bool:
         if kind_filter is not None and kind != kind_filter:
             return False
@@ -1036,8 +1101,9 @@ class ConfirmUrlClearLayout(LayoutView):
             TextDisplay("### ⚠️ Clear Shortened URLs"),
             TextDisplay(
                 f"This will permanently remove **{match_count}** entr{'y' if match_count == 1 else 'ies'} "
-                f"from `shortened-urls.json` -- {mode_desc}. This only clears this bot's local record of "
-                "them, across every provider; it does not delete the underlying links/pastes/files from "
+                f"from the Supabase `shortened_urls` database -- {mode_desc}. This only clears this bot's "
+                "persistent record of them, across every provider; it does not delete the underlying "
+                "links/pastes/files from "
                 "whichever provider actually created them. This action cannot be undone."
             ),
             accent_color=discord.Color.orange(),
@@ -1067,7 +1133,7 @@ class ConfirmUrlClearLayout(LayoutView):
         self.confirmed = True
         self.stop()
         await safe_edit_message(interaction,
-            view=status_layout("Clearing Entries", "Clearing `shortened-urls.json` entries...", discord.Color.blurple())
+            view=status_layout("Clearing Entries", "Clearing persistent shortened-URL records...", discord.Color.blurple())
         )
 
     async def cancel(self, interaction: discord.Interaction):
@@ -1124,7 +1190,7 @@ async def _url_clear_impl(
 
     try:
         matches = await find_matching_shortened_urls(predicate)
-    except GitHubAPIError as e:
+    except ShortenedURLStoreError as e:
         return await send_error(interaction, str(e))
 
     if not matches:
@@ -1137,36 +1203,24 @@ async def _url_clear_impl(
     if not view.confirmed:
         return  # Cancelled (message already replaced/deleted by the button) or timed out.
 
-    commit_message = (
-        f"Cleared {len(matches)} shortened-urls.json entr{'y' if len(matches) == 1 else 'ies'} "
-        f"by {interaction.user} ({interaction.user.id}) via /url clear ({mode})"
-    )
     try:
-        removed = await clear_shortened_urls(predicate, commit_message)
-    except GitHubAPIError as e:
+        removed = await clear_shortened_urls(predicate)
+    except ShortenedURLStoreError as e:
         return await message.edit(view=status_layout("Clear Failed", str(e), discord.Color.red()))
 
     await send_alert(interaction.client, alert_embed(
         "🧹 Shortened URLs Cleared",
         f"{interaction.user.mention} cleared **{len(removed)}** entr{'y' if len(removed) == 1 else 'ies'} "
-        f"from `shortened-urls.json` via `/url clear` -- {mode_desc}.",
+        f"from the Supabase `shortened_urls` database via `/url clear` -- {mode_desc}.",
         color=ALERT_COLOR_REMOVE,
     ))
 
-    await message.edit(view=status_layout(
-        "✅ Cleared",
-        f"Cleared **{len(removed)}** entr{'y' if len(removed) == 1 else 'ies'} matching {mode_desc}.",
-        discord.Color.green(),
-    ))
-
-    # Full listing of what got removed, as a follow-up -- paginated (via
-    # PaginatedListView) rather than crammed into one embed/Container,
-    # since a large /url clear (e.g. `all`, or a wide `before` cutoff) can
-    # easily produce more removed entries than a single message's text
-    # components can hold.
+    # Replace the confirmation message itself with the complete paginated
+    # result instead of sending a second ephemeral message. This keeps the
+    # interaction to one message: Confirm -> Cleared Entries (#).
     lines = [_format_removed_line(provider, kind, code, entry) for provider, kind, code, entry in removed]
     result_view = PaginatedListView(f"🗑️ Cleared Entries ({len(removed)})", lines, color=discord.Color.red())
-    await interaction.followup.send(view=result_view, ephemeral=True)
+    await message.edit(view=result_view)
 
 
 class Url(commands.Cog):
@@ -1190,7 +1244,7 @@ class Url(commands.Cog):
     @app_commands.choices(provider=choices_for("shorten"))
     # 3 per 60s per user -- generous enough for normal use, tight enough
     # that a slip of the enter key (or someone poking at it) can't spray
-    # requests at a provider or rack up GitHub commits.
+    # requests at a provider.
     #@app_commands.checks.cooldown(3, 60.0)
     @has_role(config.REQUIRED_ROLE_ID)
     @is_in_guild(config.GUILD_ID)
@@ -1223,7 +1277,7 @@ class Url(commands.Cog):
     # mutual-exclusivity with the other two lives in /url clear's error
     # messages and ConfirmUrlClearLayout instead, where there's no such
     # limit.
-    @url_group.command(name="clear", description="Clears entries from shortened-urls.json -- everything, one user's, or before a given time.")
+    @url_group.command(name="clear", description="Clears persistent URL records -- everything, one user's, or before a given time.")
     @app_commands.describe(
         all="Clear every entry. Use this, `user`, or `before` -- not more than one.",
         user="Clear only entries created by this user. Use this, `all`, or `before` -- not one.",

@@ -1,57 +1,21 @@
 """
-api package -- shared constants, GitHub Contents-API helpers, validation
-utilities, and Discord helper functions used across every cog.
+api package -- shared configuration, Supabase persistence, storage, validation
+utilities, and Discord helper functions used across the bot.
 
-This used to be a single bot_api.py; it's split by concern so each file
-stays a manageable size:
-
-    config.py          env-driven constants (Discord IDs, GitHub repo, secrets)
-    github.py          GitHub helpers for non-license assets
-    supabase_db.py     license/user database access
-    bot_state.py       durable bot-state persistence in Supabase
-    supabase_storage.py private Supabase Storage access for protected game scripts
-    users.py           Discord-facing user helpers + buyer role revocation
-    keys.py            key generation + input validation
-    time_utils.py       date formatting/parsing + temp-whitelist expiration
-    hashing.py         /hash algorithm utilities
-    transforms.py       /transform's stylized-Unicode text styles
-    encoding.py         /encode encode and /encode decode's algorithms + Identify heuristic
-    ciphers.py          /cipher encrypt and /cipher decrypt's classical cipher algorithms + Identify heuristic
-    encryption.py       /encrypt and /decrypt's modern authenticated-encryption algorithms
-    qrcode_gen.py       /qrcode generate's encoding + Pillow rendering (solid/rainbow, styles)
-    discord_helpers.py embeds, interaction responders, permission checks
-    alerts.py           staff Alerts channel logging (send_alert/alert_embed)
-    providers/          third-party paste/file-hosting/URL-shortening API clients (ez_host.py,
-                        is_gd.py, tinyurl.py, catbox.py, litterbox.py, pastebin.py,
-                        pastee_dev.py, pastey_gg.py, rubis.py) plus the registry.py that maps
-                        /url shorten, /paste, and /file's `provider` choices to them
-
-Everything below is re-exported here too, so cogs can do either
-`from api import github` or `from api.github import fetch_users_with_sha`.
+The bot no longer depends on GitHub for runtime persistence. License/user
+records, durable bot state, shortened URLs/pastes/files, and protected game
+scripts use Supabase-backed persistence.
 """
 
 from . import config
 from .config import (
-    DISCORD_TOKEN, GITHUB_TOKEN, EZ_HOST_API_KEY,
+    DISCORD_TOKEN, EZ_HOST_API_KEY,
     GUILD_ID, REQUIRED_ROLE_ID, REACTION_ROLE_CHANNEL_ID,
     PANEL_CHANNEL_ID, BUYER_ROLE_ID, ALERTS_CHANNEL_ID,
     LOCAL_TZ,
-    OWNER, REPO, FILE_PATH, BRANCH, RAW_URL, API_URL,
-    STORAGE_REPO, STORAGE_BRANCH,
     SUPABASE_URL, SUPABASE_SECRET_KEY, SUPABASE_GAME_SCRIPTS_BUCKET,
-    STORED_SCRIPT_FILE_PATH,
-    HEADERS,
 )
 
-from .github import (
-    GitHubAPIError,
-    fetch_raw_text,
-    list_commits, get_commit,
-    fetch_stored_script, fetch_stored_script_with_sha, commit_stored_script,
-    inject_script_key, validate_stored_script,
-    fetch_shortened_urls_with_sha, commit_shortened_urls, update_shortened_urls,
-    get_shortened_urls, save_shortened_url,
-)
 
 # Every provider's own `<Provider>APIError` (EZHostAPIError, TinyURLAPIError,
 # ...) subclasses this -- see api/providers/errors.py. Re-exported alongside
@@ -69,6 +33,12 @@ from .supabase_db import (
 
 
 from .bot_state import BotStateError, fetch_botstate, update_botstate, new_state_id
+
+from .shortened_urls import (
+    ShortenedURLStoreError, fetch_all_shortened_urls, get_shortened_urls,
+    find_shortened_url_entry, save_shortened_url,
+    find_matching_shortened_urls, clear_shortened_urls,
+)
 
 from .supabase_storage import SupabaseStorageError, fetch_game_script, fetch_game_script_bytes, upload_game_script, delete_game_script, get_game_script_filename
 
