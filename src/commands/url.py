@@ -18,6 +18,7 @@ it's gone for good.
 
 from datetime import datetime, timezone
 import json
+import re
 from typing import Any, Callable, Dict, List, Optional, Tuple
 
 import discord
@@ -1044,17 +1045,16 @@ def _clear_predicate(
     *,
     discord_id: Optional[str] = None,
     cutoff: Optional[datetime] = None,
+    entry_ids: Optional[set[int]] = None,
     kind_filter: Optional[str] = None,
 ) -> Callable[[Dict[str, Any], str, str], bool]:
-    """Builds the predicate find_matching_shortened_urls()/
-    clear_shortened_urls() call per entry. `mode` selects which of /url
-    clear's three mutually-exclusive filters (`all`/`user`/`before`) is
-    active; `kind_filter` (from the `type` option) is layered on top of
-    any of the three, rather than being a fourth mode of its own. Not
-    provider-filterable -- /url clear always sweeps every provider's
-    namespace, matching find_matching_shortened_urls()/
-    clear_shortened_urls()'s own already-multi-provider-generic design in
-    api/shortened_urls.py."""
+    """Build the predicate used by both the preview and deletion passes.
+
+    `mode` selects one mutually-exclusive scope: `all`, `user`, `before`,
+    or `entries`. `entries` matches the Supabase primary-key `id` values
+    exactly, while the optional `kind_filter` can further restrict those IDs
+    to shortened links, pastes, or file uploads.
+    """
     def _predicate(entry: Dict[str, Any], kind: str, provider: str) -> bool:
         if kind_filter is not None and kind != kind_filter:
             return False
@@ -1065,8 +1065,41 @@ def _clear_predicate(
         if mode == "before":
             created = parse_iso(entry.get("created_at"))
             return created is not None and created <= cutoff
+        if mode == "entries":
+            try:
+                entry_id = int(entry.get("id"))
+            except (TypeError, ValueError):
+                return False
+            return entry_ids is not None and entry_id in entry_ids
         return False
     return _predicate
+
+
+def _parse_clear_entry_ids(value: str) -> Tuple[Optional[List[int]], Optional[str]]:
+    """Parse a single ID or a whitespace/comma-separated list of IDs.
+
+    A leading `#` is accepted because IDs are displayed as `#123` in the
+    local-store UI. Duplicate IDs are silently collapsed so the same row can
+    never be counted/deleted twice.
+    """
+    tokens = [token for token in re.split(r"[\s,]+", value.strip()) if token]
+    if not tokens:
+        return None, "Provide at least one database entry ID."
+
+    parsed: List[int] = []
+    seen: set[int] = set()
+    for token in tokens:
+        normalized = token.lstrip("#")
+        if not normalized.isdigit():
+            return None, f"`{token}` is not a valid database entry ID. Use IDs like `12` or `12, 18, 27`."
+        entry_id = int(normalized)
+        if entry_id <= 0:
+            return None, f"`{token}` is not a valid database entry ID. IDs must be positive integers."
+        if entry_id not in seen:
+            seen.add(entry_id)
+            parsed.append(entry_id)
+
+    return parsed, None
 
 
 def _format_removed_line(provider: str, kind: str, short_code: str, entry: Dict[str, Any]) -> str:
@@ -1150,15 +1183,20 @@ async def _url_clear_impl(
     clear_all: Optional[bool],
     user: Optional[discord.User],
     before: Optional[str],
+    entries: Optional[str],
     kind_filter: Optional[str],
 ):
-    provided = [bool(clear_all), user is not None, before is not None]
+    provided = [bool(clear_all), user is not None, before is not None, entries is not None]
     if sum(provided) == 0:
-        return await send_error(interaction, "Provide one of `all`, `user`, or `before`.")
+        return await send_error(interaction, "Provide one of `all`, `user`, `before`, or `entries`.")
     if sum(provided) > 1:
-        return await send_error(interaction, "Provide only one of `all`, `user`, or `before` -- not more than one.")
+        return await send_error(
+            interaction,
+            "Provide only one of `all`, `user`, `before`, or `entries` -- not more than one.",
+        )
 
     cutoff: Optional[datetime] = None
+    entry_ids: Optional[List[int]] = None
     if before is not None:
         cutoff = parse_time_filter(before)
         if cutoff is None:
@@ -1167,6 +1205,10 @@ async def _url_clear_impl(
                 f"Couldn't parse `{before}` as a date/time. Try an exact date/time (e.g. `8/13/2026, 2:50 AM`) "
                 "or a relative duration (e.g. `20 minutes`, `2 hours ago`, `3 days`).",
             )
+    if entries is not None:
+        entry_ids, parse_error = _parse_clear_entry_ids(entries)
+        if parse_error is not None:
+            return await send_error(interaction, parse_error)
 
     if clear_all:
         mode = "all"
@@ -1174,14 +1216,24 @@ async def _url_clear_impl(
     elif user is not None:
         mode = "user"
         mode_desc = f"every entry created by {user.mention}"
-    else:
+    elif before is not None:
         mode = "before"
         mode_desc = f"every entry created at or before <t:{int(cutoff.timestamp())}:f>"
+    else:
+        mode = "entries"
+        formatted_ids = ", ".join(f"#{entry_id}" for entry_id in entry_ids)
+        mode_desc = f"specific database entr{'y' if len(entry_ids) == 1 else 'ies'}: {formatted_ids}"
 
     if kind_filter is not None:
         mode_desc += f" ({_KIND_LABELS.get(kind_filter, kind_filter)}s only)"
 
-    predicate = _clear_predicate(mode, discord_id=str(user.id) if user else None, cutoff=cutoff, kind_filter=kind_filter)
+    predicate = _clear_predicate(
+        mode,
+        discord_id=str(user.id) if user else None,
+        cutoff=cutoff,
+        entry_ids=set(entry_ids or []),
+        kind_filter=kind_filter,
+    )
 
     # Deferred first: the preview fetch just below, and the confirmation
     # round trip that follows it, both easily blow Discord's ~3s ack
@@ -1272,17 +1324,16 @@ class Url(commands.Cog):
     async def url_unshorten(self, interaction: discord.Interaction, url: str):
         await _url_unshorten_impl(interaction, url)
 
-    # Discord caps command/option descriptions at 100 characters -- the
-    # fuller explanation of `before`'s accepted formats and each option's
-    # mutual-exclusivity with the other two lives in /url clear's error
-    # messages and ConfirmUrlClearLayout instead, where there's no such
-    # limit.
-    @url_group.command(name="clear", description="Clears persistent URL records -- everything, one user's, or before a given time.")
+    # Discord caps command/option descriptions at 100 characters. The
+    # fuller explanation of `before` and the ID-list format lives in /url
+    # clear's validation errors and confirmation prompt instead.
+    @url_group.command(name="clear", description="Clears persistent URL records -- by scope or specific database ID(s).")
     @app_commands.describe(
-        all="Clear every entry. Use this, `user`, or `before` -- not more than one.",
-        user="Clear only entries created by this user. Use this, `all`, or `before` -- not one.",
-        before="Clear entries at/before this time -- a date/time or '20 minutes ago'-style duration.",
-        type="Optional -- restrict to one kind of entry (default: all).",
+        all="Clear every entry. Use this, `user`, `before`, or `entries` -- not more than one.",
+        user="Clear only entries created by this user.",
+        before="Clear entries at/before this time -- a date/time or duration.",
+        entries="Specific database ID(s) to clear, e.g. `12` or `12, 18, 27`.",
+        type="Optional -- restrict to shortened links, pastes, or file uploads.",
     )
     @app_commands.choices(type=_CLEAR_KIND_CHOICES)
     # 1 per 30s -- this is a destructive, potentially-bulk operation (unlike
@@ -1298,9 +1349,12 @@ class Url(commands.Cog):
         all: Optional[bool] = None,
         user: Optional[discord.User] = None,
         before: Optional[str] = None,
+        entries: Optional[app_commands.Range[str, 1, 1000]] = None,
         type: Optional[app_commands.Choice[str]] = None,
     ):
-        await _url_clear_impl(interaction, all, user, before, type.value if type else None)
+        await _url_clear_impl(
+            interaction, all, user, before, entries, type.value if type else None
+        )
 
     @app_commands.command(name="paste", description="Creates a text paste.")
     @app_commands.describe(
