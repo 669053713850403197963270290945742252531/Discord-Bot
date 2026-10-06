@@ -10,6 +10,7 @@ local CHALLENGE_ENDPOINT = ENDPOINT .. "/whitelist/challenge"
 local CHECK_ENDPOINT = ENDPOINT .. "/whitelist/check"
 local COMPLETE_ENDPOINT = ENDPOINT .. "/whitelist/complete"
 local BREACH_ENDPOINT = ENDPOINT .. "/whitelist/breach"
+local QUARTZ_URL = "https://gitlab.com/upio/quartz/-/releases/permalink/latest/downloads/Quartz.luau"
 local TAMPER_DETECTION_ENABLED = tostring("__LICENSE_TAMPER_DETECTION_ENABLED__") == "true"
 
 local originalGetgenv = getgenv
@@ -20,6 +21,10 @@ local GAME = game
 -- Client observes the table after the protected script starts and synchronizes
 -- its declared files into the executor workspace.
 ENV.assets = {}
+-- Populated with a frozen snapshot of Quartz executor capability results before
+-- the protected game script is executed. The authenticated client keeps its
+-- private copy separate from this game-script-facing global.
+ENV.executor_functions = {}
 
 local originalWritefile = ENV.writefile
 local originalDelfile = ENV.delfile
@@ -215,6 +220,116 @@ local function parse_time(value)
 end
 
 local auth
+
+
+local executorFunctionResults = {}
+local executorFunctionResultsReady = false
+
+local function freeze_executor_function_table(value)
+    if type(value) ~= "table" then
+        value = {}
+    end
+
+    local freeze = type(table.freeze) == "function" and table.freeze or nil
+    if freeze then
+        pcall(freeze, value)
+    end
+    return value
+end
+
+local function copy_executor_function_results(source)
+    local out = {}
+    if type(source) ~= "table" then
+        return out
+    end
+
+    for functionName, supported in pairs(source) do
+        if type(functionName) == "string" and type(supported) == "boolean" then
+            out[functionName] = supported
+        end
+    end
+
+    return out
+end
+
+local function load_executor_function_results()
+    if executorFunctionResultsReady then
+        return copy_executor_function_results(executorFunctionResults)
+    end
+
+    executorFunctionResultsReady = true
+    executorFunctionResults = {}
+
+    -- Use the captured original request/loadstring references so this optional
+    -- compatibility check does not depend on mutable executor globals after the
+    -- License Client starts. Quartz testing is explicitly run without its
+    -- polyfills so the result describes native executor support rather than
+    -- whether Quartz can provide a replacement.
+    if type(originalRequest) ~= "function" or type(originalLoadstring) ~= "function" then
+        return {}
+    end
+
+    local ok, response = pcall(originalRequest, {
+        Url = QUARTZ_URL,
+        Method = "GET",
+        Headers = {
+            ["Accept"] = "text/plain, */*",
+            ["Cache-Control"] = "no-cache",
+        },
+    })
+    if not ok or type(response) ~= "table" or response.Success ~= true then
+        return {}
+    end
+
+    local quartzSource = response.Body
+    if type(quartzSource) ~= "string" or quartzSource == "" then
+        return {}
+    end
+
+    local chunkOk, quartzChunk = pcall(originalLoadstring, quartzSource)
+    if not chunkOk or type(quartzChunk) ~= "function" then
+        return {}
+    end
+
+    local quartzOk, Quartz = pcall(quartzChunk)
+    if not quartzOk or type(Quartz) ~= "table" or type(Quartz.new) ~= "function" then
+        return {}
+    end
+
+    local testerOk, Tester = pcall(function()
+        return Quartz.new({
+            Timeout = 5,
+            AllowFFlagPolyfills = false,
+        })
+    end)
+    if not testerOk or type(Tester) ~= "table" then
+        return {}
+    end
+
+    local resultsOk, results = pcall(function()
+        return Tester:TestAll()
+    end)
+
+    if not resultsOk or type(results) ~= "table" then
+        resultsOk, results = pcall(function()
+            return Tester:GetResults()
+        end)
+    end
+
+    if not resultsOk or type(results) ~= "table" then
+        return {}
+    end
+
+    executorFunctionResults = copy_executor_function_results(results)
+    return copy_executor_function_results(executorFunctionResults)
+end
+
+local function initialize_executor_function_global()
+    local results = load_executor_function_results()
+    local exposed = copy_executor_function_results(results)
+    ENV.executor_functions = freeze_executor_function_table(exposed)
+    return results
+end
 
 local ASSET_ROOT = "Celestial ScriptHub/Assets/" .. tostring(GAME.PlaceId)
 local ASSET_MANIFEST = ASSET_ROOT .. "/manifest.json"
@@ -1089,6 +1204,17 @@ function auth.getNotes()
     return userRecord and userRecord.Notes or nil
 end
 
+function auth.getExecutorFunctions()
+    return freeze_executor_function_table(copy_executor_function_results(executorFunctionResults))
+end
+
+function auth.isExecutorFunctionSupported(functionName)
+    if type(functionName) ~= "string" then
+        return false
+    end
+    return executorFunctionResults[functionName] == true
+end
+
 function auth.getExecutor()
     if type(originalIdentifyExecutor) ~= "function" then
         return nil
@@ -1568,9 +1694,13 @@ end
 -- record is available through auth, but the protected script is never decoded,
 -- compiled, executed, or completed as an execution.
 if infoOnly then
+    -- Capability detection is only required by the protected game-script path.
+    -- Keep info-only mode lightweight and do not execute a third-party test suite.
     print("[Celestial] License authenticated successfully (info-only mode).")
     return auth
 end
+
+initialize_executor_function_global()
 
 if type(originalBase64Decode) ~= "function" then
     return reject("base64_api_unavailable")

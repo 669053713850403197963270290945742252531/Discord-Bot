@@ -13,3 +13,7 @@ The protected game-script mapping lives in the Supabase `games` table, whose `sc
 ```
 
 The public `/client` endpoint fills its own API base URL at request time, so users can run the normal two-line loader without editing the client.
+
+## Executor capability detection
+
+Before a protected game script runs, the License Client loads Quartz and runs `Tester:TestAll()` with Quartz polyfills disabled, so the resulting `executor_functions` table reports the executor capabilities being tested rather than Quartz replacements. The protected script can check values such as `executor_functions.fireclickdetector`. The client also exposes `auth.getExecutorFunctions()` and `auth.isExecutorFunctionSupported(name)`. These values are informational only and are not trusted for license authorization.
