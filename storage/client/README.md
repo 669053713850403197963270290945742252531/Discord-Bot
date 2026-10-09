@@ -17,3 +17,7 @@ The public `/client` endpoint fills its own API base URL at request time, so use
 ## Executor capability detection
 
 Before a protected game script runs, the License Client loads Quartz and runs `Tester:TestAll()` with Quartz polyfills disabled, so the resulting `executor_functions` table reports the executor capabilities being tested rather than Quartz replacements. The protected script can check values such as `executor_functions.fireclickdetector`. The client also exposes `auth.getExecutorFunctions()` and `auth.isExecutorFunctionSupported(name)`. These values are informational only and are not trusted for license authorization.
+
+
+## Session heartbeat
+The License Client starts a server-side session heartbeat after successful `/whitelist/check`. The heartbeat uses the server-issued session UUID and the authenticated HWID, and it does not send the license key. The server considers a session active while `last_seen` is within `LICENSE_SESSION_TIMEOUT_SECONDS`; a session that remains silent beyond that window expires and must authenticate again. Transient heartbeat request failures are ignored so ordinary connectivity interruptions do not immediately kick the user. If the server disables the license, the next successful heartbeat reports `license_disabled` and the client terminates the session.

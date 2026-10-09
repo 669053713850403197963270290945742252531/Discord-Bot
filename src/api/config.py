@@ -148,12 +148,55 @@ LICENSE_TAMPER_DETECTION_ENABLED = os.getenv(
     "LICENSE_TAMPER_DETECTION_ENABLED", "true"
 ).strip().lower() not in ("false", "0", "no", "off")
 
-# Optional server-side detection for likely key sharing after a HWID reset.
-# High-confidence cases (different Roblox account identity) can disable the license;
-# country-only changes are treated as a warning to avoid penalizing travel/VPN use.
+# Server-side historical key-sharing detection. Roblox UserId, HWID, country,
+# executor, device, and IP are supporting signals rather than identity locks.
+# Enforcement is based on persistent session history and, optionally, overlapping
+# active sessions.
 LICENSE_KEY_SHARING_DETECTION_ENABLED = os.getenv(
     "LICENSE_KEY_SHARING_DETECTION_ENABLED", "true"
 ).strip().lower() not in ("false", "0", "no", "off")
+
+# Persistent license identity clustering.
+LICENSE_IDENTITY_CLUSTERING_ENABLED = os.getenv(
+    "LICENSE_IDENTITY_CLUSTERING_ENABLED", "true"
+).strip().lower() not in ("false", "0", "no", "off")
+
+# A session is active while its last heartbeat is inside this window.
+LICENSE_SESSION_HEARTBEAT_ENABLED = os.getenv(
+    "LICENSE_SESSION_HEARTBEAT_ENABLED", "true"
+).strip().lower() not in ("false", "0", "no", "off")
+LICENSE_SESSION_HEARTBEAT_INTERVAL_SECONDS = int(
+    os.getenv("LICENSE_SESSION_HEARTBEAT_INTERVAL_SECONDS", "20")
+)
+LICENSE_SESSION_TIMEOUT_SECONDS = int(
+    os.getenv("LICENSE_SESSION_TIMEOUT_SECONDS", "75")
+)
+
+LICENSE_CONCURRENT_SESSION_ENFORCEMENT_ENABLED = os.getenv(
+    "LICENSE_CONCURRENT_SESSION_ENFORCEMENT_ENABLED", "true"
+).strip().lower() not in ("false", "0", "no", "off")
+LICENSE_REPEATED_ALTERNATION_DETECTION_ENABLED = os.getenv(
+    "LICENSE_REPEATED_ALTERNATION_DETECTION_ENABLED", "true"
+).strip().lower() not in ("false", "0", "no", "off")
+
+# Historical-pattern thresholds. These require repeated evidence before
+# `key_sharing_detected` disables a license.
+LICENSE_SHARING_LOOKBACK_SESSIONS = int(
+    os.getenv("LICENSE_SHARING_LOOKBACK_SESSIONS", "12")
+)
+LICENSE_SHARING_SUSPECTED_REVISITS = int(
+    os.getenv("LICENSE_SHARING_SUSPECTED_REVISITS", "1")
+)
+LICENSE_SHARING_DETECTED_REVISITS = int(
+    os.getenv("LICENSE_SHARING_DETECTED_REVISITS", "6")
+)
+LICENSE_SHARING_DETECTED_MIN_RUNS = int(
+    os.getenv("LICENSE_SHARING_DETECTED_MIN_RUNS", "8")
+)
+LICENSE_SHARING_DETECTED_MIN_DIVERGENCE = int(
+    os.getenv("LICENSE_SHARING_DETECTED_MIN_DIVERGENCE", "6")
+)
+
 
 # Sentivel heartbeat used by the bot status page. By default it is enabled
 # only on Render, since local development intentionally goes offline during

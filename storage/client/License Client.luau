@@ -10,6 +10,7 @@ local CHALLENGE_ENDPOINT = ENDPOINT .. "/whitelist/challenge"
 local CHECK_ENDPOINT = ENDPOINT .. "/whitelist/check"
 local COMPLETE_ENDPOINT = ENDPOINT .. "/whitelist/complete"
 local BREACH_ENDPOINT = ENDPOINT .. "/whitelist/breach"
+local HEARTBEAT_ENDPOINT = ENDPOINT .. "/whitelist/heartbeat"
 local QUARTZ_URL = "https://gitlab.com/upio/quartz/-/releases/permalink/latest/downloads/Quartz.luau"
 local TAMPER_DETECTION_ENABLED = tostring("__LICENSE_TAMPER_DETECTION_ENABLED__") == "true"
 
@@ -66,6 +67,7 @@ local originalGetFunctionHash = ENV.getfunctionhash
 local originalIsFunctionHooked = ENV.isfunctionhooked
 local originalRestoreFunction = ENV.restorefunction
 local authenticatedHwid = nil
+local sessionHeartbeatActive = false
 local activationCountry = nil
 
 local trackedFunctions = {}
@@ -146,7 +148,7 @@ local REASONS = {
     hwid_unavailable = "Unable to read this device's HWID.",
     hwid_hash_failed = "Unable to securely process this device's HWID.",
     invalid_hwid_format = "Your device HWID could not be validated.",
-    hwid_mismatch = "Unauthorized key sharing detected: this license key is bound to another device.",
+    hwid_mismatch = "This license key is already linked to a different device, so this request was blocked. If you are the key owner and need to relink a new or reinstalled device, reset your HWID in the Celestial Discord #panel channel. If you are using someone else's key, contact the owner and ask them to relink it. A single HWID mismatch is not a confirmed key-sharing finding.",
     potential_circumvention = "Potential circumvention detected. Your license has been disabled.",
     key_sharing_detected = "Potential key sharing detected. Your license has been disabled.",
     game_not_configured = "This game is not configured for Celestial licensing.",
@@ -167,6 +169,7 @@ local REASONS = {
     invalid_execution_token = "The execution authorization was invalid.",
     execution_token_expired = "The execution authorization expired.",
     execution_token_mismatch = "The execution authorization did not match this session.",
+    session_expired = "Your license session expired. Please execute the loader again.",
 }
 
 local function reason_text(reason)
@@ -901,27 +904,173 @@ local function sync_assets(desired)
     return true
 end
 
+-- Return the equals marker and final character position for Lua long-bracket
+-- strings/comments such as [[...]], [=[...]=], or [==[...]==].
+local function long_bracket_open(source, index)
+    if string.sub(source, index, index) ~= "[" then
+        return nil
+    end
+
+    local cursor = index + 1
+    while string.sub(source, cursor, cursor) == "=" do
+        cursor += 1
+    end
+    if string.sub(source, cursor, cursor) ~= "[" then
+        return nil
+    end
+
+    return string.rep("=", cursor - index - 1), cursor
+end
+
+local function masked_character(character)
+    if character == "\n" or character == "\r" then
+        return character
+    end
+    return " "
+end
+
+-- Produce two same-length views of source. `codeMask` hides comments and string
+-- literals so tokens/braces inside them cannot be mistaken for live syntax;
+-- `withoutComments` hides comments but preserves strings for URL extraction.
+local function mask_lua_source(source)
+    local length = #source
+    local codeMask = table.create(length)
+    local withoutComments = table.create(length)
+    local index = 1
+
+    local function mask_range(first, last, preserveString)
+        for position = first, last do
+            local character = string.sub(source, position, position)
+            local masked = masked_character(character)
+            codeMask[position] = masked
+            withoutComments[position] = preserveString and character or masked
+        end
+    end
+
+    while index <= length do
+        local character = string.sub(source, index, index)
+        local nextCharacter = string.sub(source, index + 1, index + 1)
+
+        if character == "-" and nextCharacter == "-" then
+            local equals, openerEnd = long_bracket_open(source, index + 2)
+            if equals ~= nil then
+                local closing = "]" .. equals .. "]"
+                local closingStart = string.find(source, closing, openerEnd + 1, true)
+                local last = closingStart and (closingStart + #closing - 1) or length
+                mask_range(index, last, false)
+                index = last + 1
+            else
+                local cursor = index + 2
+                while cursor <= length do
+                    local current = string.sub(source, cursor, cursor)
+                    if current == "\n" or current == "\r" then
+                        break
+                    end
+                    cursor += 1
+                end
+                local last = math.min(cursor - 1, length)
+                mask_range(index, last, false)
+                index = last + 1
+            end
+        elseif character == "\"" or character == "'" then
+            local quote = character
+            local cursor = index + 1
+            while cursor <= length do
+                local current = string.sub(source, cursor, cursor)
+                if current == "\\" then
+                    cursor += 2
+                elseif current == quote then
+                    break
+                else
+                    cursor += 1
+                end
+            end
+            local last = math.min(cursor, length)
+            mask_range(index, last, true)
+            index = last + 1
+        elseif character == "[" then
+            local equals, openerEnd = long_bracket_open(source, index)
+            if equals ~= nil then
+                local closing = "]" .. equals .. "]"
+                local closingStart = string.find(source, closing, openerEnd + 1, true)
+                local last = closingStart and (closingStart + #closing - 1) or length
+                mask_range(index, last, true)
+                index = last + 1
+            else
+                codeMask[index] = character
+                withoutComments[index] = character
+                index += 1
+            end
+        else
+            codeMask[index] = character
+            withoutComments[index] = character
+            index += 1
+        end
+    end
+
+    return table.concat(codeMask), table.concat(withoutComments)
+end
+
 local function extract_declared_assets(source)
     local result = {}
     if type(source) ~= "string" then
         return result, false
     end
 
-    local start = string.find(source, "%f[%a_]assets%f[^%w_]%s*=%s*{")
-    if not start then
+    local codeMask, withoutComments = mask_lua_source(source)
+    local searchFrom = 1
+    local openBrace = nil
+
+    -- Only accept an `assets = { ... }` assignment whose identifier appears in
+    -- Lua code, not inside comments, quoted strings, or long-bracket strings.
+    while true do
+        local start, tokenEnd = string.find(codeMask, "%f[%a_]assets%f[^%w_]", searchFrom)
+        if not start then
+            break
+        end
+
+        local previous = start - 1
+        while previous >= 1 and string.match(string.sub(codeMask, previous, previous), "%s") do
+            previous -= 1
+        end
+        local previousCharacter = previous >= 1 and string.sub(codeMask, previous, previous) or ""
+        local suffix = string.sub(codeMask, tokenEnd + 1)
+        local assignment = string.match(suffix, "^%s*=%s*{")
+
+        if previousCharacter ~= "." and previousCharacter ~= ":" and assignment then
+            openBrace = tokenEnd + #assignment
+            break
+        end
+
+        searchFrom = tokenEnd + 1
+    end
+
+    if not openBrace then
         return result, false
     end
 
-    local openBrace = string.find(source, "{", start, true)
-    if not openBrace then
+    -- Match braces against the code-only mask, so braces in strings/comments
+    -- do not prematurely end the table.
+    local depth = 0
+    local closeBrace = nil
+    for position = openBrace, #codeMask do
+        local character = string.sub(codeMask, position, position)
+        if character == "{" then
+            depth += 1
+        elseif character == "}" then
+            depth -= 1
+            if depth == 0 then
+                closeBrace = position
+                break
+            end
+        end
+    end
+
+    if not closeBrace then
         return result, true
     end
 
-    local block = string.match(string.sub(source, openBrace), "^%b{}")
-    if not block then
-        return result, true
-    end
-
+    local block = string.sub(withoutComments, openBrace, closeBrace)
     for name, url in string.gmatch(block, "%[%s*\"([^\"]+)\"%s*%]%s*=%s*\"([^\"]+)\"") do
         if valid_asset_name(name) and valid_asset_url(url) then
             result[name] = url
@@ -1513,13 +1662,13 @@ local function start_tamper_monitor(currentHwid)
 end
 
 reject = function(reason)
-    if reason == "hwid_mismatch" then
-        print("[Celestial][SECURITY] Unauthorized key sharing detected.")
-        print("[Celestial][SECURITY] The supplied license key is bound to another HWID.")
-    end
-
+    sessionHeartbeatActive = false
     local message = reason_text(reason)
-    warn("[Celestial] " .. message)
+    -- In normal use, show the HWID-mismatch explanation only in the kick
+    -- message. Keep the warning for info-only tooling, which does not kick.
+    if reason ~= "hwid_mismatch" or infoOnly then
+        warn("[Celestial] " .. message)
+    end
 
     -- Info-only mode is intended for development/UI tooling. Authentication
     -- failures are reported to the caller instead of terminating the session.
@@ -1576,6 +1725,63 @@ local function decode(body)
     end
 
     return value
+end
+
+local function start_session_heartbeat(sessionId, sessionHwid)
+    if sessionHeartbeatActive then
+        return
+    end
+    if tostring("__LICENSE_SESSION_HEARTBEAT_ENABLED__") ~= "true" then
+        return
+    end
+    if type(sessionId) ~= "string" or sessionId == "" then
+        return
+    end
+
+    local interval = tonumber("__LICENSE_SESSION_HEARTBEAT_INTERVAL__") or 20
+    interval = math.max(10, interval)
+    sessionHeartbeatActive = true
+
+    task.spawn(function()
+        while sessionHeartbeatActive do
+            task.wait(interval)
+            if not sessionHeartbeatActive then
+                break
+            end
+
+            local encoded
+            local encodeOk = pcall(function()
+                encoded = originalJSONEncode(HttpService, {
+                    session_id = sessionId,
+                    hwid = sessionHwid,
+                    timestamp = os.time(),
+                })
+            end)
+            if not encodeOk or type(encoded) ~= "string" then
+                continue
+            end
+
+            local response = httpPost(HEARTBEAT_ENDPOINT, encoded)
+            if type(response) ~= "table" then
+                continue
+            end
+
+            local heartbeatResponse = decode(response.Body or "")
+            if not heartbeatResponse then
+                continue
+            end
+            if heartbeatResponse.ok == true then
+                continue
+            end
+
+            local reason = tostring(heartbeatResponse.reason or "")
+            if reason == "license_disabled" or reason == "key_sharing_detected" or reason == "session_revoked" or reason == "session_expired" then
+                sessionHeartbeatActive = false
+                reject(reason)
+                break
+            end
+        end
+    end)
 end
 
 local function get_hwid()
@@ -1698,6 +1904,10 @@ if infoOnly then
     -- Keep info-only mode lightweight and do not execute a third-party test suite.
     print("[Celestial] License authenticated successfully (info-only mode).")
     return auth
+end
+
+if type(decoded.session_id) == "string" and decoded.session_id ~= "" then
+    start_session_heartbeat(decoded.session_id, hwid)
 end
 
 initialize_executor_function_global()

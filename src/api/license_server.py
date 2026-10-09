@@ -13,17 +13,26 @@ import threading
 import time
 import urllib.error
 import urllib.request
-from datetime import datetime, timezone
-from typing import Any, Dict, Tuple
+from datetime import datetime, timezone, timedelta
+from typing import Any, Dict, Optional, Tuple
 
 from . import config
 from .supabase_db import (
     get_license_by_key,
+    get_license_by_identifier,
     game_allowed,
     get_game,
     complete_successful_execution,
     bind_license_hwid,
     disable_license,
+    record_license_session,
+    get_license_session,
+    heartbeat_license_session,
+    get_recent_license_sessions,
+    get_active_license_sessions,
+    get_license_identities,
+    get_recent_license_security_events,
+    record_license_security_event,
 )
 from .supabase_storage import fetch_game_script, SupabaseStorageError
 from .keys import is_valid_hwid
@@ -39,6 +48,7 @@ _recent: Dict[Tuple[str, str], float] = {}
 _challenges: Dict[str, float] = {}
 _challenge_recent: Dict[str, float] = {}
 _breach_recent: Dict[Tuple[str, str], float] = {}
+_breach_notification_recent: Dict[Tuple[str, str], float] = {}
 _execution_tokens: Dict[str, Dict[str, Any]] = {}
 
 
@@ -55,6 +65,9 @@ def _purge(now: float) -> None:
     for key, last in list(_breach_recent.items()):
         if now - last > 60:
             _breach_recent.pop(key, None)
+    for key, last in list(_breach_notification_recent.items()):
+        if now - last > 3600:
+            _breach_notification_recent.pop(key, None)
     for token, record in list(_execution_tokens.items()):
         if now - record["issued_at"] > 90:
             _execution_tokens.pop(token, None)
@@ -122,40 +135,372 @@ def _roblox_profile_link(value: Any) -> str:
     return f"[{user_id}](https://www.roblox.com/users/{user_id}/profile)"
 
 
-def _key_sharing_assessment(
-    entry: Dict[str, Any],
-    current_country: str,
-    current_roblox_user_id: int | None,
-) -> Dict[str, Any]:
-    """Compare current activation identity with the immutable first-activation snapshot.
+def _parse_iso_timestamp(value: Any) -> Optional[datetime]:
+    try:
+        return datetime.fromisoformat(str(value).replace("Z", "+00:00"))
+    except (TypeError, ValueError):
+        return None
 
-    HWID resets are the context in which this detector is primarily useful: a
-    newly bound HWID after a reset can otherwise make the same key appear valid
-    on a different user's device. Roblox UserId is treated as the stronger
-    identity signal; country is corroborating telemetry and can legitimately
-    change because of travel/VPNs.
-    """
-    stored_country = _normalize_country_code(entry.get("ActivationCountry"))
-    stored_user_id = _parse_roblox_user_id(entry.get("ActivationRobloxUserId"))
-    after_reset = int(entry.get("totalHwidResets") or 0) > 0 and not str(entry.get("HWID") or "").strip()
 
-    country_changed = bool(stored_country and current_country and stored_country != current_country)
-    user_changed = bool(stored_user_id and current_roblox_user_id and stored_user_id != current_roblox_user_id)
+def _as_utc(value: Any) -> Optional[datetime]:
+    parsed = _parse_iso_timestamp(value)
+    if parsed is None:
+        return None
+    if parsed.tzinfo is None:
+        return parsed.replace(tzinfo=timezone.utc)
+    return parsed.astimezone(timezone.utc)
 
-    if not after_reset or not (country_changed or user_changed):
-        return {"suspected": False, "high_confidence": False}
 
-    high_confidence = user_changed
+def _identity_divergence(first: Dict[str, Any], second: Dict[str, Any]) -> Dict[str, Any]:
+    comparisons = {
+        "hwid": (str(first.get("hwid") or "").strip().lower(), str(second.get("hwid") or "").strip().lower()),
+        "executor": (str(first.get("executor") or "").strip().lower(), str(second.get("executor") or "").strip().lower()),
+        "device": (str(first.get("device") or "").strip().lower(), str(second.get("device") or "").strip().lower()),
+        "country_code": (str(first.get("country_code") or "").strip().upper(), str(second.get("country_code") or "").strip().upper()),
+        "ip": (str(first.get("last_ip") or "").strip(), str(second.get("last_ip") or "").strip()),
+    }
+    differing = [name for name, (left, right) in comparisons.items() if left and right and left != right]
+    strong = [name for name in ("hwid",) if name in differing]
+    return {"differing_fields": differing, "strong_differences": strong, "score": len(strong) * 3 + max(0, len(differing) - len(strong))}
+
+
+def _collapse_identity_sequence(sessions: list[Dict[str, Any]]) -> list[int]:
+    sequence: list[int] = []
+    for session in reversed(sessions):
+        try:
+            identity_id = int(session.get("identity_id"))
+        except (TypeError, ValueError):
+            continue
+        if not sequence or sequence[-1] != identity_id:
+            sequence.append(identity_id)
+    return sequence
+
+
+def _sharing_pattern(sequence: list[int]) -> Dict[str, Any]:
+    seen: set[int] = set()
+    revisits = 0
+    alternations = 0
+    for index, identity_id in enumerate(sequence):
+        if identity_id in seen and index > 0:
+            revisits += 1
+        seen.add(identity_id)
+        if index >= 2 and sequence[index - 2] == identity_id and sequence[index - 1] != identity_id:
+            alternations += 1
     return {
-        "suspected": True,
-        "high_confidence": high_confidence,
-        "country_changed": country_changed,
-        "user_changed": user_changed,
-        "stored_country": stored_country or "Unknown",
-        "current_country": current_country or "Unknown",
-        "stored_user_id": stored_user_id,
-        "current_user_id": current_roblox_user_id,
-        "reset_count": int(entry.get("totalHwidResets") or 0),
+        "sequence": sequence,
+        "unique_identities": len(seen),
+        "switches": max(0, len(sequence) - 1),
+        "revisit_count": revisits,
+        "alternation_points": alternations,
+    }
+
+
+def _breach_notification_allowed(identifier: str, event_type: str) -> bool:
+    """Rate-limit staff-only breach webhook alerts per license and event type."""
+    now = time.time()
+    bucket = (identifier, event_type)
+    with _state_lock:
+        _purge(now)
+        last = _breach_notification_recent.get(bucket, 0.0)
+        if now - last < 3600:
+            return False
+        _breach_notification_recent[bucket] = now
+    return True
+
+
+def _sharing_detection_details(pattern: Dict[str, Any], profiles: Dict[int, Dict[str, Any]]) -> Dict[str, Any]:
+    transitions = []
+    sequence = pattern["sequence"]
+    for left_id, right_id in zip(sequence, sequence[1:]):
+        if left_id == right_id:
+            continue
+        transitions.append({
+            "from": left_id,
+            "to": right_id,
+            "divergence": _identity_divergence(profiles.get(left_id, {}), profiles.get(right_id, {})),
+        })
+    max_divergence = max((x["divergence"]["score"] for x in transitions), default=0)
+    return {"transitions": transitions[-8:], "max_identity_divergence": max_divergence}
+
+
+# Repeated blocked HWID attempts are evaluated over the preceding 24 hours.
+BLOCKED_ATTEMPT_DETECTION_WINDOW_SECONDS = 24 * 60 * 60
+
+
+def _handle_hwid_mismatch_attempt(
+    *,
+    entry: Dict[str, Any],
+    key: str,
+    current_hwid: str,
+    game_id: str,
+    remote: str,
+    executor: Any,
+    job_id: Any,
+    device: Any,
+    country_code: Any = "",
+) -> None:
+    """Block a device mismatch, record a suspicion, and alert staff only.
+
+    A single mismatch is not proof of sharing, so this function never disables
+    the license. The client kick message is the only user-facing explanation;
+    no direct notification or message is sent to the license owner.
+    """
+    identifier = str(entry.get("Identifier") or "").strip()
+    owner_hwid = str(entry.get("HWID") or "").strip().lower()
+    attempted_hwid = str(current_hwid or "").strip().lower()
+    details = {
+        "reason": "hwid_mismatch",
+        "blocked": True,
+        "attempted_hwid": attempted_hwid,
+        "bound_hwid": owner_hwid,
+        "remote_ip": str(remote or "").strip(),
+        "executor": _safe_log_value(executor, fallback="Unknown", max_length=256),
+        "device": _safe_log_value(device, fallback="Unknown", max_length=128),
+        "country_code": _normalize_country_code(country_code),
+        "game_id": str(game_id or "").strip(),
+        "job_id": _safe_log_value(job_id, fallback="Unknown", max_length=128),
+        "assessment": "A single HWID mismatch is suspicious but not proof of key sharing.",
+    }
+
+    event_recorded = False
+    if identifier:
+        try:
+            _run(record_license_security_event(
+                identifier,
+                session_id=None,
+                identity_id=None,
+                event_type="key_sharing_suspected",
+                confidence="low",
+                details=details,
+            ))
+            event_recorded = True
+        except Exception as exc:
+            print(f"[License] Failed to record HWID-mismatch suspicion event: {exc}")
+
+    # Keep mismatch requests blocked, but count repeated blocked attempts as their
+    # own historical evidence stream. The successful-session detector cannot see
+    # these requests because they exit before a session is created.
+    if event_recorded and identifier and getattr(config, "LICENSE_KEY_SHARING_DETECTION_ENABLED", True):
+        try:
+            threshold = max(2, int(getattr(config, "LICENSE_SHARING_DETECTED_MIN_RUNS", 8)))
+            window_seconds = BLOCKED_ATTEMPT_DETECTION_WINDOW_SECONDS
+            since = datetime.now(timezone.utc) - timedelta(seconds=window_seconds)
+            recent_attempts = _run(get_recent_license_security_events(
+                identifier,
+                event_type="key_sharing_suspected",
+                since=since,
+                limit=100,
+            ))
+            matching_attempts = []
+            for row in recent_attempts:
+                row_details = row.get("details") if isinstance(row.get("details"), dict) else {}
+                attempted = str(row_details.get("attempted_hwid") or "").strip().lower()
+                bound = str(row_details.get("bound_hwid") or "").strip().lower()
+                if (
+                    row_details.get("reason") == "hwid_mismatch"
+                    and row_details.get("blocked") is True
+                    and attempted
+                    and attempted != bound
+                ):
+                    matching_attempts.append(row)
+
+            # A previous detection must not permanently suppress future detections.
+            # Treat its timestamp as the start of a new counting episode, so each
+            # new batch of threshold-sized attempts can be escalated independently.
+            existing_detections = _run(get_recent_license_security_events(
+                identifier,
+                event_type="key_sharing_detected",
+                since=since,
+                limit=100,
+            ))
+            prior_blocked_detections = [
+                row for row in existing_detections
+                if isinstance(row.get("details"), dict)
+                and row["details"].get("detection_source") == "blocked_hwid_attempts"
+            ]
+            detection_times = [
+                parsed for row in prior_blocked_detections
+                if (parsed := _as_utc(row.get("created_at"))) is not None
+            ]
+            latest_detection_at = max(detection_times, default=None)
+            if latest_detection_at is not None:
+                matching_attempts = [
+                    row for row in matching_attempts
+                    if (attempt_at := _as_utc(row.get("created_at"))) is not None
+                    and attempt_at > latest_detection_at
+                ]
+
+            count_window = (
+                f"since the previous blocked-attempt detection at {latest_detection_at.isoformat()}"
+                if latest_detection_at is not None
+                else f"in the last {window_seconds} seconds"
+            )
+            print(
+                f"[License] Blocked HWID attempt counter for {identifier!r}: "
+                f"{len(matching_attempts)}/{threshold} qualifying attempts {count_window} "
+                f"(queried {len(recent_attempts or [])} suspicion events)."
+            )
+
+            if len(matching_attempts) >= threshold:
+                detection_details = {
+                    "reason": "repeated_hwid_mismatch_attempts",
+                    "detection_source": "blocked_hwid_attempts",
+                    "blocked": True,
+                    "blocked_attempt_count": len(matching_attempts),
+                    "required_attempts": threshold,
+                    "window_seconds": window_seconds,
+                    "bound_hwid": owner_hwid,
+                    "attempted_hwids": sorted({
+                        str((row.get("details") or {}).get("attempted_hwid") or "").strip().lower()
+                        for row in matching_attempts
+                        if isinstance(row.get("details"), dict)
+                    }),
+                    "recent_attempts": [
+                        {
+                            "created_at": row.get("created_at"),
+                            "remote_ip": (row.get("details") or {}).get("remote_ip"),
+                            "game_id": (row.get("details") or {}).get("game_id"),
+                            "job_id": (row.get("details") or {}).get("job_id"),
+                        }
+                        for row in matching_attempts[:10]
+                    ],
+                    "assessment": "Repeated blocked HWID mismatches met the configured detection threshold.",
+                }
+                disabled = False
+                try:
+                    disabled = bool(_run(disable_license(identifier)))
+                except Exception as exc:
+                    detection_details["disable_error"] = str(exc)[:500]
+                    print(f"[License] Failed to disable license after repeated HWID mismatches: {exc}")
+                detection_details["disabled"] = disabled
+                try:
+                    _run(record_license_security_event(
+                        identifier,
+                        session_id=None,
+                        identity_id=None,
+                        event_type="key_sharing_detected",
+                        confidence="high",
+                        details=detection_details,
+                    ))
+                except Exception as exc:
+                    print(f"[License] Failed to record repeated-HWID key-sharing detection: {exc}")
+                if _breach_notification_allowed(identifier, "key_sharing_detected"):
+                    _queue_breach_webhook(
+                        entry=entry,
+                        key=key,
+                        current_hwid=attempted_hwid,
+                        game_id=game_id,
+                        remote=remote,
+                        executor=executor,
+                        job_id=job_id,
+                        device=device,
+                        reason="key_sharing_detected",
+                        detection_details=(
+                            f"Repeated blocked HWID mismatch attempts: {len(matching_attempts)} "
+                            f"within {window_seconds} seconds (threshold: {threshold}). "
+                            f"License disabled: {disabled}."
+                        ),
+                        license_disabled=disabled,
+                    )
+                print(
+                    f"[License] Repeated blocked HWID attempts detected for {identifier!r}: "
+                    f"{len(matching_attempts)}/{threshold}; license_disabled={disabled}"
+                )
+        except Exception as exc:
+            print(f"[License] Failed to evaluate repeated blocked HWID attempts: {exc}")
+
+    _queue_breach_webhook(
+        entry=entry,
+        key=key,
+        current_hwid=attempted_hwid,
+        game_id=game_id,
+        remote=remote,
+        executor=executor,
+        job_id=job_id,
+        device=device,
+        reason="hwid_mismatch",
+        detection_details=(
+            "The request was blocked because its HWID does not match the license's bound HWID. "
+            "A single mismatch is only suspicious; repeated attempts are evaluated against the configured threshold."
+        ),
+        license_disabled=False,
+    )
+
+
+def _format_sharing_details(pattern: Dict[str, Any], details: Dict[str, Any], confidence: str, concurrent: list[Dict[str, Any]]) -> str:
+    sequence = " → ".join(f"#{value}" for value in pattern["sequence"]) or "None"
+    transitions = []
+    for item in details.get("transitions", []):
+        fields = ", ".join(item["divergence"].get("differing_fields", [])) or "no comparable differences"
+        transitions.append(f"#{item['from']} → #{item['to']} ({fields})")
+    return (
+        f"Identity sequence: `{sequence}`; unique identities: {pattern['unique_identities']}; "
+        f"switches: {pattern['switches']}; revisits: {pattern['revisit_count']}; "
+        f"alternation points: {pattern['alternation_points']}; "
+        f"max identity divergence: {details['max_identity_divergence']}; "
+        f"confidence: {confidence}; concurrent sessions: {len(concurrent)}; "
+        f"recent transitions: {'; '.join(transitions) or 'None'}"
+    )
+
+
+def assess_license_session_sharing(identifier: str, session_id: str, identity_id: Optional[int]) -> Dict[str, Any]:
+    recent = _run(get_recent_license_sessions(identifier, limit=max(8, int(getattr(config, "LICENSE_SHARING_LOOKBACK_SESSIONS", 12)))))
+    identity_ids = []
+    for row in recent:
+        if row.get("identity_id") is not None:
+            try:
+                identity_ids.append(int(row["identity_id"]))
+            except (TypeError, ValueError):
+                pass
+    profiles_list = _run(get_license_identities(identifier, identity_ids=identity_ids))
+    profiles = {int(row["id"]): row for row in profiles_list}
+    pattern = _sharing_pattern(_collapse_identity_sequence(recent))
+    details = _sharing_detection_details(pattern, profiles)
+
+    concurrent: list[Dict[str, Any]] = []
+    if identity_id is not None and getattr(config, "LICENSE_CONCURRENT_SESSION_ENFORCEMENT_ENABLED", True):
+        cutoff = datetime.now(timezone.utc) - timedelta(seconds=max(10, int(getattr(config, "LICENSE_SESSION_TIMEOUT_SECONDS", 75))))
+        active_sessions = _run(get_active_license_sessions(
+            identifier, cutoff, exclude_session_id=session_id
+        ))
+        for row in active_sessions:
+            try:
+                other_identity = int(row.get("identity_id"))
+            except (TypeError, ValueError):
+                continue
+            if other_identity != int(identity_id):
+                concurrent.append({
+                    "session_id": row.get("session_id"),
+                    "identity_id": other_identity,
+                    "last_seen": row.get("last_seen"),
+                    "game_id": row.get("game_id"),
+                    "job_id": row.get("job_id"),
+                })
+
+    repeated_enabled = getattr(config, "LICENSE_REPEATED_ALTERNATION_DETECTION_ENABLED", True)
+    suspected = bool(
+        repeated_enabled
+        and pattern["unique_identities"] >= 2
+        and pattern["revisit_count"] >= int(getattr(config, "LICENSE_SHARING_SUSPECTED_REVISITS", 1))
+        and len(pattern["sequence"]) >= 3
+    )
+    detected = bool(
+        repeated_enabled
+        and pattern["unique_identities"] >= 2
+        and len(pattern["sequence"]) >= int(getattr(config, "LICENSE_SHARING_DETECTED_MIN_RUNS", 8))
+        and pattern["revisit_count"] >= int(getattr(config, "LICENSE_SHARING_DETECTED_REVISITS", 6))
+        and details["max_identity_divergence"] >= int(getattr(config, "LICENSE_SHARING_DETECTED_MIN_DIVERGENCE", 6))
+    ) or bool(concurrent)
+    confidence = "high" if detected else ("medium" if suspected else "low")
+    return {
+        "session_id": session_id,
+        "identity_id": identity_id,
+        "pattern": pattern,
+        "details": details,
+        "confidence": confidence,
+        "suspected": suspected or bool(concurrent),
+        "detected": detected,
+        "concurrent_sessions": concurrent,
     }
 
 
@@ -199,7 +544,7 @@ def _send_breach_webhook(
     detection_details: Any = None,
     license_disabled: bool = False,
 ) -> None:
-    """Send a security alert for a suspicious license-server event.
+    """Send a staff-only security alert for a suspicious license-server event.
 
     Executor/device values are client-reported telemetry, so the alert labels
     them accordingly rather than treating them as independently verified.
@@ -286,8 +631,7 @@ def _send_breach_webhook(
 
     payload = json.dumps({
         "embeds": [embed],
-        # Do not ping a staff member merely because a stored Discord ID is in
-        # the database. The mention remains readable in the message.
+        # Breach embeds are staff-only; do not ping or message license owners.
         "allowed_mentions": {"parse": []},
     }).encode("utf-8")
 
@@ -476,66 +820,12 @@ def evaluate_and_load(
         except ValueError:
             pass
 
-    sharing = {"suspected": False, "high_confidence": False}
-    if getattr(config, "LICENSE_KEY_SHARING_DETECTION_ENABLED", True):
-        sharing = _key_sharing_assessment(entry, country_code, roblox_user_id)
-        if sharing.get("suspected"):
-            details = (
-                f"HWID reset count: {sharing.get('reset_count', 0)}; "
-                f"Activation country: {sharing.get('stored_country', 'Unknown')}; "
-                f"Current country: {sharing.get('current_country', 'Unknown')}; "
-                f"Activation Roblox UserId: {_roblox_profile_link(sharing.get('stored_user_id'))}; "
-                f"Current Roblox UserId: {_roblox_profile_link(sharing.get('current_user_id'))}; "
-                f"Country changed: {'Yes' if sharing.get('country_changed') else 'No'}; "
-                f"Roblox UserId changed: {'Yes' if sharing.get('user_changed') else 'No'}; "
-                f"Confidence: {'High' if sharing.get('high_confidence') else 'Medium'}"
-            )
-            if sharing.get("high_confidence"):
-                disabled = False
-                disable_error = None
-                try:
-                    disabled = bool(_run(disable_license(str(entry["Identifier"]))))
-                except Exception as exc:
-                    disable_error = exc
-                    print(f"[License] Failed to disable suspected shared license: {exc}")
-                breach_entry = dict(entry)
-                breach_entry["CurrentRobloxUserId"] = roblox_user_id
-                _queue_breach_webhook(
-                    entry=breach_entry,
-                    key=key,
-                    current_hwid=hwid,
-                    game_id=game_id,
-                    remote=remote,
-                    executor=executor,
-                    job_id=job_id,
-                    device=device,
-                    reason="key_sharing_detected",
-                    detection_details=details + (f"; Enforcement error: {disable_error}" if disable_error else ""),
-                    license_disabled=disabled,
-                )
-                if disabled:
-                    return {"allowed": False, "reason": "key_sharing_detected"}
-                return {"allowed": False, "reason": "backend_unavailable"}
-
-            breach_entry = dict(entry)
-            breach_entry["CurrentRobloxUserId"] = roblox_user_id
-            _queue_breach_webhook(
-                entry=breach_entry,
-                key=key,
-                current_hwid=hwid,
-                game_id=game_id,
-                remote=remote,
-                executor=executor,
-                job_id=job_id,
-                device=device,
-                reason="key_sharing_suspected",
-                detection_details=details,
-                license_disabled=False,
-            )
+    # Historical key-sharing enforcement happens after a session is recorded,
+    # so Roblox UserId/HWID/country changes alone can never disable a license.
 
     entry_hwid = str(entry.get("HWID") or "").strip().lower()
     if entry_hwid and entry_hwid != hwid:
-        _queue_breach_webhook(
+        _handle_hwid_mismatch_attempt(
             entry=entry,
             key=key,
             current_hwid=hwid,
@@ -544,7 +834,7 @@ def evaluate_and_load(
             executor=executor,
             job_id=job_id,
             device=device,
-            reason="hwid_mismatch",
+            country_code=country_code,
         )
         return {"allowed": False, "reason": "hwid_mismatch"}
     if not entry_hwid:
@@ -573,6 +863,83 @@ def evaluate_and_load(
     except Exception as exc:
         print(f"[License] Game authorization lookup failed: {exc}")
         return {"allowed": False, "reason": "backend_unavailable"}
+
+    session_id = None
+    if getattr(config, "LICENSE_IDENTITY_CLUSTERING_ENABLED", True):
+        try:
+            session_id = _run(
+                record_license_session(
+                    str(entry["Identifier"]),
+                    hwid=hwid,
+                    roblox_user_id=roblox_user_id,
+                    country_code=country_code,
+                    executor=executor,
+                    device=device,
+                    remote_ip=remote,
+                    game_id=game_id,
+                    job_id=job_id,
+                )
+            )
+            if session_id and getattr(config, "LICENSE_KEY_SHARING_DETECTION_ENABLED", True):
+                session_row = _run(get_license_session(session_id))
+                sharing = assess_license_session_sharing(
+                    str(entry["Identifier"]),
+                    session_id,
+                    int(session_row["identity_id"]) if session_row and session_row.get("identity_id") is not None else None,
+                )
+                if sharing.get("suspected") or sharing.get("detected"):
+                    details = _format_sharing_details(
+                        sharing["pattern"],
+                        sharing["details"],
+                        sharing["confidence"],
+                        sharing.get("concurrent_sessions", []),
+                    )
+                    breach_entry = dict(entry)
+                    breach_entry["CurrentRobloxUserId"] = roblox_user_id
+                    event_type = "key_sharing_detected" if sharing.get("detected") else "key_sharing_suspected"
+                    if sharing.get("detected"):
+                        disabled = False
+                        disable_error = None
+                        try:
+                            disabled = bool(_run(disable_license(str(entry["Identifier"]))))
+                        except Exception as exc:
+                            disable_error = exc
+                            print(f"[License] Failed to disable shared license: {exc}")
+                        details_for_event = details + (f"; Enforcement error: {disable_error}" if disable_error else "")
+                        if _breach_notification_allowed(str(entry["Identifier"]), event_type):
+                            _queue_breach_webhook(
+                                entry=breach_entry, key=key, current_hwid=hwid, game_id=game_id, remote=remote,
+                                executor=executor, job_id=job_id, device=device, reason=event_type,
+                                detection_details=details_for_event, license_disabled=disabled,
+                            )
+                        try:
+                            _run(record_license_security_event(
+                                str(entry["Identifier"]), session_id=session_id, identity_id=sharing.get("identity_id"),
+                                event_type=event_type, confidence="high",
+                                details={**sharing, "disabled": disabled},
+                            ))
+                        except Exception as exc:
+                            print(f"[License] Failed to record key-sharing detection event: {exc}")
+                        if disabled:
+                            return {"allowed": False, "reason": "key_sharing_detected"}
+                        return {"allowed": False, "reason": "backend_unavailable"}
+                    else:
+                        if _breach_notification_allowed(str(entry["Identifier"]), event_type):
+                            _queue_breach_webhook(
+                                entry=breach_entry, key=key, current_hwid=hwid, game_id=game_id, remote=remote,
+                                executor=executor, job_id=job_id, device=device, reason=event_type,
+                                detection_details=details, license_disabled=False,
+                            )
+                        try:
+                            _run(record_license_security_event(
+                                str(entry["Identifier"]), session_id=session_id, identity_id=sharing.get("identity_id"),
+                                event_type=event_type, confidence="medium",
+                                details=sharing,
+                            ))
+                        except Exception as exc:
+                            print(f"[License] Failed to record key-sharing suspicion event: {exc}")
+        except Exception as exc:
+            print(f"[License] Session history/security analysis failed: {exc}")
 
     try:
         payload = _run(fetch_game_script(str(game["script_path"])))
@@ -611,6 +978,7 @@ def evaluate_and_load(
         "user": user_data,
         "payload": base64.b64encode(payload.encode("utf-8") if isinstance(payload, str) else payload).decode("ascii"),
         "execution_token": _issue_execution_token(str(entry["Identifier"]), hwid, game_id),
+        "session_id": session_id,
     }
 
 
@@ -770,6 +1138,55 @@ def handle_check_request(raw: bytes, remote: str) -> Tuple[int, str, Dict[str, s
     return status, json.dumps(result), {"Content-Type": "application/json", "Cache-Control": "no-store"}
 
 
+def handle_heartbeat_request(raw: bytes, remote: str) -> Tuple[int, str, Dict[str, str]]:
+    """Refresh a server-issued session while the client is still running."""
+    if len(raw) > 4096:
+        return 413, json.dumps({"ok": False, "reason": "request_too_large"}), {"Content-Type": "application/json"}
+    try:
+        payload = json.loads(raw.decode("utf-8"))
+    except (UnicodeDecodeError, json.JSONDecodeError):
+        return 400, json.dumps({"ok": False, "reason": "malformed_request"}), {"Content-Type": "application/json"}
+    if not isinstance(payload, dict):
+        return 400, json.dumps({"ok": False, "reason": "malformed_request"}), {"Content-Type": "application/json"}
+
+    session_id = str(payload.get("session_id") or "").strip()
+    hwid = str(payload.get("hwid") or "").strip().lower()
+    timestamp = payload.get("timestamp")
+    try:
+        int(timestamp)
+    except (TypeError, ValueError):
+        return 400, json.dumps({"ok": False, "reason": "malformed_request"}), {"Content-Type": "application/json"}
+    if abs(time.time() - int(timestamp)) > MAX_CLOCK_SKEW:
+        return 400, json.dumps({"ok": False, "reason": "stale_timestamp"}), {"Content-Type": "application/json"}
+    if not NONCE_RE.fullmatch(session_id) and len(session_id) < 16:
+        # Session IDs are UUIDs and therefore high-entropy bearer credentials.
+        return 400, json.dumps({"ok": False, "reason": "invalid_session"}), {"Content-Type": "application/json"}
+    if not is_valid_hwid(hwid):
+        return 400, json.dumps({"ok": False, "reason": "invalid_hwid_format"}), {"Content-Type": "application/json"}
+
+    try:
+        session = _run(heartbeat_license_session(session_id, hwid))
+    except Exception as exc:
+        print(f"[License] Session heartbeat failed: {exc}")
+        return 503, json.dumps({"ok": False, "reason": "backend_unavailable"}), {"Content-Type": "application/json"}
+    if not session:
+        return 404, json.dumps({"ok": False, "reason": "session_not_found"}), {"Content-Type": "application/json"}
+    if session.get("ok") is not True:
+        return 403, json.dumps({"ok": False, "reason": session.get("reason", "session_identity_mismatch")}), {"Content-Type": "application/json"}
+
+    identifier = str((session.get("session") or {}).get("license_identifier") or "").strip()
+    if not identifier:
+        return 503, json.dumps({"ok": False, "reason": "backend_unavailable"}), {"Content-Type": "application/json"}
+    try:
+        entry = _run(get_license_by_key(str(payload.get("key") or "").strip())) if payload.get("key") else _run(get_license_by_identifier(identifier))
+    except Exception:
+        entry = None
+    if not entry or not entry.get("Enabled", True):
+        return 403, json.dumps({"ok": False, "reason": "license_disabled"}), {"Content-Type": "application/json"}
+
+    return 200, json.dumps({"ok": True, "reason": "ok", "last_seen": (session.get("session") or {}).get("last_seen")}), {"Content-Type": "application/json", "Cache-Control": "no-store"}
+
+
 def handle_complete_request(raw: bytes, remote: str) -> Tuple[int, str, Dict[str, str]]:
     if len(raw) > MAX_BODY_BYTES:
         return 413, json.dumps({"ok": False, "reason": "request_too_large"}), {"Content-Type": "application/json"}
@@ -798,6 +1215,18 @@ def handle_complete_request(raw: bytes, remote: str) -> Tuple[int, str, Dict[str
             return 403, json.dumps({"ok": False, "reason": "not_authorized"}), {"Content-Type": "application/json"}
         current_hwid = str(entry.get("HWID") or "").strip().lower()
         if not current_hwid or current_hwid != hwid:
+            if current_hwid and current_hwid != hwid:
+                _handle_hwid_mismatch_attempt(
+                    entry=entry,
+                    key=key,
+                    current_hwid=hwid,
+                    game_id=game_id,
+                    remote=remote,
+                    executor=executor,
+                    job_id=job_id,
+                    device=device,
+                    country_code=country_code,
+                )
             return 403, json.dumps({"ok": False, "reason": "hwid_mismatch"}), {"Content-Type": "application/json"}
         game = _run(get_game(game_id))
         if not game:

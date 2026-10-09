@@ -6,7 +6,8 @@ The bot talks to Supabase directly; GitHub is not used for license records.
 
 import asyncio
 import json
-from datetime import datetime, timezone
+import uuid
+from datetime import datetime, timezone, timedelta
 from typing import Any, Dict, List, Optional, Tuple
 
 from supabase import create_client
@@ -1118,6 +1119,473 @@ async def clear_hwid_reset_cooldown(identifier: str) -> Optional[Dict[str, Any]]
         )
         return result.data[0] if result.data else None
     return await asyncio.to_thread(_clear)
+
+
+def _normalize_identity_hwid(value: Any) -> Optional[str]:
+    text = str(value or "").strip().lower()
+    return text or None
+
+
+def _normalize_identity_user_id(value: Any) -> Optional[str]:
+    if value in (None, ""):
+        return None
+    try:
+        parsed = int(value)
+    except (TypeError, ValueError):
+        return None
+    return str(parsed) if parsed > 0 else None
+
+
+def _normalize_identity_text(value: Any) -> Optional[str]:
+    text = str(value or "").strip().lower()
+    return text or None
+
+
+def _identity_similarity(existing: Dict[str, Any], current: Dict[str, Any]) -> Dict[str, Any]:
+    """Score whether a session belongs to an existing identity cluster.
+
+    This is deliberately a clustering heuristic, not an identity lock. HWID,
+    country, executor, device, and IP are supporting signals. Roblox UserId is
+    informational telemetry only and must not affect identity grouping.
+    A single changed signal therefore does not automatically create a security
+    finding or invalidate an existing license.
+    """
+    score = 0
+    signals: Dict[str, str] = {}
+
+    existing_hwid = _normalize_identity_hwid(existing.get("hwid"))
+    current_hwid = _normalize_identity_hwid(current.get("hwid"))
+    if existing_hwid and current_hwid:
+        if existing_hwid == current_hwid:
+            score += 50
+            signals["hwid"] = "match"
+        else:
+            score -= 10
+            signals["hwid"] = "different"
+
+    existing_executor = _normalize_identity_text(existing.get("executor"))
+    current_executor = _normalize_identity_text(current.get("executor"))
+    if existing_executor and current_executor:
+        if existing_executor == current_executor:
+            score += 8
+            signals["executor"] = "match"
+        else:
+            signals["executor"] = "different"
+
+    existing_device = _normalize_identity_text(existing.get("device"))
+    current_device = _normalize_identity_text(current.get("device"))
+    if existing_device and current_device:
+        if existing_device == current_device:
+            score += 7
+            signals["device"] = "match"
+        else:
+            signals["device"] = "different"
+
+    existing_country = _normalize_identity_text(existing.get("country_code"))
+    current_country = _normalize_identity_text(current.get("country_code"))
+    if existing_country and current_country:
+        if existing_country == current_country:
+            score += 3
+            signals["country"] = "match"
+        else:
+            signals["country"] = "different"
+
+    existing_ip = str(existing.get("last_ip") or "").strip()
+    current_ip = str(current.get("remote_ip") or "").strip()
+    if existing_ip and current_ip and existing_ip == current_ip:
+        score += 2
+        signals["ip"] = "match"
+
+    strong_anchor = bool(existing_hwid and current_hwid and existing_hwid == current_hwid)
+    supporting_match = sum(1 for value in signals.values() if value == "match")
+    is_match = bool(strong_anchor and score >= 40) or bool(
+        score >= 55 and supporting_match >= 3
+    )
+    return {
+        "score": score,
+        "match": is_match,
+        "signals": signals,
+    }
+
+
+async def get_recent_license_security_events(
+    license_identifier: str,
+    *,
+    event_type: str,
+    since: datetime,
+    limit: int = 100,
+) -> List[Dict[str, Any]]:
+    """Return recent security events for one license and event type."""
+    identifier = str(license_identifier or "").strip()
+    event_type = str(event_type or "").strip()
+    limit = max(1, min(int(limit), 500))
+    if not identifier or not event_type:
+        return []
+    since_text = _iso(since)
+    if not since_text:
+        return []
+
+    def _get():
+        return (
+            _client_sync().table("license_security_events").select("*")
+            .eq("license_identifier", identifier)
+            .eq("event_type", event_type)
+            .gte("created_at", since_text)
+            .order("created_at", desc=True)
+            .limit(limit)
+            .execute().data or []
+        )
+
+    return await _retry_supabase_read(
+        lambda: asyncio.to_thread(_get),
+        "get recent license security events",
+    )
+
+
+async def record_license_security_event(
+    license_identifier: str,
+    *,
+    session_id: Optional[str],
+    identity_id: Optional[int],
+    event_type: str,
+    confidence: Optional[str] = None,
+    details: Optional[Dict[str, Any]] = None,
+) -> None:
+    row = {
+        "license_identifier": str(license_identifier),
+        "session_id": session_id,
+        "identity_id": identity_id,
+        "event_type": str(event_type),
+        "confidence": confidence,
+        "details": details or {},
+    }
+    await asyncio.to_thread(
+        lambda: _client_sync().table("license_security_events").insert(row).execute()
+    )
+
+
+async def get_license_session(session_id: str) -> Optional[Dict[str, Any]]:
+    """Return a persisted license session by server-issued session UUID."""
+    session_id = str(session_id or "").strip()
+    if not session_id:
+        return None
+
+    def _get():
+        rows = (
+            _client_sync().table("license_sessions").select("*")
+            .eq("session_id", session_id).limit(1).execute().data or []
+        )
+        return rows[0] if rows else None
+
+    return await _retry_supabase_read(lambda: asyncio.to_thread(_get), "get license session")
+
+
+async def heartbeat_license_session(session_id: str, hwid: str) -> Optional[Dict[str, Any]]:
+    """Validate a session's HWID and advance its last_seen timestamp."""
+    session_id = str(session_id or "").strip()
+    normalized_hwid = _normalize_identity_hwid(hwid)
+    if not session_id or not normalized_hwid:
+        return None
+
+    def _touch():
+        client = _client_sync()
+        rows = (
+            client.table("license_sessions")
+            .select("license_identifier,session_id,hwid,identity_id,last_seen")
+            .eq("session_id", session_id).limit(1).execute().data or []
+        )
+        if not rows:
+            return None
+        row = rows[0]
+        previous_seen = row.get("last_seen")
+        if previous_seen:
+            try:
+                previous_dt = datetime.fromisoformat(str(previous_seen).replace("Z", "+00:00"))
+                if previous_dt.tzinfo is None:
+                    previous_dt = previous_dt.replace(tzinfo=timezone.utc)
+                timeout_seconds = max(10, int(getattr(config, "LICENSE_SESSION_TIMEOUT_SECONDS", 75)))
+                if datetime.now(timezone.utc) - previous_dt.astimezone(timezone.utc) > timedelta(seconds=timeout_seconds):
+                    return {"ok": False, "reason": "session_expired", "session": row}
+            except (TypeError, ValueError):
+                pass
+        stored_hwid = _normalize_identity_hwid(row.get("hwid"))
+        if stored_hwid and stored_hwid != normalized_hwid:
+            return {"ok": False, "reason": "session_identity_mismatch", "session": row}
+        updated = (
+            client.table("license_sessions")
+            .update({"last_seen": datetime.now(timezone.utc).isoformat()})
+            .eq("session_id", session_id)
+            .eq("hwid", normalized_hwid)
+            .execute().data or []
+        )
+        if not updated:
+            return None
+        return {"ok": True, "reason": "ok", "session": updated[0]}
+
+    return await asyncio.to_thread(_touch)
+
+
+async def get_recent_license_sessions(license_identifier: str, *, limit: int = 12) -> List[Dict[str, Any]]:
+    identifier = str(license_identifier or "").strip()
+    limit = max(1, min(int(limit), 100))
+    if not identifier:
+        return []
+
+    def _get():
+        return (
+            _client_sync().table("license_sessions").select("*")
+            .eq("license_identifier", identifier)
+            .order("started_at", desc=True).limit(limit).execute().data or []
+        )
+
+    return await _retry_supabase_read(lambda: asyncio.to_thread(_get), "get recent license sessions")
+
+
+async def get_active_license_sessions(
+    license_identifier: str,
+    cutoff: datetime,
+    *,
+    exclude_session_id: Optional[str] = None,
+) -> List[Dict[str, Any]]:
+    """Return sessions still active according to their last heartbeat."""
+    identifier = str(license_identifier or "").strip()
+    if not identifier:
+        return []
+    cutoff_text = cutoff.astimezone(timezone.utc).isoformat()
+
+    def _get():
+        query = (
+            _client_sync()
+            .table("license_sessions")
+            .select("*")
+            .eq("license_identifier", identifier)
+            .gte("last_seen", cutoff_text)
+            .order("last_seen", desc=True)
+        )
+        if exclude_session_id:
+            query = query.neq("session_id", str(exclude_session_id))
+        return query.execute().data or []
+
+    return await _retry_supabase_read(
+        lambda: asyncio.to_thread(_get),
+        "get active license sessions",
+    )
+
+
+async def get_license_identities(license_identifier: str, identity_ids: Optional[List[int]] = None) -> List[Dict[str, Any]]:
+    identifier = str(license_identifier or "").strip()
+    if not identifier:
+        return []
+    ids = []
+    for value in identity_ids or []:
+        try:
+            parsed = int(value)
+        except (TypeError, ValueError):
+            continue
+        if parsed > 0:
+            ids.append(parsed)
+
+    def _get():
+        query = _client_sync().table("license_identities").select("*").eq("license_identifier", identifier)
+        if ids:
+            query = query.in_("id", ids)
+        return query.execute().data or []
+
+    return await _retry_supabase_read(lambda: asyncio.to_thread(_get), "get license identities")
+
+
+def _find_identity_sync(
+    license_identifier: str,
+    current: Dict[str, Any],
+) -> Tuple[Optional[int], bool, Dict[str, Any]]:
+    client = _client_sync()
+    rows = (
+        client.table("license_identities")
+        .select("*")
+        .eq("license_identifier", license_identifier)
+        .order("last_seen", desc=True)
+        .execute()
+    ).data or []
+
+    best_row: Optional[Dict[str, Any]] = None
+    best_score: Optional[Dict[str, Any]] = None
+    for row in rows:
+        assessment = _identity_similarity(row, current)
+        if best_score is None or assessment["score"] > best_score["score"]:
+            best_row = row
+            best_score = assessment
+
+    if best_row is not None and best_score and best_score["match"]:
+        identity_id = int(best_row["id"])
+        # Identity state is updated only after the session row is successfully
+        # inserted. This prevents session_count from drifting when a session
+        # insert fails after a match has already been selected.
+        return identity_id, False, {
+            "score": best_score["score"],
+            "matched_identity_id": identity_id,
+            "signals": best_score["signals"],
+        }
+
+    identity_key = f"identity_{uuid.uuid4().hex}"
+    row = {
+        "license_identifier": license_identifier,
+        "identity_key": identity_key,
+        "hwid": current.get("hwid"),
+        "roblox_user_id": current.get("roblox_user_id"),
+        "country_code": current.get("country_code"),
+        "executor": current.get("executor"),
+        "device": current.get("device"),
+        "session_count": 0,
+        "ip_count": 0,
+    }
+    if current.get("remote_ip"):
+        row["last_ip"] = current["remote_ip"]
+    created = client.table("license_identities").insert(row).execute().data or []
+    if not created:
+        raise RuntimeError("Supabase did not return the created license identity")
+    identity_id = int(created[0]["id"])
+    return identity_id, True, {
+        "score": best_score["score"] if best_score else None,
+        "matched_identity_id": best_row.get("id") if best_row else None,
+        "signals": best_score["signals"] if best_score else {},
+    }
+
+
+async def record_license_session(
+    license_identifier: str,
+    *,
+    hwid: Optional[str] = None,
+    roblox_user_id: Optional[int] = None,
+    country_code: Optional[str] = None,
+    executor: Optional[str] = None,
+    device: Optional[str] = None,
+    remote_ip: Optional[str] = None,
+    game_id: Optional[str] = None,
+    job_id: Optional[str] = None,
+) -> str:
+    """Record a successful authentication and associate it with an identity cluster."""
+    identifier = str(license_identifier or "").strip()
+    if not identifier:
+        raise ValueError("License session is missing license identifier")
+
+    session_id = str(uuid.uuid4())
+    normalized_hwid = _normalize_identity_hwid(hwid)
+    normalized_user_id = _normalize_identity_user_id(roblox_user_id)
+    normalized_country = _normalize_identity_text(country_code)
+    if normalized_country and len(normalized_country) != 2:
+        normalized_country = None
+    normalized_executor = _normalize_identity_text(executor)
+    normalized_device = _normalize_identity_text(device)
+
+    normalized_ip: Optional[str] = None
+    if remote_ip:
+        import ipaddress
+        try:
+            normalized_ip = str(ipaddress.ip_address(str(remote_ip).strip()))
+        except ValueError:
+            normalized_ip = None
+
+    current = {
+        "hwid": normalized_hwid,
+        "roblox_user_id": normalized_user_id,
+        "country_code": normalized_country,
+        "executor": normalized_executor,
+        "device": normalized_device,
+        "remote_ip": normalized_ip,
+    }
+
+    identity_id, created, clustering = await asyncio.to_thread(
+        _find_identity_sync,
+        identifier,
+        current,
+    )
+
+    row = {
+        "license_identifier": identifier,
+        "session_id": session_id,
+        "identity_id": identity_id,
+        "hwid": normalized_hwid,
+        "roblox_user_id": int(normalized_user_id) if normalized_user_id else None,
+        "country_code": normalized_country,
+        "executor": normalized_executor,
+        "device": normalized_device,
+        "remote_ip": normalized_ip,
+        "game_id": str(game_id or "").strip() or None,
+        "job_id": str(job_id or "").strip() or None,
+    }
+
+    try:
+        await asyncio.to_thread(
+            lambda: _client_sync().table("license_sessions").insert(row).execute()
+        )
+    except Exception:
+        # Do not leave an identity profile with a session_count that cannot be
+        # represented in session history. Best-effort rollback only; session
+        # persistence must never block otherwise successful authentication.
+        if identity_id and created:
+            try:
+                await asyncio.to_thread(
+                    lambda: _client_sync()
+                    .table("license_identities")
+                    .delete()
+                    .eq("id", identity_id)
+                    .execute()
+                )
+            except Exception:
+                pass
+        raise
+
+    def _update_identity_after_session() -> None:
+        client = _client_sync()
+        current_row = (
+            client.table("license_identities")
+            .select("session_count,ip_count,last_ip")
+            .eq("id", identity_id)
+            .limit(1)
+            .execute()
+            .data
+            or []
+        )
+        if not current_row:
+            raise RuntimeError("Supabase license identity disappeared after session insert")
+        profile = current_row[0]
+        updates = {
+            "last_seen": datetime.now(timezone.utc).isoformat(),
+            "session_count": int(profile.get("session_count") or 0) + 1,
+            "ip_count": int(profile.get("ip_count") or 0),
+        }
+        current_ip = str(current.get("remote_ip") or "").strip()
+        previous_ip = str(profile.get("last_ip") or "").strip()
+        if current_ip and current_ip != previous_ip:
+            updates["ip_count"] += 1
+            updates["last_ip"] = current_ip
+        client.table("license_identities").update(updates).eq("id", identity_id).execute()
+
+    try:
+        await asyncio.to_thread(_update_identity_after_session)
+    except Exception as exc:
+        print(f"[License] Failed to update identity cluster after session insert: {exc}")
+
+    if created:
+        try:
+            await record_license_security_event(
+                identifier,
+                session_id=session_id,
+                identity_id=identity_id,
+                event_type="new_identity_observed",
+                confidence="low",
+                details={
+                    "clustering": clustering,
+                    "roblox_user_id": int(normalized_user_id) if normalized_user_id else None,
+                    "country_code": normalized_country,
+                    "executor": normalized_executor,
+                    "device": normalized_device,
+                },
+            )
+        except Exception as exc:
+            print(f"[License] Failed to record identity event: {exc}")
+
+    return session_id
 
 
 async def complete_successful_execution(

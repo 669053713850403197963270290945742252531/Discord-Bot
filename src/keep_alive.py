@@ -59,6 +59,14 @@ def public_license_client():
         "__LICENSE_TAMPER_DETECTION_ENABLED__",
         "true" if config.LICENSE_TAMPER_DETECTION_ENABLED else "false",
     )
+    source = source.replace(
+        "__LICENSE_SESSION_HEARTBEAT_ENABLED__",
+        "true" if config.LICENSE_SESSION_HEARTBEAT_ENABLED else "false",
+    )
+    source = source.replace(
+        "__LICENSE_SESSION_HEARTBEAT_INTERVAL__",
+        str(config.LICENSE_SESSION_HEARTBEAT_INTERVAL_SECONDS),
+    )
 
     # `/client` must remain usable by the executor's HTTP client, but opening
     # the endpoint in a normal browser should never expose the license client
@@ -134,6 +142,15 @@ def whitelist_challenge():
 def whitelist_check():
     from api.license_server import handle_check_request
     status, body, headers = handle_check_request(
+        request.get_data(), request.remote_addr or 'unknown'
+    )
+    return Response(body, status=status, headers=headers)
+
+
+@app.route('/whitelist/heartbeat', methods=['POST'])
+def whitelist_heartbeat():
+    from api.license_server import handle_heartbeat_request
+    status, body, headers = handle_heartbeat_request(
         request.get_data(), request.remote_addr or 'unknown'
     )
     return Response(body, status=status, headers=headers)
