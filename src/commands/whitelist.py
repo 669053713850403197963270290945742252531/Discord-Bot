@@ -791,73 +791,42 @@ class Whitelist(commands.Cog):
             return
         await _unwhitelist_user_impl(interaction, resolved_user)
 
-    @whitelist_group.command(name="edit", description="Replace the license database from JSON export.")
+    @whitelist_group.command(name="edit", description="Opens the website-based whitelist JSON editor.")
     @has_role(config.REQUIRED_ROLE_ID)
     @is_in_guild(config.GUILD_ID)
     async def editwhitelist(self, interaction):
-        try:
-            before_users = await asyncio.wait_for(fetch_users(), timeout=2.0)
-        except asyncio.TimeoutError:
-            return await send_error(interaction, "The license database took too long to respond. Please try again.")
-        except Exception as exc:
-            return await send_error(interaction, f"Failed to load the license database: {exc}")
+        """Show the hosted Stage 1 whitelist editor in a Components V2 layout."""
+        editor_url = f"{config.LICENSE_SERVER_BASE_URL.rstrip('/')}/editwhitelist"
 
-        current = json.dumps(before_users, indent=4, ensure_ascii=False) + "\n"
-        modal = Modal(title="Edit License JSON")
-        text = TextInput(label="License JSON", style=discord.TextStyle.paragraph, default=current[:4000], max_length=4000)
-        modal.add_item(text)
-
-        async def submit(i):
-            try:
-                payload = json.loads(text.value)
-                if not isinstance(payload, list):
-                    raise ValueError("JSON must be an array of license objects")
-
-                normalized = []
-                identifiers = set()
-                for row in payload:
-                    record = record_from_import_row(row)
-                    key = record["Identifier"].casefold()
-                    if key in identifiers:
-                        raise ValueError(f"Duplicate identifier: {record['Identifier']}")
-                    identifiers.add(key)
-                    normalized.append(record)
-
-                committed = await commit_content(
-                    json.dumps(normalized, ensure_ascii=False),
-                    None,
-                    f"Replace license database by {i.user}",
-                )
-                after_users = committed if isinstance(committed, list) else await fetch_users()
-                diff_text = _license_database_diff(before_users, after_users)
-            except Exception as e:
-                import traceback
-                traceback.print_exc()
-                return await send_error(i, f"Invalid license JSON: {e}")
-
-            await send_success(i, "License database updated.")
-            changed_identifiers = _changed_license_identifiers(before_users, after_users)
-            if changed_identifiers:
-                if len(changed_identifiers) <= 15:
-                    changed_text = ", ".join(f"`{identifier}`" for identifier in changed_identifiers)
-                else:
-                    shown = ", ".join(f"`{identifier}`" for identifier in changed_identifiers[:15])
-                    changed_text = f"{shown}, + {len(changed_identifiers) - 15} more"
-                description = (
-                    f"{i.user.mention} replaced the license database via `/whitelist edit`.\n"
-                    f"**Edited user(s):** {changed_text}"
-                )
-            else:
-                description = (
-                    f"{i.user.mention} replaced the license database via `/whitelist edit`.\n"
-                    f"**Edited user(s):** None detected"
-                )
-
-            diff_view = LicenseDatabaseDiffView(description, diff_text)
-            await send_component_alert(i.client, diff_view)
-
-        modal.on_submit = submit
-        await safe_send_modal(interaction, modal)
+        open_button = Button(
+            label="Open Whitelist Editor",
+            emoji="🌐",
+            style=discord.ButtonStyle.link,
+            url=editor_url,
+        )
+        view = LayoutView(timeout=None)
+        view.add_item(Container(
+            TextDisplay(
+                "# 🛠️ Celestial Whitelist Editor\n"
+                "Edit and validate whitelist JSON in your browser, with syntax highlighting "
+                "and inline error markers—without Discord modal character limits."
+            ),
+            TextDisplay(
+                "### ✨ Available now · Stage 1\n"
+                "• JSON syntax highlighting and line numbers\n"
+                "• Live syntax validation and error markers\n"
+                "• Bracket matching and automatic bracket closing"
+            ),
+            TextDisplay(
+                "### ⚠️ Preview limitation\n"
+                "This stage is editor-only. It does **not** load the live whitelist or write changes "
+                "to the database. `Save Changes` validates the editor contents but does not update "
+                "the live whitelist. Database loading and saving are planned for Stage 2."
+            ),
+            TextDisplay("-# Celestial • Whitelist Administration"),
+            ActionRow(open_button),
+        ))
+        await safe_respond(interaction, view=view, ephemeral=True)
 
     @whitelist_group.command(name="search", description="Searches the license database for a value.")
     @app_commands.describe(

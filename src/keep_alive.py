@@ -1,12 +1,10 @@
-"""Small Flask server with four jobs:
+"""Small Flask server for keep-alive, website, and licensing endpoints.
 
-1. `/` -- plain keep-alive endpoint.
-3. `/client` -- serves the public Potassium license loader. It contains no
-   server secret and is safe to distribute in the normal two-line loader.
-3. `/whitelist/challenge` + `/whitelist/check` + `/whitelist/complete` -- public license API.
-   The challenge is one-use/short-lived; the check validates the license key
-   and game; the protected game payload is returned only after authorization;
-   completion records activation and increments the execution counter.
+- `/` -- plain keep-alive endpoint.
+- `/client` -- serves the public Potassium license loader.
+- `/editwhitelist` -- Stage 1 JSON editor UI; deliberately has no database I/O.
+- `/whitelist/*` -- public license challenge, check, heartbeat, breach, and
+  completion endpoints.
 
 There is intentionally no client-shared secret. A public Roblox script cannot
 keep a secret from the user executing it. HTTPS, one-use challenges, rate
@@ -28,6 +26,45 @@ app = Flask('')
 @app.route('/')
 def home():
     return "Bot is alive!", 200
+
+
+@app.route('/editwhitelist', methods=['GET'])
+@app.route('/editwhitelist/', methods=['GET'])
+def whitelist_editor_page():
+    """Serve the Stage 1 whitelist JSON editor.
+
+    This route intentionally does not load or write whitelist/database data.
+    Stage 2 will add an authorized, server-backed load/save workflow.
+    """
+    from pathlib import Path
+
+    page_path = Path(__file__).resolve().parent / "templates" / "editwhitelist.html"
+    try:
+        page = page_path.read_text(encoding="utf-8")
+    except OSError:
+        return "Whitelist editor unavailable", 503, {"Content-Type": "text/plain; charset=utf-8"}
+
+    response = Response(
+        page,
+        status=200,
+        mimetype="text/html",
+        headers={
+            "Cache-Control": "no-store, no-cache, must-revalidate, max-age=0",
+            "Pragma": "no-cache",
+            "X-Content-Type-Options": "nosniff",
+            "X-Frame-Options": "DENY",
+            "Referrer-Policy": "no-referrer",
+            "Content-Security-Policy": (
+                "default-src 'none'; "
+                "script-src https://cdnjs.cloudflare.com 'unsafe-inline'; "
+                "style-src https://cdnjs.cloudflare.com 'unsafe-inline'; "
+                "font-src https://cdnjs.cloudflare.com data:; "
+                "img-src data:; connect-src 'none'; object-src 'none'; "
+                "base-uri 'none'; frame-ancestors 'none'"
+            ),
+        },
+    )
+    return response
 
 
 @app.route('/client', methods=['GET'])
