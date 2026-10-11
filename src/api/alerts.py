@@ -201,6 +201,10 @@ async def send_component_alert(
         return None
     try:
         kwargs = {"view": view}
+        # Keep the user mention visible in LicenseDatabaseDiffView, but do not
+        # generate a notification when the staff diff alert is posted.
+        if isinstance(view, LicenseDatabaseDiffView):
+            kwargs["allowed_mentions"] = discord.AllowedMentions(users=False)
         if file is not None:
             kwargs["file"] = file
         return await channel.send(**kwargs)

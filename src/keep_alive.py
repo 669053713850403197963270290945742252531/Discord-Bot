@@ -29,6 +29,28 @@ def home():
     return "Bot is alive!", 200
 
 
+@app.route('/editwhitelist/favicon.png', methods=['GET'])
+def whitelist_editor_favicon():
+    """Serve the locally bundled PNG tab icon for the whitelist editor."""
+    from pathlib import Path
+
+    icon_path = Path(__file__).resolve().parent / "static" / "whitelist-editor.png"
+    try:
+        icon_bytes = icon_path.read_bytes()
+    except OSError:
+        return "Whitelist editor icon unavailable", 503, {"Content-Type": "text/plain; charset=utf-8"}
+
+    return Response(
+        icon_bytes,
+        status=200,
+        mimetype="image/png",
+        headers={
+            "Cache-Control": "public, max-age=86400",
+            "X-Content-Type-Options": "nosniff",
+        },
+    )
+
+
 @app.route('/editwhitelist', methods=['GET'])
 @app.route('/editwhitelist/', methods=['GET'])
 def whitelist_editor_page():
@@ -56,7 +78,7 @@ def whitelist_editor_page():
                 "script-src https://cdnjs.cloudflare.com 'unsafe-inline'; "
                 "style-src https://cdnjs.cloudflare.com 'unsafe-inline'; "
                 "font-src https://cdnjs.cloudflare.com data:; "
-                "img-src data:; connect-src 'self'; object-src 'none'; "
+                "img-src 'self' data:; connect-src 'self'; object-src 'none'; "
                 "base-uri 'none'; frame-ancestors 'none'"
             ),
         },
