@@ -28,6 +28,7 @@ from api.keys import generate_unique_key, is_valid_discord_id, parse_game_ids
 from commands.keys import _tempwhitelist_impl, _checktemp_impl, _extend_impl
 from commands.database import _upload_impl
 from api.time_utils import format_discord_timestamp
+from api.whitelist_editor import create_whitelist_editor_session, build_editor_initial_view
 from api.tls import get_ssl_context
 
 GUILD = discord.Object(id=config.GUILD_ID)
@@ -795,38 +796,16 @@ class Whitelist(commands.Cog):
     @has_role(config.REQUIRED_ROLE_ID)
     @is_in_guild(config.GUILD_ID)
     async def editwhitelist(self, interaction):
-        """Show the hosted Stage 1 whitelist editor in a Components V2 layout."""
-        editor_url = f"{config.LICENSE_SERVER_BASE_URL.rstrip('/')}/editwhitelist"
-
-        open_button = Button(
-            label="Open Whitelist Editor",
-            emoji="🌐",
-            style=discord.ButtonStyle.link,
-            url=editor_url,
+        """Open an authenticated web editor for the live Supabase whitelist."""
+        _token, editor_url = create_whitelist_editor_session(
+            interaction,
+            config.LICENSE_SERVER_BASE_URL.rstrip("/"),
         )
-        view = LayoutView(timeout=None)
-        view.add_item(Container(
-            TextDisplay(
-                "# 🛠️ Celestial Whitelist Editor\n"
-                "Edit and validate whitelist JSON in your browser, with syntax highlighting "
-                "and inline error markers—without Discord modal character limits."
-            ),
-            TextDisplay(
-                "### ✨ Available now · Stage 1\n"
-                "• JSON syntax highlighting and line numbers\n"
-                "• Live syntax validation and error markers\n"
-                "• Bracket matching and automatic bracket closing"
-            ),
-            TextDisplay(
-                "### ⚠️ Preview limitation\n"
-                "This stage is editor-only. It does **not** load the live whitelist or write changes "
-                "to the database. `Save Changes` validates the editor contents but does not update "
-                "the live whitelist. Database loading and saving are planned for Stage 2."
-            ),
-            TextDisplay("-# Celestial • Whitelist Administration"),
-            ActionRow(open_button),
-        ))
-        await safe_respond(interaction, view=view, ephemeral=True)
+        await safe_respond(
+            interaction,
+            view=build_editor_initial_view(editor_url),
+            ephemeral=True,
+        )
 
     @whitelist_group.command(name="search", description="Searches the license database for a value.")
     @app_commands.describe(

@@ -32,10 +32,11 @@
     .diagnostics-list .ok { color: #1a7f37; }
     .actions { display: flex; justify-content: flex-end; gap: 10px; margin-top: 14px; }
     button { min-height: 36px; border: 1px solid #d0d7de; border-radius: 6px; padding: 7px 15px; background: #fff; color: #24292f; font: inherit; font-size: .92rem; cursor: pointer; }
-    button:hover { background: #f3f4f6; }
+    button:hover:not(:disabled) { background: #f3f4f6; }
+    button:disabled { opacity: .6; cursor: wait; }
     button:focus-visible { outline: 2px solid #0969da; outline-offset: 2px; }
     button.primary { color: #fff; background: #1f883d; border-color: #1f883d; font-weight: 600; }
-    button.primary:hover { background: #1a7f37; }
+    button.primary:hover:not(:disabled) { background: #1a7f37; }
     .notice { margin: 12px 0 0; min-height: 1.5em; font-size: .92rem; }
     .notice.error { color: #cf222e; }
     .notice.success { color: #1a7f37; }
@@ -48,10 +49,10 @@
   <main>
     <header>
       <h1>Celestial Whitelist Editor</h1>
-      <p class="intro">Edit a JSON whitelist export with syntax highlighting and live validation.</p>
+      <p class="intro">Edit the live Celestial license database with syntax highlighting, validation, and database-backed saving.</p>
     </header>
 
-    <p class="stage-note"><strong>Stage 1 preview:</strong> paste your whitelist JSON into the editor. Loading data from the bot and saving changes to the database are not connected yet; nothing on this page will modify the live whitelist.</p>
+    <p class="stage-note"><strong>Live database editor:</strong> the current whitelist loads automatically. Save Changes validates and writes the full dataset to Supabase; Refresh reloads the latest saved database.</p>
 
     <section class="editor-shell" aria-label="JSON editor">
       <div class="editor-toolbar">
@@ -71,8 +72,8 @@
       <button id="refresh-button" type="button">Refresh</button>
       <button id="save-button" class="primary" type="button">Save Changes</button>
     </div>
-    <p id="notice" class="notice info" role="status">Ready. No live database connection is active in Stage 1.</p>
-    <p class="footer-note">Validation checks JSON syntax, the top-level array, required identifiers, duplicate identifiers, and common field types. Database-level validation will be handled in Stage 2.</p>
+    <p id="notice" class="notice info" role="status">Connecting to the live whitelist database…</p>
+    <p class="footer-note">Validation checks the exported license fields, value types, required fields, and duplicate identifiers, Discord IDs, and license keys. Refresh reloads the database snapshot; if another edit is saved first, you will need to refresh before saving.</p>
   </main>
 
   <script src="https://cdnjs.cloudflare.com/ajax/libs/codemirror/5.65.16/codemirror.min.js"></script>
@@ -83,7 +84,6 @@
   <script>
     (() => {
       "use strict";
-      const initialJson = "[]";
       const diagnosticsList = document.getElementById("diagnostics-list");
       const notice = document.getElementById("notice");
       const stats = document.getElementById("editor-stats");
@@ -150,6 +150,48 @@
         return offsets;
       }
 
+      const fieldAliases = {
+        Identifier: ["Identifier", "identifier"],
+        DiscordId: ["DiscordId", "discord_id"],
+        Key: ["Key", "LicenseKey", "license_key", "key"],
+        Activated: ["Activated", "activated"],
+        Executions: ["Executions", "executions"],
+        Rank: ["Rank", "rank"],
+        Notes: ["Notes", "notes"],
+        Games: ["Games", "games"],
+        Enabled: ["Enabled", "enabled"],
+        ExpiresAt: ["ExpiresAt", "expires_at"],
+        CreatedAt: ["CreatedAt", "created_at"],
+        UpdatedAt: ["UpdatedAt", "updated_at"],
+        HWID: ["HWID", "hwid"],
+        LastHwidReset: ["LastHwidReset", "LastHWIDReset", "last_hwid_reset"],
+        totalHwidResets: ["totalHwidResets", "HwidResets", "HWIDResets", "hwid_resets"],
+        ActivationCountry: ["ActivationCountry", "activation_country_code", "activation_country"],
+        ActivationRobloxUserId: ["ActivationRobloxUserId", "activation_roblox_user_id"]
+      };
+      const allowedFields = new Set(Object.values(fieldAliases).flat());
+      const requiredFields = Object.keys(fieldAliases);
+
+      function fieldValue(row, name) {
+        const aliases = fieldAliases[name];
+        const present = aliases.filter(alias => Object.prototype.hasOwnProperty.call(row, alias));
+        if (!present.length) return { found: false, value: undefined };
+        const first = row[present[0]];
+        if (present.some(alias => row[alias] !== first)) return { found: true, conflict: true, value: first };
+        return { found: true, value: first };
+      }
+
+      function isNullableString(value) {
+        return value === null || value === "" || typeof value === "string";
+      }
+
+      function isIsoDateOrNull(value) {
+        if (value === null || value === "") return true;
+        if (typeof value !== "string") return false;
+        const trimmed = value.trim();
+        return /^\d{4}-\d{2}-\d{2}(?:[Tt ][0-9:.]+(?:[Zz]|[+-][0-9:]+)?)?$/.test(trimmed) && !Number.isNaN(Date.parse(trimmed));
+      }
+
       function validateJson(source) {
         const issues = [];
         let parsed;
@@ -168,6 +210,7 @@
 
         const identifiers = new Map();
         const discordIds = new Map();
+        const licenseKeys = new Map();
         const objectOffsets = findArrayObjectOffsets(source);
         for (let index = 0; index < parsed.length; index++) {
           const row = parsed[index];
@@ -177,39 +220,83 @@
             continue;
           }
 
-          const rawIdentifier = row.Identifier ?? row.identifier;
-          const identifier = typeof rawIdentifier === "string" ? rawIdentifier.trim() : "";
-          if (!identifier) {
-            issues.push(issueAt(source, Math.max(0, marker), `Entry ${index + 1} is missing a non-empty Identifier.`));
+          for (const field of Object.keys(row)) {
+            if (!allowedFields.has(field)) {
+              issues.push(issueAt(source, Math.max(0, marker), `Entry ${index + 1} has unknown field "${field}".`));
+            }
+          }
+          const values = {};
+          for (const field of requiredFields) {
+            const found = fieldValue(row, field);
+            if (!found.found) {
+              issues.push(issueAt(source, Math.max(0, marker), `Entry ${index + 1} is missing required field "${field}".`));
+            } else if (found.conflict) {
+              issues.push(issueAt(source, Math.max(0, marker), `Entry ${index + 1} has conflicting aliases for "${field}".`));
+            }
+            values[field] = found.value;
+          }
+
+          const identifier = values.Identifier;
+          if (typeof identifier !== "string" || !identifier.trim()) {
+            issues.push(issueAt(source, Math.max(0, marker), `Entry ${index + 1} requires a non-empty string Identifier.`));
           } else {
-            const key = identifier.toLocaleLowerCase();
+            const key = identifier.trim().toLocaleLowerCase();
             if (identifiers.has(key)) {
               issues.push(issueAt(source, Math.max(0, marker), `Duplicate Identifier "${identifier}" (also used by entry ${identifiers.get(key)}).`));
-            } else {
-              identifiers.set(key, index + 1);
-            }
+            } else identifiers.set(key, index + 1);
           }
 
-          const discordId = String(row.DiscordId ?? row.discord_id ?? "").trim();
-          if (discordId) {
-            if (discordIds.has(discordId)) {
+          const discordId = values.DiscordId;
+          if (discordId !== null && discordId !== "") {
+            if (typeof discordId !== "string" || !/^\d+$/.test(discordId)) {
+              issues.push(issueAt(source, Math.max(0, marker), `DiscordId in entry ${index + 1} must be a quoted numeric ID or null.`));
+            } else if (discordIds.has(discordId)) {
               issues.push(issueAt(source, Math.max(0, marker), `DiscordId "${discordId}" is duplicated (also used by entry ${discordIds.get(discordId)}).`));
-            } else {
-              discordIds.set(discordId, index + 1);
-            }
+            } else discordIds.set(discordId, index + 1);
           }
 
-          for (const field of ["Executions", "totalHwidResets", "HwidResets", "HWIDResets"]) {
-            if (row[field] !== undefined && row[field] !== null && row[field] !== "" && (typeof row[field] === "boolean" || !Number.isInteger(Number(row[field])) || Number(row[field]) < 0)) {
+          const keyValue = values.Key;
+          if (keyValue !== null && keyValue !== "") {
+            if (typeof keyValue !== "string") {
+              issues.push(issueAt(source, Math.max(0, marker), `Key in entry ${index + 1} must be a string or null.`));
+            } else if (licenseKeys.has(keyValue)) {
+              issues.push(issueAt(source, Math.max(0, marker), `License Key is duplicated (also used by entry ${licenseKeys.get(keyValue)}).`));
+            } else licenseKeys.set(keyValue, index + 1);
+          }
+
+          if (typeof values.Rank !== "string" || !values.Rank.trim()) {
+            issues.push(issueAt(source, Math.max(0, marker), `Rank in entry ${index + 1} must be a non-empty string.`));
+          }
+          if (values.Notes !== null && typeof values.Notes !== "string") {
+            issues.push(issueAt(source, Math.max(0, marker), `Notes in entry ${index + 1} must be a string or null.`));
+          }
+          if (typeof values.Enabled !== "boolean") {
+            issues.push(issueAt(source, Math.max(0, marker), `Enabled in entry ${index + 1} must be true or false.`));
+          }
+          for (const field of ["Activated", "ExpiresAt", "CreatedAt", "UpdatedAt", "LastHwidReset"]) {
+            if (!isIsoDateOrNull(values[field])) {
+              issues.push(issueAt(source, Math.max(0, marker), `${field} in entry ${index + 1} must be an ISO-8601 timestamp or null.`));
+            }
+          }
+          for (const field of ["Executions", "totalHwidResets"]) {
+            if (typeof values[field] !== "number" || !Number.isInteger(values[field]) || values[field] < 0) {
               issues.push(issueAt(source, Math.max(0, marker), `${field} in entry ${index + 1} must be a non-negative integer.`));
             }
           }
-          const games = row.Games ?? row.games;
-          if (games !== undefined && games !== null && !Array.isArray(games) && typeof games !== "string") {
-            issues.push(issueAt(source, Math.max(0, marker), `Games in entry ${index + 1} must be an array or a comma-separated string.`));
-          }
-          if (Array.isArray(games) && games.some(game => typeof game !== "string")) {
+          const games = values.Games;
+          if (!Array.isArray(games) && typeof games !== "string") {
+            issues.push(issueAt(source, Math.max(0, marker), `Games in entry ${index + 1} must be an array of strings or a comma-separated string.`));
+          } else if (Array.isArray(games) && games.some(game => typeof game !== "string")) {
             issues.push(issueAt(source, Math.max(0, marker), `Every Games item in entry ${index + 1} must be a string.`));
+          }
+          for (const field of ["HWID", "ActivationCountry"]) {
+            if (!isNullableString(values[field])) {
+              issues.push(issueAt(source, Math.max(0, marker), `${field} in entry ${index + 1} must be a string or null.`));
+            }
+          }
+          const robloxId = values.ActivationRobloxUserId;
+          if (robloxId !== null && robloxId !== "" && (typeof robloxId !== "number" || !Number.isSafeInteger(robloxId) || robloxId < 0)) {
+            issues.push(issueAt(source, Math.max(0, marker), `ActivationRobloxUserId in entry ${index + 1} must be a non-negative integer or null.`));
           }
         }
         return { parsed, issues };
@@ -248,6 +335,23 @@
       }
 
       const textarea = document.getElementById("json-editor");
+      const refreshButton = document.getElementById("refresh-button");
+      const saveButton = document.getElementById("save-button");
+      let editorSession = "";
+      let loadedRevision = "";
+      let baselineText = "";
+      let isBusy = false;
+
+      try {
+        const fragment = new URLSearchParams(window.location.hash.replace(/^#/, ""));
+        const linkToken = fragment.get("session");
+        if (linkToken) sessionStorage.setItem("celestialWhitelistEditorSession", linkToken);
+        editorSession = linkToken || sessionStorage.getItem("celestialWhitelistEditorSession") || "";
+        if (linkToken) history.replaceState(null, "", window.location.pathname + window.location.search);
+      } catch (_) {
+        editorSession = "";
+      }
+
       if (window.CodeMirror) {
         editor = CodeMirror.fromTextArea(textarea, {
           mode: { name: "javascript", json: true },
@@ -274,37 +378,136 @@
       function getValue() { return editor ? editor.getValue() : textarea.value; }
       function setValue(value) { if (editor) editor.setValue(value); else textarea.value = value; }
       function showNotice(message, type) { notice.textContent = message; notice.className = `notice ${type || "info"}`; }
+      function setBusy(value) {
+        isBusy = value;
+        refreshButton.disabled = value || !editorSession;
+        saveButton.disabled = value || !editorSession;
+        refreshButton.textContent = value ? "Please wait…" : "Refresh";
+        saveButton.textContent = value ? "Working…" : "Save Changes";
+      }
+      function displayError(result, fallback) {
+        if (result && result.status === 401) {
+          try { sessionStorage.removeItem("celestialWhitelistEditorSession"); } catch (_) {}
+          editorSession = "";
+          return "This editor session expired. Run `/whitelist edit` in Discord to open a new editor.";
+        }
+        return (result && result.error) || fallback;
+      }
+      async function apiRequest(path, options = {}) {
+        if (!editorSession) throw new Error("No editor session was found. Open this page using the button from `/whitelist edit`.");
+        const headers = new Headers(options.headers || {});
+        headers.set("X-Editor-Session", editorSession);
+        if (options.body) headers.set("Content-Type", "application/json");
+        const response = await fetch(path, { ...options, headers, cache: "no-store", credentials: "same-origin" });
+        let payload;
+        try { payload = await response.json(); } catch (_) { payload = {}; }
+        if (!response.ok || !payload.ok) {
+          throw Object.assign(new Error(displayError({ status: response.status, error: payload.error }, "The request failed.")), { status: response.status, payload });
+        }
+        return payload;
+      }
+      function formatData(data) { return JSON.stringify(data, null, 4) + "\n"; }
+      function hasUnsavedChanges() { return Boolean(baselineText) && getValue() !== baselineText; }
 
-      function saveChanges() {
+      async function loadData({ confirmDiscard = false } = {}) {
+        if (isBusy) return;
+        if (confirmDiscard && hasUnsavedChanges() && !window.confirm("Refresh will discard your unsaved JSON changes and reload the current database. Continue?")) return;
+        setBusy(true);
+        showNotice("Loading the current whitelist from the database…", "info");
+        try {
+          const payload = await apiRequest("/editwhitelist/api/data", { method: "GET" });
+          const source = formatData(payload.data || []);
+          setValue(source);
+          baselineText = source;
+          loadedRevision = payload.revision || "";
+          if (editor) { editor.clearHistory(); editor.performLint(); }
+          renderIssues(validateJson(source).issues, source);
+          showNotice(`Loaded ${payload.data.length} license record(s) from the live database.`, "success");
+        } catch (error) {
+          showNotice(error.message || "Failed to load the whitelist database.", "error");
+          if (error.status === 401) {
+            setValue("[]\n");
+            baselineText = "";
+            loadedRevision = "";
+          }
+        } finally {
+          setBusy(false);
+        }
+      }
+
+      async function saveChanges() {
+        if (isBusy) return;
         const source = getValue();
         const result = validateJson(source);
         renderIssues(result.issues, source);
         if (result.issues.length) {
-          showNotice(`Cannot proceed: ${result.issues.length} validation problem(s) found. Fix them before saving.`, "error");
+          showNotice(`Cannot save: ${result.issues.length} validation problem(s) found. Fix them first.`, "error");
           if (editor) editor.focus();
           return;
         }
-        showNotice("JSON is valid, but Save Changes is not connected to the bot or database in Stage 1. Nothing was saved.", "info");
+        if (!loadedRevision) {
+          showNotice("The database snapshot is missing. Click Refresh before saving.", "error");
+          return;
+        }
+        setBusy(true);
+        showNotice("Validating and saving changes to Supabase…", "info");
+        try {
+          const payload = await apiRequest("/editwhitelist/api/save", {
+            method: "POST",
+            body: JSON.stringify({ source, revision: loadedRevision })
+          });
+          const savedSource = formatData(payload.data || []);
+          setValue(savedSource);
+          baselineText = savedSource;
+          loadedRevision = payload.revision || "";
+          if (editor) { editor.clearHistory(); editor.performLint(); }
+          renderIssues(validateJson(savedSource).issues, savedSource);
+          const summary = payload.summary || {};
+          const counts = [];
+          if (summary.added_count) counts.push(`${summary.added_count} added`);
+          if (summary.modified_count) counts.push(`${summary.modified_count} modified`);
+          if (summary.removed_count) counts.push(`${summary.removed_count} removed`);
+          const statusSuffix = payload.discord_response_updated ? " The original Discord response was updated." : " The database save succeeded, but the Discord response could not be updated; check the bot logs.";
+          const statusText = counts.length
+            ? `Saved successfully: ${counts.join(", ")}.${statusSuffix}`
+            : (payload.discord_response_updated ? "No changes detected; the database already matches this JSON." : "No changes detected. The database already matches this JSON, but the Discord response could not be updated.");
+          showNotice(statusText, payload.discord_response_updated ? "success" : "info");
+        } catch (error) {
+          showNotice(error.message || "The database update failed. Refresh to check the current database state before retrying.", "error");
+          if (error.status === 409) {
+            // Keep the user's text in place; they may copy it before refreshing.
+            showNotice(`${error.message} Your current edits have been kept.`, "error");
+          }
+        } finally {
+          setBusy(false);
+        }
       }
 
-      document.getElementById("save-button").addEventListener("click", saveChanges);
-      document.getElementById("refresh-button").addEventListener("click", () => {
-        setValue(initialJson);
-        if (editor) { editor.clearHistory(); editor.performLint(); editor.focus(); }
-        renderIssues(validateJson(initialJson).issues, initialJson);
-        showNotice("Editor reset to the initial Stage 1 content. No database was queried.", "info");
-      });
+      saveButton.addEventListener("click", saveChanges);
+      refreshButton.addEventListener("click", () => loadData({ confirmDiscard: true }));
       if (editor) {
-        editor.on("change", () => showNotice("Unsaved local edits. Database loading/saving is not enabled in Stage 1.", "info"));
+        editor.on("change", () => {
+          if (!isBusy && baselineText && getValue() !== baselineText) showNotice("Unsaved changes. Save Changes to validate and write them to the live database.", "info");
+        });
         editor.performLint();
       } else {
         textarea.addEventListener("input", () => {
           const result = validateJson(textarea.value);
           renderIssues(result.issues, textarea.value);
-          showNotice("Unsaved local edits. Database loading/saving is not enabled in Stage 1.", "info");
+          if (baselineText && textarea.value !== baselineText) showNotice("Unsaved changes. Save Changes to validate and write them to the live database.", "info");
         });
         renderIssues(validateJson(textarea.value).issues, textarea.value);
       }
+
+      if (!editorSession) {
+        setValue("[]\n");
+        showNotice("Open this page using the temporary link from `/whitelist edit` in Discord.", "error");
+        refreshButton.disabled = true;
+        saveButton.disabled = true;
+      } else {
+        loadData();
+      }
+
     })();
   </script>
 </body>

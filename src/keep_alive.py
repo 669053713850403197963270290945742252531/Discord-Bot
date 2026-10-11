@@ -2,7 +2,7 @@
 
 - `/` -- plain keep-alive endpoint.
 - `/client` -- serves the public Potassium license loader.
-- `/editwhitelist` -- Stage 1 JSON editor UI; deliberately has no database I/O.
+- `/editwhitelist` -- authorized live JSON editor for the Supabase whitelist.
 - `/whitelist/*` -- public license challenge, check, heartbeat, breach, and
   completion endpoints.
 
@@ -14,6 +14,7 @@ are the security boundaries.
 
 import hashlib
 import hmac
+import json
 import os
 from threading import Thread
 
@@ -31,11 +32,7 @@ def home():
 @app.route('/editwhitelist', methods=['GET'])
 @app.route('/editwhitelist/', methods=['GET'])
 def whitelist_editor_page():
-    """Serve the Stage 1 whitelist JSON editor.
-
-    This route intentionally does not load or write whitelist/database data.
-    Stage 2 will add an authorized, server-backed load/save workflow.
-    """
+    """Serve the editor shell; live data is exposed only through token-authenticated API routes."""
     from pathlib import Path
 
     page_path = Path(__file__).resolve().parent / "templates" / "editwhitelist.html"
@@ -59,12 +56,176 @@ def whitelist_editor_page():
                 "script-src https://cdnjs.cloudflare.com 'unsafe-inline'; "
                 "style-src https://cdnjs.cloudflare.com 'unsafe-inline'; "
                 "font-src https://cdnjs.cloudflare.com data:; "
-                "img-src data:; connect-src 'none'; object-src 'none'; "
+                "img-src data:; connect-src 'self'; object-src 'none'; "
                 "base-uri 'none'; frame-ancestors 'none'"
             ),
         },
     )
     return response
+
+
+def _editor_api_json(payload, status=200):
+    """Return a non-cacheable JSON response for the editor APIs."""
+    response = Response(
+        json.dumps(payload, ensure_ascii=False, separators=(",", ":")),
+        status=status,
+        mimetype="application/json",
+        headers={
+            "Cache-Control": "no-store, no-cache, must-revalidate, max-age=0",
+            "Pragma": "no-cache",
+            "X-Content-Type-Options": "nosniff",
+        },
+    )
+    return response
+
+
+def _authorized_editor_session():
+    from api.whitelist_editor import get_whitelist_editor_session
+
+    token = request.headers.get("X-Editor-Session", "")
+    session = get_whitelist_editor_session(token)
+    return session
+
+
+@app.route('/editwhitelist/api/data', methods=['GET'])
+def whitelist_editor_load_data():
+    """Load the current full licenses dataset for an authorized editor session."""
+    session = _authorized_editor_session()
+    if session is None:
+        return _editor_api_json({"ok": False, "error": "Editor session expired or invalid. Run `/whitelist edit` again to open a new session."}, 401)
+
+    try:
+        from api.supabase_db import fetch_users
+        from api.whitelist_editor import run_on_editor_bot_loop, database_revision
+
+        users = run_on_editor_bot_loop(session, fetch_users())
+        return _editor_api_json({"ok": True, "data": users, "revision": database_revision(users)})
+    except Exception as exc:
+        print(f"[Whitelist Editor] Failed to load the license database: {exc}")
+        return _editor_api_json({"ok": False, "error": "Failed to load the live whitelist database. Check the bot logs and retry."}, 500)
+
+
+@app.route('/editwhitelist/api/save', methods=['POST'])
+def whitelist_editor_save_data():
+    """Validate and apply an edited full licenses dataset, then update the originating Discord response."""
+    session = _authorized_editor_session()
+    if session is None:
+        return _editor_api_json({"ok": False, "error": "Editor session expired or invalid. Run `/whitelist edit` again to open a new session."}, 401)
+
+    from api.whitelist_editor import (
+        MAX_EDITOR_JSON_BYTES,
+        _EDITOR_SAVE_LOCK,
+        validate_and_normalize_records,
+        run_on_editor_bot_loop,
+        database_revision,
+        _match_records,
+        _prepare_server_timestamps,
+        summary_counts,
+        diff_to_text,
+        finalize_editor_save,
+    )
+
+    if request.content_length is not None and request.content_length > MAX_EDITOR_JSON_BYTES + 65536:
+        return _editor_api_json({"ok": False, "error": "The editor payload is too large (maximum 8 MiB)."}, 413)
+
+    request_data = request.get_json(silent=True)
+    if not isinstance(request_data, dict):
+        return _editor_api_json({"ok": False, "error": "Expected a JSON request body."}, 400)
+    source = request_data.get("source")
+    expected_revision = request_data.get("revision")
+    if not isinstance(source, str):
+        return _editor_api_json({"ok": False, "error": "Missing editor JSON source."}, 400)
+    if len(source.encode("utf-8")) > MAX_EDITOR_JSON_BYTES:
+        return _editor_api_json({"ok": False, "error": "The whitelist JSON exceeds the 8 MiB limit."}, 413)
+
+    try:
+        parsed = json.loads(source)
+    except json.JSONDecodeError as exc:
+        return _editor_api_json({
+            "ok": False,
+            "error": f"Invalid JSON: {exc.msg} (line {exc.lineno}, column {exc.colno}).",
+        }, 400)
+
+    try:
+        records = validate_and_normalize_records(parsed)
+    except ValueError as exc:
+        return _editor_api_json({"ok": False, "error": str(exc)}, 400)
+
+    # Prevent two web editors in this process from applying stale full-dataset
+    # writes at the same time. The revision comparison also catches ordinary
+    # changes made through the Discord commands while this page was open.
+    try:
+        with _EDITOR_SAVE_LOCK:
+            from api.supabase_db import fetch_users, commit_users
+            current_users = run_on_editor_bot_loop(session, fetch_users())
+            current_revision = database_revision(current_users)
+            if not isinstance(expected_revision, str) or not hmac.compare_digest(expected_revision, current_revision):
+                return _editor_api_json({
+                    "ok": False,
+                    "error": "The whitelist database changed after you opened or refreshed this editor. Click Refresh to load the latest database before saving again.",
+                    "code": "database_changed",
+                }, 409)
+
+            if current_users and not records:
+                return _editor_api_json({
+                    "ok": False,
+                    "error": "Saving an empty array would delete every license. This editor blocks that accidental full-database wipe; keep at least one record and remove users individually.",
+                }, 400)
+
+            diff = _match_records(current_users, records)
+            protected_fields = {"ActivationCountry", "ActivationRobloxUserId"}
+            for item in diff["modified"]:
+                changed_fields = protected_fields.intersection((item.get("Changes") or {}).keys())
+                if changed_fields:
+                    names = ", ".join(sorted(changed_fields))
+                    return _editor_api_json({
+                        "ok": False,
+                        "error": f"System-generated activation history cannot be edited from this page ({names}). Leave those values unchanged.",
+                    }, 400)
+            if not diff["added"] and not diff["removed"] and not diff["modified"]:
+                after_users = current_users
+                final_diff = diff
+            else:
+                _prepare_server_timestamps(current_users, records, diff)
+                after_users = run_on_editor_bot_loop(
+                    session,
+                    commit_users(
+                        records,
+                        None,
+                        f"Web whitelist edit by {session['user_name']}",
+                        preserve_empty_games=True,
+                    ),
+                )
+                final_diff = _match_records(current_users, after_users)
+
+            summary = summary_counts(final_diff)
+            current_revision = database_revision(after_users)
+            diff_text = diff_to_text(final_diff)
+            discord_response_updated = False
+            try:
+                discord_response_updated = bool(run_on_editor_bot_loop(
+                    session,
+                    finalize_editor_save(session, current_users, after_users, final_diff, diff_text),
+                    timeout=35,
+                ))
+            except Exception as exc:
+                # A Discord status/alert failure must not turn a successful
+                # Supabase write into a browser-visible database failure.
+                print(f"[Whitelist Editor] Save succeeded, but Discord status update failed: {exc}")
+
+        return _editor_api_json({
+            "ok": True,
+            "data": after_users,
+            "revision": current_revision,
+            "summary": summary,
+            "discord_response_updated": discord_response_updated,
+            "message": "Database updated successfully." if (summary["added_count"] or summary["removed_count"] or summary["modified_count"]) else "No changes were necessary; the database already matches the editor.",
+        })
+    except ValueError as exc:
+        return _editor_api_json({"ok": False, "error": str(exc)}, 400)
+    except Exception as exc:
+        print(f"[Whitelist Editor] Failed to save the license database: {exc}")
+        return _editor_api_json({"ok": False, "error": "The database update failed. Check the bot logs before retrying; refresh the editor to confirm the current database state."}, 500)
 
 
 @app.route('/client', methods=['GET'])

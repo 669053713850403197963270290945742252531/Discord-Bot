@@ -270,7 +270,7 @@ def record_from_import_row(row: Dict[str, Any]) -> Dict[str, Any]:
     elif games is None:
         games = ["*"]
     else:
-        games = [str(part).strip() for part in games if str(part).strip()] or ["*"]
+        games = [str(part).strip() for part in games if str(part).strip()]
 
     identifier = str(first("Identifier", "identifier") or "").strip()
     if not identifier:
@@ -286,7 +286,7 @@ def record_from_import_row(row: Dict[str, Any]) -> Dict[str, Any]:
     except (TypeError, ValueError) as exc:
         raise ValueError("HWID reset count must be an integer") from exc
 
-    return {
+    record = {
         "Identifier": identifier,
         "DiscordId": (str(first("DiscordId", "discord_id") or "").strip() or None),
         "Key": (str(first("Key", "LicenseKey", "license_key", "key") or "").strip() or None),
@@ -305,8 +305,7 @@ def record_from_import_row(row: Dict[str, Any]) -> Dict[str, Any]:
     }
     if any(key in row for key in ("ActivationCountry", "activation_country_code", "activation_country")):
         value = first("ActivationCountry", "activation_country_code", "activation_country")
-        if value not in (None, ""):
-            record["ActivationCountry"] = str(value).strip().upper()
+        record["ActivationCountry"] = str(value).strip().upper() if value not in (None, "") else None
     if any(key in row for key in ("ActivationRobloxUserId", "activation_roblox_user_id")):
         value = first("ActivationRobloxUserId", "activation_roblox_user_id")
         if value not in (None, ""):
@@ -314,6 +313,8 @@ def record_from_import_row(row: Dict[str, Any]) -> Dict[str, Any]:
                 record["ActivationRobloxUserId"] = int(value)
             except (TypeError, ValueError) as exc:
                 raise ValueError("Activation Roblox User ID must be an integer") from exc
+        else:
+            record["ActivationRobloxUserId"] = None
     return record
 
 
@@ -743,7 +744,7 @@ async def redeem_license(key: str, discord_id: str, identifier: str, rank: str =
     return await asyncio.to_thread(_redeem)
 
 
-def _replace_users_sync(users: List[Dict[str, Any]]) -> List[Dict[str, Any]]:
+def _replace_users_sync(users: List[Dict[str, Any]], preserve_empty_games: bool = False) -> List[Dict[str, Any]]:
     """Replace the license dataset without violating unique Discord IDs.
 
     Older versions used ``upsert(..., on_conflict="identifier")`` here.
@@ -756,6 +757,8 @@ def _replace_users_sync(users: List[Dict[str, Any]]) -> List[Dict[str, Any]]:
     Discord ID, then license key. Matched rows are UPDATEd in place; only
     genuinely new records are INSERTed. Game mappings are synchronized after
     the row update, and unmatched existing records are removed at the end.
+    The web editor can pass ``preserve_empty_games=True`` so an explicit empty
+    Games array remains an empty mapping instead of silently becoming wildcard.
     """
     client = _client_sync()
 
@@ -851,13 +854,19 @@ def _replace_users_sync(users: List[Dict[str, Any]]) -> List[Dict[str, Any]]:
             # explicitly so it stays attached to the renamed record.
             if old_identifier != identifier:
                 client.table("license_games").delete().eq("identifier", old_identifier).execute()
-            _set_games_sync(identifier, record.get("Games") or ["*"])
+            if preserve_empty_games and record.get("Games") == []:
+                client.table("license_games").delete().eq("identifier", identifier).execute()
+            else:
+                _set_games_sync(identifier, record.get("Games") or ["*"])
             matched_existing_identifiers.add(old_identifier)
         else:
             inserted = client.table("licenses").insert(row).execute().data or []
             if not inserted:
                 raise RuntimeError(f"Supabase did not create license `{identifier}`")
-            _set_games_sync(identifier, record.get("Games") or ["*"])
+            if preserve_empty_games and record.get("Games") == []:
+                client.table("license_games").delete().eq("identifier", identifier).execute()
+            else:
+                _set_games_sync(identifier, record.get("Games") or ["*"])
 
     # Delete only records that were not matched by the replacement dataset.
     desired_identifiers = {
@@ -879,12 +888,19 @@ def _replace_users_sync(users: List[Dict[str, Any]]) -> List[Dict[str, Any]]:
     return _fetch_users_sync()
 
 
-async def replace_users(users: List[Dict[str, Any]]) -> List[Dict[str, Any]]:
-    return await asyncio.to_thread(_replace_users_sync, users)
+async def replace_users(users: List[Dict[str, Any]], *, preserve_empty_games: bool = False) -> List[Dict[str, Any]]:
+    return await asyncio.to_thread(_replace_users_sync, users, preserve_empty_games)
 
 
-async def commit_users(users: List[Dict[str, Any]], sha=None, message: str = "Update licenses", session=None):
-    return await replace_users(users)
+async def commit_users(
+    users: List[Dict[str, Any]],
+    sha=None,
+    message: str = "Update licenses",
+    session=None,
+    *,
+    preserve_empty_games: bool = False,
+):
+    return await replace_users(users, preserve_empty_games=preserve_empty_games)
 
 
 async def commit_content(content_str: str, sha=None, message: str = "Update licenses", session=None):
