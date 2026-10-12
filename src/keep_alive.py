@@ -280,6 +280,29 @@ def _get_authenticated_editor_session(*, recheck=True):
     return editor_session
 
 
+def _close_editor_launch_for_token(token, reason):
+    """Best-effort terminal Discord-message update from a Flask request thread."""
+    if not isinstance(token, str) or not token:
+        return False
+    try:
+        from api.whitelist_editor import (
+            close_whitelist_editor_launch,
+            get_whitelist_editor_session,
+            run_on_editor_bot_loop,
+        )
+        editor_session = get_whitelist_editor_session(token)
+        if editor_session is None:
+            return False
+        return run_on_editor_bot_loop(
+            editor_session,
+            close_whitelist_editor_launch(editor_session, reason),
+            timeout=12,
+        )
+    except Exception as exc:
+        print(f'[Whitelist Editor] Could not close launch message ({reason}): {exc}')
+        return False
+
+
 def _authorization_denied_page():
     response = _gate_page('Access denied', show_launch_hint=False)
     # Replace the generic waiting status with a fixed message; don't disclose
@@ -366,6 +389,14 @@ def whitelist_editor_oauth_start():
     from api.whitelist_editor import get_whitelist_editor_session
     editor_session = get_whitelist_editor_session(token, require_launch_valid=True)
     if editor_session is None:
+        existing_session = get_whitelist_editor_session(token)
+        reason = "invalidated"
+        if existing_session is not None:
+            if existing_session.get("oauth_completed"):
+                reason = "used"
+            elif existing_session.get("launch_expires_at", 0) <= time.time():
+                reason = "expired"
+        _close_editor_launch_for_token(token, reason)
         return _editor_api_json({"ok": False, "error": "The temporary editor launch link is expired, already used, or invalid. Run `/whitelist edit` again in Discord."}, 401)
 
     now = time.time()
@@ -410,7 +441,16 @@ def whitelist_editor_oauth_callback():
     oauth = _oauth_configuration()
     state = request.args.get('state', '')
     state_cookie = request.cookies.get(_OAUTH_STATE_COOKIE, '')
-    if request.args.get('error') or not state or not state_cookie or not hmac.compare_digest(state, state_cookie):
+    state_valid = bool(state and state_cookie and hmac.compare_digest(state, state_cookie))
+    if not state_valid:
+        response = _authorization_denied_page()
+        response.set_cookie(_OAUTH_STATE_COOKIE, '', max_age=0, httponly=True, secure=_cookie_secure(), samesite='Lax', path='/editwhitelist/oauth')
+        return response
+    if request.args.get('error'):
+        with _OAUTH_LOCK:
+            cancelled = _OAUTH_PENDING.pop(state, None)
+        if cancelled:
+            _close_editor_launch_for_token(cancelled.get('editor_token'), "denied")
         response = _authorization_denied_page()
         response.set_cookie(_OAUTH_STATE_COOKIE, '', max_age=0, httponly=True, secure=_cookie_secure(), samesite='Lax', path='/editwhitelist/oauth')
         return response
@@ -470,6 +510,9 @@ def whitelist_editor_oauth_callback():
                 'last_authorization_check_attempt_at': time.time(),
                 'expires_at': expires_at,
             }
+        # The one-time launch URL has now been consumed successfully. Make the
+        # original bot response terminal before later save callbacks can update it.
+        _close_editor_launch_for_token(pending['editor_token'], "used")
         response = redirect('/editwhitelist', code=303)
         response.headers['Cache-Control'] = 'no-store, no-cache, must-revalidate, max-age=0'
         response.headers['Pragma'] = 'no-cache'
@@ -482,6 +525,7 @@ def whitelist_editor_oauth_callback():
         return response
     except Exception as exc:
         print(f'[Whitelist Editor OAuth] Authorization rejected: {exc}')
+        _close_editor_launch_for_token(pending.get('editor_token'), "denied")
         response = _authorization_denied_page()
         response.set_cookie(_OAUTH_STATE_COOKIE, '', max_age=0, httponly=True, secure=_cookie_secure(), samesite='Lax', path='/editwhitelist/oauth')
         return response

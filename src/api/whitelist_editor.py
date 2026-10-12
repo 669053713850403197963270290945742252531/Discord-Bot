@@ -72,12 +72,18 @@ def create_whitelist_editor_session(interaction, base_url: str) -> Tuple[str, st
         "user_id": int(interaction.user.id),
         "user_name": str(interaction.user),
         "editor_url": editor_url,
+        # Once closed, this original Discord response is terminal: save handlers
+        # must not replace it with a later status view that re-exposes the URL.
+        "launch_closed": False,
+        "launch_closed_reason": None,
+        "launch_view_lock": asyncio.Lock(),
     }
     with _EDITOR_SESSIONS_LOCK:
         for old_token, old_session in list(_EDITOR_SESSIONS.items()):
             if old_session.get("expires_at", 0) <= now:
                 _EDITOR_SESSIONS.pop(old_token, None)
         _EDITOR_SESSIONS[token] = session
+    session["launch_expiry_task"] = loop.create_task(_expire_editor_launch(token))
     return token, editor_url
 
 
@@ -107,6 +113,47 @@ def get_whitelist_editor_session(
         ):
             return None
         return session
+
+
+async def _expire_editor_launch(token: str):
+    """Close an unused launch URL when its public lifetime elapses."""
+    await asyncio.sleep(EDITOR_LAUNCH_TTL_SECONDS)
+    session = get_whitelist_editor_session(token)
+    if session is None:
+        return
+    if not session.get("oauth_completed"):
+        await close_whitelist_editor_launch(session, "expired")
+
+
+async def close_whitelist_editor_launch(session: Dict[str, Any], reason: str) -> bool:
+    """Set the original Discord response to a terminal closed state exactly once.
+
+    All original-response updates share a per-session async lock, so a save that
+    began around the same time cannot overwrite the closed view afterward.
+    """
+    lock = session.get("launch_view_lock")
+    if lock is None:
+        lock = asyncio.Lock()
+        session["launch_view_lock"] = lock
+
+    async with lock:
+        if session.get("launch_closed"):
+            return False
+        session["launch_closed"] = True
+        session["launch_closed_reason"] = reason
+        expiry_task = session.get("launch_expiry_task")
+        if expiry_task is not None and expiry_task is not asyncio.current_task() and not expiry_task.done():
+            expiry_task.cancel()
+        try:
+            await session["interaction"].edit_original_response(
+                view=build_editor_closed_view(reason)
+            )
+            return True
+        except Exception as exc:
+            # Keep this state terminal even if Discord is temporarily unavailable;
+            # otherwise a later save could unexpectedly reopen the launch message.
+            print(f"[Whitelist Editor] Could not update the closed launch message: {exc}")
+            return False
 
 
 def run_on_editor_bot_loop(session: Dict[str, Any], awaitable, *, timeout: float = 60):
@@ -376,6 +423,43 @@ def summary_counts(diff: Dict[str, Any]) -> Dict[str, Any]:
     }
 
 
+def build_editor_closed_view(reason: str = "used"):
+    """Render the terminal state for a launch URL that can no longer be used."""
+    import discord
+    from discord.ui import LayoutView, Container, TextDisplay
+
+    messages = {
+        "used": (
+            "This one-time launch URL has been used to authenticate and is now closed. "
+            "It cannot be reused."
+        ),
+        "expired": (
+            "This launch URL has expired and can no longer be used."
+        ),
+        "denied": (
+            "Discord sign-in was denied or could not be completed, so this launch session is closed."
+        ),
+        "invalidated": (
+            "This launch session was invalidated and can no longer be used."
+        ),
+        "session_expired": (
+            "The authenticated editing session has expired or been invalidated."
+        ),
+    }
+    explanation = messages.get(reason, "This launch session is closed and can no longer be used.")
+    view = LayoutView(timeout=None)
+    view.add_item(Container(
+        TextDisplay("# 🛠️ Celestial Whitelist Editor · Launch URL Closed"),
+        TextDisplay(
+            f"🔒 **{explanation}**\n\n"
+            "To open the editor again, run `/whitelist edit` in Discord to generate a fresh launch URL."
+        ),
+        TextDisplay("-# Celestial • Whitelist Administration"),
+        accent_color=discord.Color.orange(),
+    ))
+    return view
+
+
 def build_editor_initial_view(editor_url: str):
     """Create the initial Components V2 response with its link inside the container."""
     import discord
@@ -520,8 +604,17 @@ async def finalize_editor_save(session: Dict[str, Any], before, after, diff: Dic
         except Exception as exc:
             print(f"[Whitelist Editor] Database save succeeded but staff diff alert failed: {exc}")
 
+    lock = session.get("launch_view_lock")
     try:
-        await session["interaction"].edit_original_response(view=build_editor_status_view(session, summary))
+        if lock is None:
+            lock = asyncio.Lock()
+            session["launch_view_lock"] = lock
+        async with lock:
+            if session.get("launch_closed"):
+                # Launch URL closure is terminal. Never replace it with a save
+                # status or another view after the browser has consumed/expired it.
+                return True
+            await session["interaction"].edit_original_response(view=build_editor_status_view(session, summary))
         return True
     except Exception as exc:
         # The save is already committed. Interaction-webhook expiration or an
