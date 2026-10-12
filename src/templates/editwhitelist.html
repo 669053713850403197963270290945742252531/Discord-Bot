@@ -134,24 +134,7 @@
     .logout-button { flex: 0 0 auto; padding: 9px 12px; border: 1px solid rgb(251 113 133 / 28%); border-radius: 11px; color: #ffd5dc; background: rgb(251 113 133 / 6%); font: inherit; font-size: .8rem; font-weight: 750; cursor: pointer; transition: border-color .18s ease, background .18s ease, transform .18s ease; }
     .logout-button:hover { transform: translateY(-1px); border-color: rgb(251 113 133 / 55%); background: rgb(251 113 133 / 12%); }
     .logout-button:focus-visible { outline: 2px solid #fda4af; outline-offset: 3px; }
-    .connection-pill {
-      display: inline-flex;
-      flex: 0 0 auto;
-      align-items: center;
-      gap: 9px;
-      padding: 10px 13px;
-      border: 1px solid rgb(110 231 183 / 20%);
-      border-radius: 999px;
-      color: #b7f7df;
-      background: rgb(16 185 129 / 8%);
-      box-shadow: inset 0 1px 0 rgb(255 255 255 / 3%);
-      font-size: .77rem;
-      font-weight: 650;
-      white-space: nowrap;
-    }
-    .connection-dot, .state-dot { position: relative; width: 7px; height: 7px; border-radius: 50%; background: var(--success); box-shadow: 0 0 13px rgb(110 231 183 / 75%); }
-    .connection-dot::after { position: absolute; inset: -4px; border: 1px solid rgb(110 231 183 / 45%); border-radius: inherit; content: ""; animation: pulse-ring 2.2s ease-out infinite; }
-    @keyframes pulse-ring { 0% { opacity: .85; transform: scale(.6); } 100% { opacity: 0; transform: scale(1.9); } }
+    .state-dot { position: relative; width: 7px; height: 7px; border-radius: 50%; background: var(--success); box-shadow: 0 0 13px rgb(110 231 183 / 75%); }
     @keyframes rise-in { from { opacity: 0; transform: translateY(13px); } to { opacity: 1; transform: translateY(0); } }
 
     .stage-note {
@@ -350,20 +333,17 @@
     @media (max-width: 820px) {
       header.hero { align-items: flex-start; flex-wrap: wrap; }
       .hero-copy { flex-basis: calc(100% - 82px); }
-      .connection-pill { margin-left: 80px; }
     }
     @media (max-width: 620px) {
       body { padding: 24px 12px 30px; }
       header.hero { gap: 13px; margin-bottom: 18px; }
       .brand-mark { flex-basis: 50px; width: 50px; height: 50px; border-radius: 15px; }
       .brand-mark svg { width: 27px; height: 27px; }
-      .connection-pill { margin-left: 63px; }
       .logout-button { margin-left: auto; }
       .hero-copy { flex-basis: calc(100% - 63px); }
       .eyebrow { font-size: .63rem; letter-spacing: .15em; }
       h1 { font-size: clamp(1.6rem, 7vw, 2.1rem); }
       .intro { font-size: .88rem; }
-      .connection-pill { margin-left: 0; font-size: .72rem; }
       .stage-note { margin: 17px 0; padding: 13px; border-radius: 13px; font-size: .83rem; }
       .editor-shell { border-radius: 14px; }
       .editor-toolbar { min-height: 55px; padding: 11px 12px; }
@@ -474,7 +454,6 @@
         <h1>Whitelist <span>Editor</span></h1>
         <p class="intro">Manage the live license database with syntax-aware editing, record validation, and guarded saves.</p>
       </div>
-      <div class="connection-pill"><span class="connection-dot" aria-hidden="true"></span> OAuth verified editor</div>
       <button id="logout-button" class="logout-button" type="button">Sign out</button>
     </header>
 
