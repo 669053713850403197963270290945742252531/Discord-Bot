@@ -122,10 +122,11 @@ RESET_HWID_COOLDOWN = timedelta(days=7)
 
 
 # Public license-service settings. The License Server is always enabled.
-# Render exposes RENDER_EXTERNAL_URL automatically; local development falls
-# back to the same listener used by the Flask server.
+# An optional explicit public URL supports custom domains. Otherwise Render's
+# public URL is used, then local development falls back to the Flask listener.
 LICENSE_SERVER_BASE_URL = (
-    os.getenv("RENDER_EXTERNAL_URL", "").strip().rstrip("/")
+    os.getenv("LICENSE_SERVER_BASE_URL", "").strip().rstrip("/")
+    or os.getenv("RENDER_EXTERNAL_URL", "").strip().rstrip("/")
     or f"http://127.0.0.1:{os.getenv('PORT', '8080')}"
 )
 

@@ -6,6 +6,17 @@
   <meta name="color-scheme" content="dark">
   <meta name="theme-color" content="#080b18">
   <title>Celestial · Whitelist Editor</title>
+  <script>
+    (() => {
+      const fragment = new URLSearchParams(window.location.hash.replace(/^#/, ""));
+      const launchToken = fragment.get("session");
+      if (launchToken) {
+        window.__celestialWhitelistLaunchToken = launchToken;
+        document.documentElement.setAttribute("data-whitelist-launch", "pending");
+        history.replaceState(null, document.title, window.location.pathname + window.location.search);
+      }
+    })();
+  </script>
   <link rel="icon" type="image/png" sizes="64x64" href="/editwhitelist/favicon.png">
   <link rel="stylesheet" href="https://cdnjs.cloudflare.com/ajax/libs/codemirror/5.65.16/codemirror.min.css">
   <link rel="stylesheet" href="https://cdnjs.cloudflare.com/ajax/libs/codemirror/5.65.16/theme/material-darker.min.css">
@@ -32,6 +43,17 @@
     }
     * { box-sizing: border-box; }
     html { min-height: 100%; background: var(--page); }
+    #oauth-redirect-screen { display: none; }
+    html[data-whitelist-launch="pending"] #oauth-redirect-screen {
+      position: fixed; z-index: 99999; inset: 0; display: flex; flex-direction: column;
+      align-items: center; justify-content: center; padding: 28px; text-align: center;
+      color: #edf0ff; background: radial-gradient(ellipse at 50% 0%, #27245b 0, transparent 55%), linear-gradient(145deg, #090c1b, #10172d 60%, #080b18);
+    }
+    #oauth-redirect-screen strong { font-size: 1.15rem; }
+    #oauth-redirect-screen p { max-width: 480px; color: #aeb9d8; }
+    #oauth-redirect-screen .auth-spinner { width: 30px; height: 30px; margin: 20px auto; border: 3px solid rgb(167 139 250 / 20%); border-top-color: #a78bfa; border-right-color: #55d9f3; border-radius: 50%; animation: auth-spin .8s linear infinite; }
+    @keyframes auth-spin { to { transform: rotate(360deg); } }
+    @media (prefers-reduced-motion: reduce) { #oauth-redirect-screen .auth-spinner { animation: none; } }
     body {
       position: relative;
       isolation: isolate;
@@ -109,6 +131,9 @@
     }
     p { line-height: 1.6; }
     .intro { margin: 9px 0 0; color: #a5afce; font-size: .96rem; max-width: 710px; }
+    .logout-button { flex: 0 0 auto; padding: 9px 12px; border: 1px solid rgb(251 113 133 / 28%); border-radius: 11px; color: #ffd5dc; background: rgb(251 113 133 / 6%); font: inherit; font-size: .8rem; font-weight: 750; cursor: pointer; transition: border-color .18s ease, background .18s ease, transform .18s ease; }
+    .logout-button:hover { transform: translateY(-1px); border-color: rgb(251 113 133 / 55%); background: rgb(251 113 133 / 12%); }
+    .logout-button:focus-visible { outline: 2px solid #fda4af; outline-offset: 3px; }
     .connection-pill {
       display: inline-flex;
       flex: 0 0 auto;
@@ -332,6 +357,8 @@
       header.hero { gap: 13px; margin-bottom: 18px; }
       .brand-mark { flex-basis: 50px; width: 50px; height: 50px; border-radius: 15px; }
       .brand-mark svg { width: 27px; height: 27px; }
+      .connection-pill { margin-left: 63px; }
+      .logout-button { margin-left: auto; }
       .hero-copy { flex-basis: calc(100% - 63px); }
       .eyebrow { font-size: .63rem; letter-spacing: .15em; }
       h1 { font-size: clamp(1.6rem, 7vw, 2.1rem); }
@@ -428,6 +455,11 @@
   </style>
 </head>
 <body>
+  <div id="oauth-redirect-screen" role="status" aria-live="polite">
+    <strong id="oauth-redirect-status">Checking authorization…</strong>
+    <div id="oauth-redirect-spinner" class="auth-spinner" aria-hidden="true"></div>
+    <p id="oauth-redirect-details">Preparing secure Discord sign-in. The editor will remain unavailable until authorization finishes.</p>
+  </div>
   <main>
     <header class="hero">
       <div class="brand-mark" aria-hidden="true">
@@ -442,7 +474,8 @@
         <h1>Whitelist <span>Editor</span></h1>
         <p class="intro">Manage the live license database with syntax-aware editing, record validation, and guarded saves.</p>
       </div>
-      <div class="connection-pill"><span class="connection-dot" aria-hidden="true"></span> Database-backed editor</div>
+      <div class="connection-pill"><span class="connection-dot" aria-hidden="true"></span> OAuth verified editor</div>
+      <button id="logout-button" class="logout-button" type="button">Sign out</button>
     </header>
 
     <div class="stage-note">
@@ -514,6 +547,29 @@
   <script>
     (() => {
       "use strict";
+      const launchToken = window.__celestialWhitelistLaunchToken;
+      if (launchToken) {
+        const status = document.getElementById("oauth-redirect-status");
+        const details = document.getElementById("oauth-redirect-details");
+        const spinner = document.getElementById("oauth-redirect-spinner");
+        fetch("/editwhitelist/auth/start", {
+          method: "POST", credentials: "same-origin", cache: "no-store",
+          headers: { "Content-Type": "application/json" },
+          body: JSON.stringify({ launch_token: launchToken })
+        }).then(async response => {
+          let payload = {};
+          try { payload = await response.json(); } catch (_) {}
+          if (!response.ok || !payload.ok || !payload.authorization_url) {
+            throw new Error(payload.error || "Could not start Discord authorization.");
+          }
+          return payload.authorization_url;
+        }).then(url => location.replace(url)).catch(error => {
+          status.textContent = "Authorization could not start";
+          details.textContent = `${error && error.message ? error.message : "Please reopen the editor from Discord."} Run the /whitelist edit command again if needed.`;
+          if (spinner) spinner.hidden = true;
+        });
+        return;
+      }
       const diagnosticsList = document.getElementById("diagnostics-list");
       const notice = document.getElementById("notice");
       const stats = document.getElementById("editor-stats");
@@ -1001,23 +1057,12 @@
       const dialogCancel = document.getElementById("dialog-cancel");
       const dialogConfirm = document.getElementById("dialog-confirm");
       const dialogClose = document.getElementById("dialog-close");
-      let editorSession = "";
       let loadedRevision = "";
       let baselineText = "";
       let isBusy = false;
       let suppressChangeNotice = false;
       let activeDialogOptions = null;
       let focusBeforeDialog = null;
-
-      try {
-        const fragment = new URLSearchParams(window.location.hash.replace(/^#/, ""));
-        const linkToken = fragment.get("session");
-        if (linkToken) sessionStorage.setItem("celestialWhitelistEditorSession", linkToken);
-        editorSession = linkToken || sessionStorage.getItem("celestialWhitelistEditorSession") || "";
-        if (linkToken) history.replaceState(null, "", window.location.pathname + window.location.search);
-      } catch (_) {
-        editorSession = "";
-      }
 
       if (window.CodeMirror) {
         editor = CodeMirror.fromTextArea(textarea, {
@@ -1064,25 +1109,24 @@
       function showNotice(message, type) { notice.textContent = message; notice.className = `notice ${type || "info"}`; }
       function setBusy(value) {
         isBusy = value;
-        refreshButton.disabled = value || !editorSession;
-        saveButton.disabled = value || !editorSession;
-        formatSelect.disabled = value || !editorSession;
+        refreshButton.disabled = value || editorLocked;
+        saveButton.disabled = value || editorLocked;
+        formatSelect.disabled = value || editorLocked;
         refreshButton.textContent = value ? "Please wait…" : "Refresh";
         saveButton.textContent = value ? "Working…" : "Save Changes";
       }
       function displayError(result, fallback) {
-        if (result && result.status === 401) {
-          try { sessionStorage.removeItem("celestialWhitelistEditorSession"); } catch (_) {}
-          editorSession = "";
+        if (result && (result.status === 401 || result.status === 403)) {
           lockEditor();
-          return "This editor session expired. Run `/whitelist edit` in Discord to open a new editor.";
+          refreshButton.disabled = true;
+          saveButton.disabled = true;
+          formatSelect.disabled = true;
+          return "Your authenticated editor session expired or authorization was revoked. Run `/whitelist edit` again in Discord.";
         }
         return (result && result.error) || fallback;
       }
       async function apiRequest(path, options = {}) {
-        if (!editorSession) throw new Error("No editor session was found. Open this page using the button from `/whitelist edit`.");
         const headers = new Headers(options.headers || {});
-        headers.set("X-Editor-Session", editorSession);
         if (options.body) headers.set("Content-Type", "application/json");
         const response = await fetch(path, { ...options, headers, cache: "no-store", credentials: "same-origin" });
         let payload;
@@ -1379,7 +1423,7 @@
       }
 
       async function saveChanges() {
-        if (isBusy || editorLocked || !editorSession) return;
+        if (isBusy || editorLocked) return;
         const editorTextAtReview = getValue();
         const result = hasValidationErrors(editorTextAtReview);
         if (result.issues.length || !Array.isArray(result.parsed)) {
@@ -1429,7 +1473,7 @@
       }
 
       function requestRefresh() {
-        if (isBusy || !editorSession || editorLocked) return;
+        if (isBusy || editorLocked) return;
         const dirty = hasUnsavedChanges();
         const content = document.createDocumentFragment();
         if (dirty) {
@@ -1449,7 +1493,7 @@
       }
 
       formatSelect.addEventListener("change", () => {
-        if (isBusy || editorLocked || !editorSession) {
+        if (isBusy || editorLocked) {
           formatSelect.value = selectedFormat;
           return;
         }
@@ -1509,16 +1553,29 @@
         renderIssues(validateCurrent(textarea.value).issues, textarea.value);
       }
 
-      if (!editorSession) {
-        lockEditor();
-        setValue(formatRecords([], selectedFormat));
-        showNotice("Open this page using the temporary link from `/whitelist edit` in Discord.", "error");
-        refreshButton.disabled = true;
-        saveButton.disabled = true;
-        formatSelect.disabled = true;
-      } else {
-        loadData();
-      }
+      document.getElementById("logout-button").addEventListener("click", () => {
+        const content = document.createDocumentFragment();
+        if (hasUnsavedChanges()) {
+          appendDialogText(content, "div", "dialog-warning", "You have unsaved local edits. Signing out will discard them and end this authenticated editor session.");
+        } else {
+          appendDialogText(content, "p", "dialog-info", "This will end your authenticated editor session and require a new `/whitelist edit` link to return.");
+        }
+        openCustomDialog({
+          kicker: "Celestial / Security",
+          title: "Sign out of the whitelist editor?",
+          description: "The current page will stop accepting database operations.",
+          content,
+          confirmLabel: "Sign out",
+          cancelLabel: "Stay signed in",
+          onConfirm: async () => {
+            const response = await fetch("/editwhitelist/auth/logout", { method: "POST", credentials: "same-origin", cache: "no-store", headers: { "Content-Type": "application/json" }, body: "{}" });
+            if (!response.ok) throw new Error("The server could not end this session. Check your connection and retry.");
+            location.replace("/editwhitelist");
+          }
+        });
+      });
+
+      loadData();
 
     })();
   </script>

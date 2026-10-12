@@ -5,3 +5,4 @@ __pycache__/
 venv/
 .vscode/
 storage/client/globals.d.luau
+notes.txt

@@ -792,7 +792,7 @@ class Whitelist(commands.Cog):
             return
         await _unwhitelist_user_impl(interaction, resolved_user)
 
-    @whitelist_group.command(name="edit", description="Opens the website-based whitelist JSON editor.")
+    @whitelist_group.command(name="edit", description="Opens the secure OAuth-authenticated web whitelist editor.")
     @has_role(config.REQUIRED_ROLE_ID)
     @is_in_guild(config.GUILD_ID)
     async def editwhitelist(self, interaction):

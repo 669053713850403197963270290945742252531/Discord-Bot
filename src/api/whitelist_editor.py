@@ -1,9 +1,10 @@
 """Short-lived authenticated sessions and helpers for the web whitelist editor.
 
-The editor link is a bearer capability issued only after the bot's existing
-role/guild checks pass. Its token is kept in the URL fragment (not sent to the
-web server by the browser) and expires before the Discord interaction webhook
-used to update the original /whitelist edit response expires.
+The editor launch link is a short-lived capability issued only after the bot's
+existing role/guild checks pass. The fragment token is exchanged by a small
+non-editor gate page for a Discord OAuth authorization-code + PKCE flow. The
+editor HTML and APIs are available only behind a server-side session that is
+rechecked against current guild membership and the live license record.
 """
 
 import asyncio
@@ -16,7 +17,8 @@ from concurrent.futures import TimeoutError as FutureTimeoutError
 from datetime import datetime, timezone
 from typing import Any, Dict, List, Optional, Tuple
 
-EDITOR_SESSION_TTL_SECONDS = 13 * 60
+EDITOR_LAUNCH_TTL_SECONDS = 13 * 60
+EDITOR_SESSION_TTL_SECONDS = 60 * 60
 MAX_EDITOR_JSON_BYTES = 8 * 1024 * 1024
 _EDITOR_SESSIONS: Dict[str, Dict[str, Any]] = {}
 _EDITOR_SESSIONS_LOCK = threading.RLock()
@@ -60,6 +62,9 @@ def create_whitelist_editor_session(interaction, base_url: str) -> Tuple[str, st
     session = {
         "token": token,
         "created_at": now,
+        # The launch URL is valid only briefly, but the server-side interaction
+        # context must outlive OAuth and the authenticated editing session.
+        "launch_expires_at": now + EDITOR_LAUNCH_TTL_SECONDS,
         "expires_at": now + EDITOR_SESSION_TTL_SECONDS,
         "interaction": interaction,
         "bot": interaction.client,
@@ -76,7 +81,16 @@ def create_whitelist_editor_session(interaction, base_url: str) -> Tuple[str, st
     return token, editor_url
 
 
-def get_whitelist_editor_session(token: Optional[str]) -> Optional[Dict[str, Any]]:
+def get_whitelist_editor_session(
+    token: Optional[str], *, require_launch_valid: bool = False
+) -> Optional[Dict[str, Any]]:
+    """Return a live interaction context, optionally requiring an unused launch URL.
+
+    The URL's 13-minute lifetime is separate from the longer-lived server-side
+    context needed after OAuth succeeds. Callers exchanging a Discord launch
+    token must pass ``require_launch_valid=True``; authenticated-session checks
+    only need the overall context lifetime.
+    """
     if not isinstance(token, str) or not token or len(token) > 128:
         return None
     now = time.time()
@@ -86,6 +100,11 @@ def get_whitelist_editor_session(token: Optional[str]) -> Optional[Dict[str, Any
             return None
         if session.get("expires_at", 0) <= now:
             _EDITOR_SESSIONS.pop(token, None)
+            return None
+        if require_launch_valid and (
+            session.get("oauth_completed")
+            or session.get("launch_expires_at", session.get("created_at", now) + EDITOR_LAUNCH_TTL_SECONDS) <= now
+        ):
             return None
         return session
 
@@ -366,10 +385,10 @@ def build_editor_initial_view(editor_url: str):
     view.add_item(Container(
         TextDisplay(
             "# 🛠️ Celestial Whitelist Editor\n"
-            "Edit the live whitelist database in your browser using a JSON editor with syntax highlighting and validation."
+            "Edit the live whitelist database in a secure browser editor with JSON/CSV support, validation, and detailed change previews."
         ),
         TextDisplay(
-            "### ✅ Live database integration · Stage 2\n"
+            "### ✅ Live database integration · Stage 5\n"
             "• Automatically loads the current `licenses` database when opened\n"
             "• Validates records before writing changes\n"
             "• **Save Changes** updates the database and reports added, modified, and removed users\n"
@@ -377,7 +396,7 @@ def build_editor_initial_view(editor_url: str):
         ),
         TextDisplay(
             "### 🔒 Secure editor session\n"
-            "This editor link is temporary and expires in about 13 minutes. Use it privately and run `/whitelist edit` again if it expires."
+            "Discord OAuth is required. Access is granted only to the same Discord account that opened this link when it is currently in the Celestial server and has an enabled, unexpired `Admin` or `Owner` license. The one-time launch link expires after about 13 minutes; after sign-in, the authenticated editing session lasts up to 30 minutes. Run `/whitelist edit` again if the launch link expires."
         ),
         TextDisplay("-# Celestial • Whitelist Administration"),
         ActionRow(Button(label="Open Whitelist Editor", emoji="🌐", style=discord.ButtonStyle.link, url=editor_url)),
