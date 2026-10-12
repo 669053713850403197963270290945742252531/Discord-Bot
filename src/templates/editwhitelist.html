@@ -356,6 +356,75 @@
     @media (prefers-reduced-motion: reduce) {
       *, *::before, *::after { scroll-behavior: auto !important; animation-duration: .01ms !important; animation-iteration-count: 1 !important; transition-duration: .01ms !important; }
     }
+
+    .format-picker { display: inline-flex; align-items: center; gap: 8px; margin-left: auto; }
+    .format-picker label { color: #9ba7ca; font-size: .74rem; font-weight: 750; letter-spacing: .08em; text-transform: uppercase; }
+    #format-select { min-width: 106px; appearance: none; border: 1px solid rgb(167 139 250 / 35%); border-radius: 10px; padding: 8px 32px 8px 11px; color: #e9e9ff; font: inherit; font-weight: 700; background: linear-gradient(135deg, rgb(99 102 241 / 18%), rgb(34 211 238 / 7%)); outline: none; cursor: pointer; transition: border-color .18s ease, box-shadow .18s ease, transform .18s ease; }
+    #format-select:focus-visible { border-color: #a78bfa; box-shadow: 0 0 0 3px rgb(167 139 250 / 15%); }
+    #format-select:hover { border-color: rgb(103 232 249 / 60%); }
+    .toolbar-right { display: inline-flex; align-items: center; gap: 10px; margin-left: auto; }
+    .dialog-backdrop { position: fixed; z-index: 1000; inset: 0; display: flex; align-items: center; justify-content: center; padding: 22px; background: rgb(3 6 17 / 76%); backdrop-filter: blur(11px); opacity: 0; visibility: hidden; transition: opacity .2s ease, visibility .2s ease; }
+    .dialog-backdrop.is-open { opacity: 1; visibility: visible; }
+    .custom-dialog { display: flex; flex-direction: column; width: min(900px, 100%); max-height: min(88vh, 940px); overflow: hidden; border: 1px solid rgb(167 139 250 / 30%); border-radius: 22px; color: #edf0ff; background: linear-gradient(145deg, rgb(20 26 49 / 99%), rgb(10 15 30 / 99%)); box-shadow: 0 35px 120px rgb(0 0 0 / 58%), 0 0 0 1px rgb(255 255 255 / 3%), 0 0 70px rgb(99 102 241 / 13%); transform: translateY(12px) scale(.99); transition: transform .22s cubic-bezier(.2,.75,.25,1); }
+    .dialog-backdrop.is-open .custom-dialog { transform: translateY(0) scale(1); }
+    .dialog-header { position: relative; padding: 25px 28px 18px; border-bottom: 1px solid var(--line); background: radial-gradient(ellipse at top right, rgb(99 102 241 / 13%), transparent 48%); }
+    .dialog-kicker { margin: 0 0 7px; color: #a99bef; font-size: .69rem; font-weight: 850; letter-spacing: .17em; text-transform: uppercase; }
+    .dialog-header h2 { margin: 0; padding-right: 35px; color: #f3f4ff; font-size: clamp(1.25rem, 3vw, 1.7rem); letter-spacing: -.03em; }
+    .dialog-description { margin: 10px 0 0; color: #aeb9d8; font-size: .9rem; line-height: 1.55; }
+    .dialog-close { position: absolute; top: 18px; right: 18px; width: 34px; height: 34px; border: 1px solid rgb(158 174 235 / 17%); border-radius: 10px; color: #aeb9d8; background: rgb(255 255 255 / 3%); font-size: 1.25rem; line-height: 1; cursor: pointer; transition: color .16s ease, background .16s ease, border-color .16s ease; }
+    .dialog-close:hover { color: #fff; border-color: rgb(167 139 250 / 45%); background: rgb(167 139 250 / 13%); }
+    .dialog-body { min-height: 0; overflow: auto; padding: 20px 28px 24px; color: #c4cce5; line-height: 1.55; }
+    .dialog-actions { display: flex; align-items: center; justify-content: flex-end; gap: 10px; padding: 16px 28px 22px; border-top: 1px solid var(--line); background: rgb(3 6 17 / 20%); }
+    .dialog-actions button { min-height: 42px; padding: 10px 16px; border: 1px solid rgb(158 174 235 / 19%); border-radius: 11px; color: #cbd4ef; background: rgb(255 255 255 / 4%); font: inherit; font-weight: 750; cursor: pointer; transition: transform .16s ease, border-color .16s ease, background .16s ease, box-shadow .16s ease; }
+    .dialog-actions button:hover:not(:disabled) { transform: translateY(-1px); border-color: rgb(167 139 250 / 52%); background: rgb(167 139 250 / 10%); }
+    .dialog-actions button:focus-visible { outline: 2px solid #a78bfa; outline-offset: 3px; }
+    .dialog-actions button.primary { border-color: rgb(167 139 250 / 50%); color: #fff; background: linear-gradient(115deg, #7859e8, #5c6ce8 55%, #268fa7); box-shadow: 0 7px 22px rgb(94 82 226 / 20%); }
+    .dialog-actions button.primary:hover:not(:disabled) { box-shadow: 0 10px 28px rgb(94 82 226 / 31%); }
+    .dialog-actions button:disabled { opacity: .55; cursor: wait; }
+    .dialog-summary { display: grid; grid-template-columns: repeat(3, minmax(0, 1fr)); gap: 10px; margin-bottom: 20px; }
+    .summary-tile { min-width: 0; padding: 13px 15px; border: 1px solid var(--line); border-radius: 13px; background: rgb(255 255 255 / 2.5%); }
+    .summary-tile strong { display: block; color: #f0f2ff; font-size: 1.35rem; font-variant-numeric: tabular-nums; }
+    .summary-tile span { color: #9ba7ca; font-size: .76rem; font-weight: 750; letter-spacing: .08em; text-transform: uppercase; }
+    .summary-tile.added { border-color: rgb(52 211 153 / 22%); }
+    .summary-tile.added strong { color: #6ee7b7; }
+    .summary-tile.modified { border-color: rgb(251 191 36 / 22%); }
+    .summary-tile.modified strong { color: #fcd34d; }
+    .summary-tile.removed { border-color: rgb(251 113 133 / 22%); }
+    .summary-tile.removed strong { color: #fda4af; }
+    .diff-section { margin: 20px 0 0; }
+    .diff-section h3 { display: flex; align-items: center; gap: 9px; margin: 0 0 11px; color: #e9edff; font-size: .94rem; }
+    .diff-section h3 .count { display: inline-grid; min-width: 25px; height: 24px; padding: 0 7px; place-items: center; border: 1px solid var(--line); border-radius: 8px; color: #cbd5ef; background: rgb(255 255 255 / 4%); font-size: .75rem; }
+    .diff-card { margin: 9px 0; padding: 15px; border: 1px solid rgb(158 174 235 / 14%); border-radius: 13px; background: linear-gradient(130deg, rgb(255 255 255 / 3%), rgb(255 255 255 / 1%)); }
+    .diff-card-heading { display: flex; align-items: flex-start; justify-content: space-between; gap: 12px; margin-bottom: 11px; color: #f1f3ff; font-weight: 800; overflow-wrap: anywhere; }
+    .diff-card-heading small { flex: 0 0 auto; color: #8995bb; font-size: .72rem; font-weight: 650; }
+    .diff-fields { display: grid; grid-template-columns: minmax(115px, .6fr) minmax(0, 1fr); gap: 7px 13px; }
+    .diff-field-name { align-self: start; color: #a9b5d7; font-size: .8rem; font-weight: 750; overflow-wrap: anywhere; }
+    .diff-value { min-width: 0; color: #d7def4; font-family: ui-monospace, SFMono-Regular, Consolas, monospace; font-size: .78rem; white-space: pre-wrap; overflow-wrap: anywhere; }
+    .value-before { color: #fda4af; }
+    .value-after { color: #6ee7b7; }
+    .change-pair { min-width: 0; padding: 8px 10px; border-radius: 8px; background: rgb(2 6 17 / 25%); }
+    .change-label { display: block; margin-bottom: 4px; color: #8f9abb; font-family: inherit; font-size: .66rem; font-weight: 800; letter-spacing: .1em; text-transform: uppercase; }
+    .diff-empty { padding: 20px 14px; border: 1px dashed rgb(110 231 183 / 28%); border-radius: 13px; color: #a7f3d0; text-align: center; background: rgb(16 185 129 / 5%); }
+    .dialog-warning { padding: 13px 15px; border: 1px solid rgb(251 191 36 / 22%); border-radius: 12px; color: #f5dca1; background: rgb(245 158 11 / 6%); }
+    .dialog-info { margin: 0; color: #b5c0df; }
+    body.dialog-open { overflow: hidden; }
+    @media (max-width: 620px) {
+      .format-picker { width: 100%; margin-left: 0; justify-content: flex-end; }
+      .toolbar-right { flex: 1 1 100%; justify-content: space-between; margin-left: 0; }
+      .dialog-backdrop { padding: 10px; align-items: flex-end; }
+      .custom-dialog { max-height: 91vh; border-radius: 19px 19px 12px 12px; }
+      .dialog-header { padding: 21px 18px 16px; }
+      .dialog-body { padding: 16px 17px 20px; }
+      .dialog-actions { padding: 13px 17px 17px; }
+      .dialog-actions button { flex: 1; padding: 10px 9px; font-size: .82rem; }
+      .dialog-summary { gap: 7px; }
+      .summary-tile { padding: 10px 9px; }
+      .summary-tile strong { font-size: 1.15rem; }
+      .summary-tile span { font-size: .64rem; }
+      .diff-card { padding: 12px; }
+      .diff-fields { grid-template-columns: minmax(80px, .55fr) minmax(0, 1fr); gap: 7px 9px; }
+    }
+
   </style>
 </head>
 <body>
@@ -378,24 +447,33 @@
 
     <div class="stage-note">
       <span class="note-icon" aria-hidden="true">✦</span>
-      <div><strong>Live database editor</strong><br>The current whitelist loads automatically. Save Changes validates and writes the full dataset to Supabase; Refresh reloads the latest saved database.</div>
+      <div><strong>Live database editor</strong><br>The current whitelist loads automatically. Switch between JSON and CSV, review a complete before/after change list before every save, and refresh the latest saved database when needed.</div>
     </div>
 
-    <section class="editor-shell" aria-label="JSON editor">
+    <section class="editor-shell" aria-label="Whitelist data editor">
       <div class="editor-toolbar">
         <div class="file-label">
           <span class="file-icon" aria-hidden="true"><svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="1.7" stroke-linecap="round" stroke-linejoin="round"><path d="M14 2H6a2 2 0 0 0-2 2v16a2 2 0 0 0 2 2h12a2 2 0 0 0 2-2V8z"/><path d="M14 2v6h6M8 13l-2 2 2 2M16 13l2 2-2 2M14 12l-4 6"/></svg></span>
-          <strong>whitelist.json</strong>
+          <strong id="file-name">whitelist.json</strong>
         </div>
-        <span id="editor-stats">JSON · 1 line</span>
+        <div class="toolbar-right">
+          <div class="format-picker">
+            <label for="format-select">Format</label>
+            <select id="format-select" aria-label="Editor language">
+              <option value="json" selected>JSON</option>
+              <option value="csv">CSV</option>
+            </select>
+          </div>
+          <span id="editor-stats">JSON · 1 line</span>
+        </div>
       </div>
       <div class="editor-frame">
-        <textarea id="json-editor" aria-label="Whitelist JSON editor" spellcheck="false">[]</textarea>
+        <textarea id="json-editor" aria-label="Whitelist data editor" spellcheck="false">[]</textarea>
       </div>
       <section class="diagnostics" aria-live="polite" aria-atomic="false">
         <div class="diagnostics-heading">
           <h2><svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="1.8" stroke-linecap="round" stroke-linejoin="round" aria-hidden="true"><circle cx="12" cy="12" r="9"/><path d="M12 8v4M12 16h.01"/></svg> Validation results</h2>
-          <span class="diagnostics-caption">JSON + license fields</span>
+          <span id="diagnostics-caption" class="diagnostics-caption">JSON syntax + license fields</span>
         </div>
         <ul id="diagnostics-list" class="diagnostics-list"><li class="info">Checking JSON…</li></ul>
       </section>
@@ -409,8 +487,24 @@
       </div>
     </div>
     <p id="notice" class="notice info" role="status">Connecting to the live whitelist database…</p>
-    <p class="footer-note">Validation checks the exported license fields, value types, required fields, and duplicate identifiers, Discord IDs, and license keys. Refresh reloads the database snapshot; if another edit is saved first, you will need to refresh before saving.</p>
+    <p class="footer-note">JSON and CSV are validated against the same license fields, types, required columns, and duplicate Identifier, Discord ID, and license Key checks. Saving first opens a complete change review; the database is only written after confirmation. Refresh uses a matching confirmation dialog, and stale database revisions are rejected safely.</p>
   </main>
+
+  <div id="dialog-backdrop" class="dialog-backdrop" aria-hidden="true">
+    <section class="custom-dialog" role="dialog" aria-modal="true" aria-labelledby="dialog-title" aria-describedby="dialog-description" tabindex="-1">
+      <div class="dialog-header">
+        <p id="dialog-kicker" class="dialog-kicker">Celestial / Confirm</p>
+        <h2 id="dialog-title">Confirm action</h2>
+        <p id="dialog-description" class="dialog-description">Review this action before continuing.</p>
+        <button id="dialog-close" class="dialog-close" type="button" aria-label="Close dialog">×</button>
+      </div>
+      <div id="dialog-body" class="dialog-body"></div>
+      <div class="dialog-actions">
+        <button id="dialog-cancel" type="button">No, go back</button>
+        <button id="dialog-confirm" class="primary" type="button">Yes, continue</button>
+      </div>
+    </section>
+  </div>
 
   <script src="https://cdnjs.cloudflare.com/ajax/libs/codemirror/5.65.16/codemirror.min.js"></script>
   <script src="https://cdnjs.cloudflare.com/ajax/libs/codemirror/5.65.16/mode/javascript/javascript.min.js"></script>
@@ -423,6 +517,11 @@
       const diagnosticsList = document.getElementById("diagnostics-list");
       const notice = document.getElementById("notice");
       const stats = document.getElementById("editor-stats");
+      const diagnosticsCaption = document.getElementById("diagnostics-caption");
+      const formatSelect = document.getElementById("format-select");
+      const fileNameLabel = document.getElementById("file-name");
+      let selectedFormat = formatSelect.value;
+      let baselineRecords = [];
       let lastIssues = [];
       let editor = null;
 
@@ -638,13 +737,223 @@
         return { parsed, issues };
       }
 
+      const csvNullableFields = new Set([
+        "DiscordId", "Key", "Activated", "Notes", "ExpiresAt", "CreatedAt", "UpdatedAt",
+        "HWID", "LastHwidReset", "ActivationCountry", "ActivationRobloxUserId"
+      ]);
+
+      function parseCsvRows(source) {
+        const rows = [];
+        const offsets = [];
+        let row = [];
+        let field = "";
+        let inQuotes = false;
+        let closedQuote = false;
+        let rowStart = 0;
+        let index = 0;
+
+        function pushRow(nextStart) {
+          const values = [...row, field];
+          if (values.some(value => value !== "")) {
+            rows.push(values);
+            offsets.push(rowStart);
+          }
+          row = [];
+          field = "";
+          closedQuote = false;
+          rowStart = nextStart;
+        }
+
+        while (index < source.length) {
+          const character = source[index];
+          if (inQuotes) {
+            if (character === '"') {
+              if (source[index + 1] === '"') { field += '"'; index += 2; continue; }
+              inQuotes = false;
+              closedQuote = true;
+              index++;
+              continue;
+            }
+            field += character;
+            index++;
+            continue;
+          }
+          if (closedQuote) {
+            if (character === ",") {
+              row.push(field); field = ""; closedQuote = false; index++; continue;
+            }
+            if (character === "\r" || character === "\n") {
+              const nextStart = character === "\r" && source[index + 1] === "\n" ? index + 2 : index + 1;
+              pushRow(nextStart);
+              index = nextStart;
+              continue;
+            }
+            if (character === " " || character === "\t") { index++; continue; }
+            throw Object.assign(new Error("Unexpected character after a closing CSV quote."), { offset: index });
+          }
+          if (character === '"') {
+            if (field.length !== 0) throw Object.assign(new Error("A CSV quote must start at the beginning of a cell."), { offset: index });
+            inQuotes = true;
+            index++;
+            continue;
+          }
+          if (character === ",") {
+            row.push(field); field = ""; index++; continue;
+          }
+          if (character === "\r" || character === "\n") {
+            const nextStart = character === "\r" && source[index + 1] === "\n" ? index + 2 : index + 1;
+            pushRow(nextStart);
+            index = nextStart;
+            continue;
+          }
+          field += character;
+          index++;
+        }
+        if (inQuotes) throw Object.assign(new Error("The CSV contains an unclosed quoted cell."), { offset: source.length });
+        if (row.length || field.length || closedQuote) pushRow(source.length);
+        return { rows, offsets };
+      }
+
+      function convertCsvCell(field, raw) {
+        if (csvNullableFields.has(field) && raw === "") return null;
+        if (field === "Games") {
+          if (raw === "") return [];
+          if (raw.trim().startsWith("[")) {
+            try {
+              const parsed = JSON.parse(raw);
+              if (Array.isArray(parsed)) return parsed;
+            } catch (_) { /* Keep malformed array text so normal validation can report it. */ }
+          }
+          return raw;
+        }
+        if (field === "Enabled") {
+          if (raw.toLowerCase() === "true") return true;
+          if (raw.toLowerCase() === "false") return false;
+          return raw;
+        }
+        if (["Executions", "totalHwidResets", "ActivationRobloxUserId"].includes(field)) {
+          if (field === "ActivationRobloxUserId" && raw === "") return null;
+          if (/^\d+$/.test(raw)) {
+            const number = Number(raw);
+            if (Number.isSafeInteger(number)) return number;
+          }
+          return raw;
+        }
+        return raw;
+      }
+
+      function validateCsv(source) {
+        let parsedCsv;
+        try {
+          parsedCsv = parseCsvRows(source);
+        } catch (error) {
+          const offset = Number.isInteger(error.offset) ? error.offset : source.length;
+          return { parsed: null, issues: [issueAt(source, offset, `Invalid CSV: ${error.message}`)] };
+        }
+        const { rows, offsets } = parsedCsv;
+        if (!rows.length) return { parsed: null, issues: [issueAt(source, 0, "CSV must include a header row and all required license fields.")] };
+
+        const headers = rows[0].map(header => header.trim());
+        if (headers.length) headers[0] = headers[0].replace(/^\uFEFF/, "");
+        const issues = [];
+        const canonicalColumns = new Map();
+        const seenHeaders = new Set();
+        for (let index = 0; index < headers.length; index++) {
+          const header = headers[index];
+          if (!header) {
+            issues.push(issueAt(source, offsets[0] || 0, `CSV column ${index + 1} has an empty header.`));
+            continue;
+          }
+          if (seenHeaders.has(header)) {
+            issues.push(issueAt(source, offsets[0] || 0, `CSV header "${header}" is duplicated.`));
+            continue;
+          }
+          seenHeaders.add(header);
+          const canonical = requiredFields.find(field => fieldAliases[field].includes(header));
+          if (!canonical) {
+            issues.push(issueAt(source, offsets[0] || 0, `CSV contains unknown column "${header}".`));
+            continue;
+          }
+          if (canonicalColumns.has(canonical)) {
+            issues.push(issueAt(source, offsets[0] || 0, `CSV contains multiple columns for "${canonical}".`));
+            continue;
+          }
+          canonicalColumns.set(canonical, index);
+        }
+        for (const field of requiredFields) {
+          if (!canonicalColumns.has(field)) issues.push(issueAt(source, offsets[0] || 0, `CSV is missing required column "${field}".`));
+        }
+        if (issues.length) return { parsed: null, issues };
+
+        const records = [];
+        for (let rowIndex = 1; rowIndex < rows.length; rowIndex++) {
+          const cells = rows[rowIndex];
+          const recordOffset = offsets[rowIndex] || 0;
+          if (cells.length !== headers.length) {
+            issues.push(issueAt(source, recordOffset, `CSV record ${rowIndex} has ${cells.length} cells; expected ${headers.length}.`));
+            continue;
+          }
+          const record = {};
+          for (const field of requiredFields) {
+            record[field] = convertCsvCell(field, cells[canonicalColumns.get(field)]);
+          }
+          records.push(record);
+        }
+        if (issues.length) return { parsed: records, issues };
+
+        const checked = validateJson(JSON.stringify(records, null, 2));
+        if (checked.issues.length) {
+          for (const problem of checked.issues) {
+            const entryMatch = /Entry (\d+)/i.exec(problem.message);
+            const sourceOffset = entryMatch ? (offsets[Math.min(Number(entryMatch[1]), offsets.length - 1)] || 0) : 0;
+            const message = problem.message.replace(/ \(line \d+, column \d+\)$/, "");
+            issues.push(issueAt(source, sourceOffset, message));
+          }
+        }
+        return { parsed: records, issues };
+      }
+
+      function canonicalizeRecords(records) {
+        return (records || []).map(record => {
+          const canonical = {};
+          for (const field of requiredFields) canonical[field] = fieldValue(record, field).value;
+          return canonical;
+        });
+      }
+
+      function quoteCsv(value) {
+        let text;
+        if (value === null || value === undefined) text = "";
+        else if (Array.isArray(value)) text = JSON.stringify(value);
+        else if (typeof value === "object") text = JSON.stringify(value);
+        else text = String(value);
+        return `"${text.replace(/"/g, '""')}"`;
+      }
+
+      function formatCsv(records) {
+        const canonicalRecords = canonicalizeRecords(records);
+        const lines = [requiredFields.map(quoteCsv).join(",")];
+        for (const record of canonicalRecords) {
+          lines.push(requiredFields.map(field => quoteCsv(record[field])).join(","));
+        }
+        return lines.join("\r\n") + "\r\n";
+      }
+
+      function formatRecords(records, format = selectedFormat) {
+        return format === "csv" ? formatCsv(records) : JSON.stringify(records || [], null, 4) + "\n";
+      }
+
+      function validateCurrent(source) {
+        return selectedFormat === "csv" ? validateCsv(source) : validateJson(source);
+      }
+
       function renderIssues(issues, source) {
         lastIssues = issues;
         diagnosticsList.replaceChildren();
         if (!issues.length) {
           const item = document.createElement("li");
           item.className = "ok";
-          item.textContent = "No problems found. JSON syntax and basic license-record checks passed.";
+          item.textContent = selectedFormat === "csv" ? "No problems found. CSV structure and license-record checks passed." : "No problems found. JSON syntax and basic license-record checks passed.";
           diagnosticsList.appendChild(item);
         } else {
           for (const issue of issues.slice(0, 100)) {
@@ -661,7 +970,10 @@
         }
         const lines = source.split("\n").length;
         const bytes = new TextEncoder().encode(source).length;
-        stats.textContent = `JSON · ${lines} line${lines === 1 ? "" : "s"} · ${bytes.toLocaleString()} bytes`;
+        const formatLabel = selectedFormat.toUpperCase();
+        stats.textContent = `${formatLabel} · ${lines} line${lines === 1 ? "" : "s"} · ${bytes.toLocaleString()} bytes`;
+        diagnosticsCaption.textContent = `${formatLabel} syntax + license fields`;
+        fileNameLabel.textContent = `whitelist.${selectedFormat}`;
       }
 
       function lintJson(source) {
@@ -670,14 +982,32 @@
         return result.issues.map(({ from, to, message, severity }) => ({ from, to, message, severity }));
       }
 
+      function lintCsv(source) {
+        const result = validateCsv(source);
+        renderIssues(result.issues, source);
+        return result.issues.map(({ from, to, message, severity }) => ({ from, to, message, severity }));
+      }
+
       const textarea = document.getElementById("json-editor");
       const editorShell = document.querySelector(".editor-shell");
       const refreshButton = document.getElementById("refresh-button");
       const saveButton = document.getElementById("save-button");
+      const dialogBackdrop = document.getElementById("dialog-backdrop");
+      const dialogPanel = dialogBackdrop.querySelector(".custom-dialog");
+      const dialogKicker = document.getElementById("dialog-kicker");
+      const dialogTitle = document.getElementById("dialog-title");
+      const dialogDescription = document.getElementById("dialog-description");
+      const dialogBody = document.getElementById("dialog-body");
+      const dialogCancel = document.getElementById("dialog-cancel");
+      const dialogConfirm = document.getElementById("dialog-confirm");
+      const dialogClose = document.getElementById("dialog-close");
       let editorSession = "";
       let loadedRevision = "";
       let baselineText = "";
       let isBusy = false;
+      let suppressChangeNotice = false;
+      let activeDialogOptions = null;
+      let focusBeforeDialog = null;
 
       try {
         const fragment = new URLSearchParams(window.location.hash.replace(/^#/, ""));
@@ -692,16 +1022,16 @@
       if (window.CodeMirror) {
         editor = CodeMirror.fromTextArea(textarea, {
           theme: "material-darker",
-          mode: { name: "javascript", json: true },
+          mode: selectedFormat === "json" ? { name: "javascript", json: true } : "text/plain",
           lineNumbers: true,
-          lineWrapping: false,
+          lineWrapping: selectedFormat === "csv",
           matchBrackets: true,
           autoCloseBrackets: true,
           tabSize: 4,
           indentUnit: 4,
           indentWithTabs: false,
           gutters: ["CodeMirror-lint-markers", "CodeMirror-linenumbers"],
-          lint: { getAnnotations: lintJson, async: false },
+          lint: { getAnnotations: source => selectedFormat === "csv" ? lintCsv(source) : lintJson(source), async: false },
           extraKeys: { "Tab": cm => cm.execCommand("indentMore"), "Shift-Tab": cm => cm.execCommand("indentLess"), "Ctrl-Enter": () => saveChanges() }
         });
         editor.setSize("100%", null);
@@ -736,6 +1066,7 @@
         isBusy = value;
         refreshButton.disabled = value || !editorSession;
         saveButton.disabled = value || !editorSession;
+        formatSelect.disabled = value || !editorSession;
         refreshButton.textContent = value ? "Please wait…" : "Refresh";
         saveButton.textContent = value ? "Working…" : "Save Changes";
       }
@@ -761,62 +1092,274 @@
         }
         return payload;
       }
-      function formatData(data) { return JSON.stringify(data, null, 4) + "\n"; }
-      function hasUnsavedChanges() { return Boolean(baselineText) && getValue() !== baselineText; }
 
-      async function loadData({ confirmDiscard = false } = {}) {
+      function hasUnsavedChanges() {
+        // Compare the visible source so even local formatting edits are protected
+        // by Refresh's discard confirmation. Format conversion resets this baseline
+        // to a canonical representation in the newly selected format.
+        if (!loadedRevision) return Boolean(getValue().trim());
+        return getValue() !== baselineText;
+      }
+
+      function openCustomDialog(options) {
+        if (!options) return;
+        activeDialogOptions = options;
+        focusBeforeDialog = document.activeElement;
+        dialogKicker.textContent = options.kicker || "Celestial / Confirm";
+        dialogTitle.textContent = options.title || "Confirm action";
+        dialogDescription.textContent = options.description || "Review this action before continuing.";
+        dialogBody.replaceChildren();
+        if (options.content instanceof Node) dialogBody.appendChild(options.content);
+        else if (options.content !== undefined && options.content !== null) {
+          const paragraph = document.createElement("p");
+          paragraph.className = "dialog-info";
+          paragraph.textContent = String(options.content);
+          dialogBody.appendChild(paragraph);
+        }
+        dialogCancel.textContent = options.cancelLabel || "No, go back";
+        dialogConfirm.textContent = options.confirmLabel || "Yes, continue";
+        dialogCancel.hidden = Boolean(options.hideCancel);
+        dialogClose.hidden = false;
+        dialogBackdrop.classList.add("is-open");
+        dialogBackdrop.setAttribute("aria-hidden", "false");
+        document.body.classList.add("dialog-open");
+        window.requestAnimationFrame(() => (options.hideCancel ? dialogConfirm : dialogCancel).focus());
+      }
+
+      function closeCustomDialog(invokeCancel = false) {
+        const priorOptions = activeDialogOptions;
+        activeDialogOptions = null;
+        dialogBackdrop.classList.remove("is-open");
+        dialogBackdrop.setAttribute("aria-hidden", "true");
+        document.body.classList.remove("dialog-open");
+        if (invokeCancel && priorOptions && typeof priorOptions.onCancel === "function") {
+          try { priorOptions.onCancel(); } catch (_) { /* A cancel callback must not trap the dialog open. */ }
+        }
+        if (focusBeforeDialog && typeof focusBeforeDialog.focus === "function") focusBeforeDialog.focus();
+      }
+
+      function appendDialogText(parent, tag, className, text) {
+        const element = document.createElement(tag);
+        if (className) element.className = className;
+        element.textContent = text;
+        parent.appendChild(element);
+        return element;
+      }
+
+      function displayValue(value) {
+        if (value === undefined) return "undefined";
+        const rendered = JSON.stringify(value, null, 2);
+        return rendered === undefined ? String(value) : rendered;
+      }
+
+      function appendRecordCard(parent, record, index, kind) {
+        const card = document.createElement("article");
+        card.className = "diff-card";
+        const heading = document.createElement("div");
+        heading.className = "diff-card-heading";
+        const identifier = record && (record.Identifier ?? record.identifier) || `Record ${index + 1}`;
+        appendDialogText(heading, "span", "", String(identifier));
+        appendDialogText(heading, "small", "", kind === "added" ? "NEW RECORD" : "WILL BE REMOVED");
+        card.appendChild(heading);
+        const fields = document.createElement("div");
+        fields.className = "diff-fields";
+        const fieldEntries = Object.entries(record || {});
+        for (const [field, value] of fieldEntries) {
+          appendDialogText(fields, "div", "diff-field-name", field);
+          appendDialogText(fields, "div", "diff-value", displayValue(value));
+        }
+        card.appendChild(fields);
+        parent.appendChild(card);
+      }
+
+      function appendChangeCard(parent, item, index) {
+        const card = document.createElement("article");
+        card.className = "diff-card";
+        const heading = document.createElement("div");
+        heading.className = "diff-card-heading";
+        appendDialogText(heading, "span", "", String(item.Identifier || item.PreviousIdentifier || `Record ${index + 1}`));
+        appendDialogText(heading, "small", "", item.PreviousIdentifier && item.PreviousIdentifier !== item.Identifier ? `IDENTIFIER: ${item.PreviousIdentifier} → ${item.Identifier}` : `${Object.keys(item.Changes || {}).length} FIELD CHANGE(S)`);
+        card.appendChild(heading);
+        const fields = document.createElement("div");
+        fields.className = "diff-fields";
+        for (const [field, values] of Object.entries(item.Changes || {})) {
+          appendDialogText(fields, "div", "diff-field-name", field);
+          const pair = document.createElement("div");
+          pair.className = "change-pair";
+          appendDialogText(pair, "span", "change-label", "Before");
+          appendDialogText(pair, "div", "diff-value value-before", displayValue(values.before));
+          appendDialogText(pair, "span", "change-label", "After");
+          appendDialogText(pair, "div", "diff-value value-after", displayValue(values.after));
+          fields.appendChild(pair);
+        }
+        card.appendChild(fields);
+        parent.appendChild(card);
+      }
+
+      function renderDiffPreview(diff, summary) {
+        const fragment = document.createDocumentFragment();
+        const counts = [
+          { kind: "added", label: "Added", count: summary.added_count || 0 },
+          { kind: "modified", label: "Modified", count: summary.modified_count || 0 },
+          { kind: "removed", label: "Removed", count: summary.removed_count || 0 }
+        ];
+        const tiles = document.createElement("div");
+        tiles.className = "dialog-summary";
+        for (const entry of counts) {
+          const tile = document.createElement("div");
+          tile.className = `summary-tile ${entry.kind}`;
+          appendDialogText(tile, "strong", "", String(entry.count));
+          appendDialogText(tile, "span", "", entry.label);
+          tiles.appendChild(tile);
+        }
+        fragment.appendChild(tiles);
+
+        if (!(summary.added_count || summary.modified_count || summary.removed_count)) {
+          appendDialogText(fragment, "div", "diff-empty", "No changes detected. The database already matches the editor contents; nothing will be written.");
+          return fragment;
+        }
+        if (summary.removed_count) {
+          appendDialogText(fragment, "div", "dialog-warning", `Review carefully: ${summary.removed_count} record(s) will be permanently removed from the live whitelist database when you confirm.`);
+        }
+        const sections = [
+          { key: "added", title: "Records being added", count: summary.added_count || 0, kind: "added" },
+          { key: "modified", title: "Records being modified", count: summary.modified_count || 0, kind: "modified" },
+          { key: "removed", title: "Records being removed", count: summary.removed_count || 0, kind: "removed" }
+        ];
+        for (const sectionData of sections) {
+          if (!sectionData.count) continue;
+          const section = document.createElement("section");
+          section.className = "diff-section";
+          const heading = document.createElement("h3");
+          heading.appendChild(document.createTextNode(sectionData.title));
+          appendDialogText(heading, "span", "count", String(sectionData.count));
+          section.appendChild(heading);
+          const records = (diff && diff[sectionData.key]) || [];
+          records.forEach((record, index) => {
+            if (sectionData.kind === "modified") appendChangeCard(section, record, index);
+            else appendRecordCard(section, record, index, sectionData.kind);
+          });
+          fragment.appendChild(section);
+        }
+        const footer = document.createElement("p");
+        footer.className = "dialog-info";
+        footer.style.marginTop = "18px";
+        footer.textContent = "Only the changes shown above will be submitted. CreatedAt and UpdatedAt are managed by the server, so exact commit-time timestamp values can differ slightly from this preview. Every field is revalidated and the database revision is checked again before writing.";
+        fragment.appendChild(footer);
+        return fragment;
+      }
+
+      dialogConfirm.addEventListener("click", () => {
+        if (dialogConfirm.disabled) return;
+        const options = activeDialogOptions;
+        closeCustomDialog();
+        if (options && typeof options.onConfirm === "function") {
+          Promise.resolve().then(() => options.onConfirm()).catch(error => {
+            showNotice(error && error.message || "The requested action could not be completed.", "error");
+          });
+        }
+      });
+      dialogCancel.addEventListener("click", () => closeCustomDialog(true));
+      dialogClose.addEventListener("click", () => closeCustomDialog(true));
+      dialogBackdrop.addEventListener("click", event => {
+        if (event.target === dialogBackdrop) closeCustomDialog(true);
+      });
+      document.addEventListener("keydown", event => {
+        if (!dialogBackdrop.classList.contains("is-open")) return;
+        if (event.key === "Escape") {
+          event.preventDefault();
+          closeCustomDialog(true);
+        } else if (event.key === "Tab") {
+          const focusables = [dialogClose, dialogCancel, dialogConfirm].filter(element => !element.hidden && !element.disabled && element.offsetParent !== null);
+          if (!focusables.length) return;
+          const first = focusables[0];
+          const last = focusables[focusables.length - 1];
+          if (event.shiftKey && document.activeElement === first) { event.preventDefault(); last.focus(); }
+          else if (!event.shiftKey && document.activeElement === last) { event.preventDefault(); first.focus(); }
+        }
+      });
+
+      function showDialogError(title, message) {
+        const content = document.createDocumentFragment();
+        appendDialogText(content, "div", "dialog-warning", message);
+        openCustomDialog({
+          kicker: "Celestial / Attention",
+          title,
+          description: "No database changes have been made.",
+          content,
+          confirmLabel: "Close",
+          hideCancel: true
+        });
+      }
+
+      function hasValidationErrors(source) {
+        const result = validateCurrent(source);
+        renderIssues(result.issues, source);
+        return result;
+      }
+
+      function updateEditorMode() {
+        if (editor) {
+          editor.setOption("mode", selectedFormat === "json" ? { name: "javascript", json: true } : "text/plain");
+          editor.setOption("lineWrapping", selectedFormat === "csv");
+        }
+        renderIssues(validateCurrent(getValue()).issues, getValue());
+        if (editor) editor.performLint();
+      }
+
+      async function loadData() {
         if (isBusy) return;
-        if (confirmDiscard && hasUnsavedChanges() && !window.confirm("Refresh will discard your unsaved JSON changes and reload the current database. Continue?")) return;
         setBusy(true);
         showNotice("Loading the current whitelist from the database…", "info");
         try {
           const payload = await apiRequest("/editwhitelist/api/data", { method: "GET" });
-          const source = formatData(payload.data || []);
+          baselineRecords = payload.data || [];
+          const source = formatRecords(baselineRecords, selectedFormat);
+          suppressChangeNotice = true;
           setValue(source);
           baselineText = source;
           loadedRevision = payload.revision || "";
-          if (editor) { editor.clearHistory(); editor.performLint(); }
-          renderIssues(validateJson(source).issues, source);
-          showNotice(`Loaded ${payload.data.length} license record(s) from the live database.`, "success");
+          if (editor) editor.clearHistory();
+          suppressChangeNotice = false;
+          updateEditorMode();
+          showNotice(`Loaded ${baselineRecords.length} license record(s) from the live database.`, "success");
         } catch (error) {
+          suppressChangeNotice = true;
           showNotice(error.message || "Failed to load the whitelist database.", "error");
           if (error.status === 401) {
-            setValue("[]\n");
+            baselineRecords = [];
+            setValue(formatRecords([], selectedFormat));
             baselineText = "";
             loadedRevision = "";
           }
+          suppressChangeNotice = false;
         } finally {
           setBusy(false);
         }
       }
 
-      async function saveChanges() {
+      async function commitApprovedSave(canonicalSource, revision, reviewedEditorText, reviewedFormat) {
         if (isBusy) return;
-        const source = getValue();
-        const result = validateJson(source);
-        renderIssues(result.issues, source);
-        if (result.issues.length) {
-          showNotice(`Cannot save: ${result.issues.length} validation problem(s) found. Fix them first.`, "error");
-          if (editor) editor.focus();
-          return;
-        }
-        if (!loadedRevision) {
-          showNotice("The database snapshot is missing. Click Refresh before saving.", "error");
+        if (getValue() !== reviewedEditorText || selectedFormat !== reviewedFormat) {
+          showNotice("The editor changed after the preview was prepared. Review the changes again before saving.", "error");
           return;
         }
         setBusy(true);
-        showNotice("Validating and saving changes to Supabase…", "info");
+        showNotice("Saving the reviewed changes to Supabase…", "info");
         try {
           const payload = await apiRequest("/editwhitelist/api/save", {
             method: "POST",
-            body: JSON.stringify({ source, revision: loadedRevision })
+            body: JSON.stringify({ source: canonicalSource, revision })
           });
-          const savedSource = formatData(payload.data || []);
+          baselineRecords = payload.data || [];
+          const savedSource = formatRecords(baselineRecords, selectedFormat);
+          suppressChangeNotice = true;
           setValue(savedSource);
           baselineText = savedSource;
           loadedRevision = payload.revision || "";
-          if (editor) { editor.clearHistory(); editor.performLint(); }
-          renderIssues(validateJson(savedSource).issues, savedSource);
+          if (editor) editor.clearHistory();
+          suppressChangeNotice = false;
+          updateEditorMode();
           const summary = payload.summary || {};
           const counts = [];
           if (summary.added_count) counts.push(`${summary.added_count} added`);
@@ -825,18 +1368,113 @@
           const statusSuffix = payload.discord_response_updated ? " The original Discord response was updated." : " The database save succeeded, but the Discord response could not be updated; check the bot logs.";
           const statusText = counts.length
             ? `Saved successfully: ${counts.join(", ")}.${statusSuffix}`
-            : (payload.discord_response_updated ? "No changes detected; the database already matches this JSON." : "No changes detected. The database already matches this JSON, but the Discord response could not be updated.");
+            : (payload.discord_response_updated ? "No changes detected; the database already matches this editor." : "No changes detected. The database already matches this editor, but the Discord response could not be updated.");
           showNotice(statusText, payload.discord_response_updated ? "success" : "info");
         } catch (error) {
           showNotice(error.message || "The database update failed. Refresh to check the current database state before retrying.", "error");
-          if (error.status === 409) {
-            // Keep the user's text in place; they may copy it before refreshing.
-            showNotice(`${error.message} Your current edits have been kept.`, "error");
-          }
+          if (error.status === 409) showNotice(`${error.message} Your current edits have been kept.`, "error");
         } finally {
           setBusy(false);
         }
       }
+
+      async function saveChanges() {
+        if (isBusy || editorLocked || !editorSession) return;
+        const editorTextAtReview = getValue();
+        const result = hasValidationErrors(editorTextAtReview);
+        if (result.issues.length || !Array.isArray(result.parsed)) {
+          showNotice(`Cannot review changes: ${result.issues.length || 1} validation problem(s) found. Fix them first.`, "error");
+          if (editor) editor.focus();
+          return;
+        }
+        if (!loadedRevision) {
+          showNotice("The database snapshot is missing. Click Refresh before saving.", "error");
+          return;
+        }
+        const canonicalRecords = canonicalizeRecords(result.parsed);
+        const canonicalSource = JSON.stringify(canonicalRecords, null, 4) + "\n";
+        const revisionAtReview = loadedRevision;
+        const formatAtReview = selectedFormat;
+        setBusy(true);
+        showNotice("Validating changes and preparing the review…", "info");
+        let preview;
+        try {
+          preview = await apiRequest("/editwhitelist/api/preview", {
+            method: "POST",
+            body: JSON.stringify({ source: canonicalSource, revision: revisionAtReview })
+          });
+        } catch (error) {
+          showNotice(error.message || "Could not prepare the change review.", "error");
+          if (error.status === 409) showNotice(`${error.message} Your editor contents have been kept.`, "error");
+          return;
+        } finally {
+          setBusy(false);
+        }
+
+        const summary = preview.summary || {};
+        const changeCount = (summary.added_count || 0) + (summary.modified_count || 0) + (summary.removed_count || 0);
+        const description = changeCount
+          ? "Review each added, removed, and modified record below. Nothing is written until you confirm."
+          : "The current editor values match the live database. Confirm to close this review without writing anything.";
+        openCustomDialog({
+          kicker: "Celestial / Database review",
+          title: changeCount ? "Review changes before saving" : "No changes to save",
+          description,
+          content: renderDiffPreview(preview.diff || {}, summary),
+          confirmLabel: changeCount ? "Confirm Save" : "Done",
+          cancelLabel: "No, keep editing",
+          hideCancel: !changeCount,
+          onConfirm: changeCount ? () => commitApprovedSave(canonicalSource, revisionAtReview, editorTextAtReview, formatAtReview) : null
+        });
+      }
+
+      function requestRefresh() {
+        if (isBusy || !editorSession || editorLocked) return;
+        const dirty = hasUnsavedChanges();
+        const content = document.createDocumentFragment();
+        if (dirty) {
+          appendDialogText(content, "div", "dialog-warning", "Your editor contains unsaved changes. Refreshing will permanently discard those local edits and replace them with the latest database snapshot.");
+        } else {
+          appendDialogText(content, "p", "dialog-info", "This will reload the latest saved whitelist from Supabase and update the database revision used for the next save.");
+        }
+        openCustomDialog({
+          kicker: "Celestial / Refresh",
+          title: "Refresh whitelist data?",
+          description: "No database values will be changed by refreshing.",
+          content,
+          confirmLabel: "Refresh from database",
+          cancelLabel: dirty ? "Keep my edits" : "Cancel",
+          onConfirm: () => loadData()
+        });
+      }
+
+      formatSelect.addEventListener("change", () => {
+        if (isBusy || editorLocked || !editorSession) {
+          formatSelect.value = selectedFormat;
+          return;
+        }
+        const requestedFormat = formatSelect.value;
+        const previousFormat = selectedFormat;
+        if (requestedFormat === previousFormat) return;
+        const source = getValue();
+        const result = previousFormat === "csv" ? validateCsv(source) : validateJson(source);
+        renderIssues(result.issues, source);
+        if (result.issues.length || !Array.isArray(result.parsed)) {
+          formatSelect.value = previousFormat;
+          showNotice(`Fix the ${previousFormat.toUpperCase()} validation errors before converting formats. Your current text has been kept.`, "error");
+          return;
+        }
+        const canonicalRecords = canonicalizeRecords(result.parsed);
+        selectedFormat = requestedFormat;
+        formatSelect.value = selectedFormat;
+        baselineText = formatRecords(canonicalizeRecords(baselineRecords), selectedFormat);
+        suppressChangeNotice = true;
+        setValue(formatRecords(canonicalRecords, selectedFormat));
+        suppressChangeNotice = false;
+        if (editor) editor.clearHistory();
+        updateEditorMode();
+        showNotice(`Converted the editor view to ${selectedFormat.toUpperCase()}. This does not save or modify the database.`, hasUnsavedChanges() ? "info" : "success");
+      });
 
       document.querySelectorAll("button").forEach(button => {
         button.addEventListener("click", event => {
@@ -853,27 +1491,31 @@
       });
 
       saveButton.addEventListener("click", saveChanges);
-      refreshButton.addEventListener("click", () => loadData({ confirmDiscard: true }));
+      refreshButton.addEventListener("click", requestRefresh);
       if (editor) {
         editor.on("change", () => {
-          if (!isBusy && baselineText && getValue() !== baselineText) showNotice("Unsaved changes. Save Changes to validate and write them to the live database.", "info");
+          if (suppressChangeNotice || isBusy || !baselineText) return;
+          const dirty = hasUnsavedChanges();
+          if (dirty) showNotice(`Unsaved changes in ${selectedFormat.toUpperCase()} format. Review the complete change list before saving to the live database.`, "info");
         });
         editor.performLint();
       } else {
         textarea.addEventListener("input", () => {
-          const result = validateJson(textarea.value);
+          if (suppressChangeNotice || isBusy) return;
+          const result = validateCurrent(textarea.value);
           renderIssues(result.issues, textarea.value);
-          if (baselineText && textarea.value !== baselineText) showNotice("Unsaved changes. Save Changes to validate and write them to the live database.", "info");
+          if (baselineText && hasUnsavedChanges()) showNotice(`Unsaved changes in ${selectedFormat.toUpperCase()} format. Review the complete change list before saving to the live database.`, "info");
         });
-        renderIssues(validateJson(textarea.value).issues, textarea.value);
+        renderIssues(validateCurrent(textarea.value).issues, textarea.value);
       }
 
       if (!editorSession) {
         lockEditor();
-        setValue("[]\n");
+        setValue(formatRecords([], selectedFormat));
         showNotice("Open this page using the temporary link from `/whitelist edit` in Discord.", "error");
         refreshButton.disabled = true;
         saveButton.disabled = true;
+        formatSelect.disabled = true;
       } else {
         loadData();
       }

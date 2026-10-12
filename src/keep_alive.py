@@ -127,6 +127,97 @@ def whitelist_editor_load_data():
         return _editor_api_json({"ok": False, "error": "Failed to load the live whitelist database. Check the bot logs and retry."}, 500)
 
 
+@app.route('/editwhitelist/api/preview', methods=['POST'])
+def whitelist_editor_preview_changes():
+    """Validate edits and return a detailed diff without changing the database."""
+    session = _authorized_editor_session()
+    if session is None:
+        return _editor_api_json({"ok": False, "error": "Editor session expired or invalid. Run `/whitelist edit` again to open a new session."}, 401)
+
+    from api.whitelist_editor import (
+        MAX_EDITOR_JSON_BYTES,
+        _EDITOR_SAVE_LOCK,
+        validate_and_normalize_records,
+        run_on_editor_bot_loop,
+        database_revision,
+        _match_records,
+        _prepare_server_timestamps,
+        summary_counts,
+    )
+
+    if request.content_length is not None and request.content_length > MAX_EDITOR_JSON_BYTES + 65536:
+        return _editor_api_json({"ok": False, "error": "The editor payload is too large (maximum 8 MiB)."}, 413)
+
+    request_data = request.get_json(silent=True)
+    if not isinstance(request_data, dict):
+        return _editor_api_json({"ok": False, "error": "Expected a JSON request body."}, 400)
+    source = request_data.get("source")
+    expected_revision = request_data.get("revision")
+    if not isinstance(source, str):
+        return _editor_api_json({"ok": False, "error": "Missing editor source."}, 400)
+    if len(source.encode("utf-8")) > MAX_EDITOR_JSON_BYTES:
+        return _editor_api_json({"ok": False, "error": "The whitelist JSON exceeds the 8 MiB limit."}, 413)
+
+    try:
+        parsed = json.loads(source)
+    except json.JSONDecodeError as exc:
+        return _editor_api_json({"ok": False, "error": f"Invalid JSON: {exc.msg} (line {exc.lineno}, column {exc.colno})."}, 400)
+
+    try:
+        records = validate_and_normalize_records(parsed)
+    except ValueError as exc:
+        return _editor_api_json({"ok": False, "error": str(exc)}, 400)
+
+    try:
+        with _EDITOR_SAVE_LOCK:
+            from api.supabase_db import fetch_users
+            current_users = run_on_editor_bot_loop(session, fetch_users())
+            current_revision = database_revision(current_users)
+            if not isinstance(expected_revision, str) or not hmac.compare_digest(expected_revision, current_revision):
+                return _editor_api_json({
+                    "ok": False,
+                    "error": "The whitelist database changed after you opened or refreshed this editor. Click Refresh to load the latest database before reviewing a save.",
+                    "code": "database_changed",
+                }, 409)
+            if current_users and not records:
+                return _editor_api_json({
+                    "ok": False,
+                    "error": "Saving an empty dataset would delete every license. This editor blocks that accidental full-database wipe.",
+                }, 400)
+
+            requested_diff = _match_records(current_users, records)
+            protected_fields = {"ActivationCountry", "ActivationRobloxUserId"}
+            for item in requested_diff["modified"]:
+                changed_fields = protected_fields.intersection((item.get("Changes") or {}).keys())
+                if changed_fields:
+                    names = ", ".join(sorted(changed_fields))
+                    return _editor_api_json({
+                        "ok": False,
+                        "error": f"System-generated activation history cannot be edited from this page ({names}). Leave those values unchanged.",
+                    }, 400)
+
+            # Mirror the save path before rendering the diff so that server-managed
+            # CreatedAt/UpdatedAt behavior is included in the user's preview.
+            # Exact timestamp values are generated again at commit time.
+            if requested_diff["added"] or requested_diff["removed"] or requested_diff["modified"]:
+                _prepare_server_timestamps(current_users, records, requested_diff)
+            diff = _match_records(current_users, records)
+            summary = summary_counts(diff)
+            return _editor_api_json({
+                "ok": True,
+                "revision": current_revision,
+                "summary": summary,
+                "diff": {
+                    "added": diff["added"],
+                    "removed": diff["removed"],
+                    "modified": diff["modified"],
+                },
+            })
+    except Exception as exc:
+        print(f"[Whitelist Editor] Failed to preview database changes: {exc}")
+        return _editor_api_json({"ok": False, "error": "Could not prepare a change preview. Check the bot logs and retry."}, 500)
+
+
 @app.route('/editwhitelist/api/save', methods=['POST'])
 def whitelist_editor_save_data():
     """Validate and apply an edited full licenses dataset, then update the originating Discord response."""
