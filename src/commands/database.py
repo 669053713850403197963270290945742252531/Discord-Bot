@@ -19,16 +19,16 @@ from api.users import revoke_buyer_role, find_removed_discord_ids
 
 GUILD = discord.Object(id=config.GUILD_ID)
 
-_ALLOWED_GAME_SCRIPT_EXTENSIONS = {".lua", ".luau", ".txt"}
+_ALLOWED_GAME_SCRIPT_EXTENSIONS = {".lua", ".luau", ".txt", ".json"}
 
 
 def _validate_game_script_attachment(file: discord.Attachment) -> str | None:
     """Validate a `/games update` attachment before it is read or uploaded.
 
-    The filename is user-controlled, so require one of the explicitly supported
-    source-text extensions and reject names without an extension. The content
-    is validated separately after reading to prevent binary files that merely
-    have a script-looking filename from being stored as a game script.
+    The filename is user-controlled, so require one of the supported source-text
+    or JSON extensions and reject names without an extension. The content is
+    validated separately after reading to prevent binary files that merely have
+    a supported filename extension from being stored as a game script.
     """
     filename = str(getattr(file, "filename", "") or "").strip()
     if not filename:
@@ -36,7 +36,7 @@ def _validate_game_script_attachment(file: discord.Attachment) -> str | None:
 
     suffix = PurePosixPath(filename).suffix.lower()
     if suffix not in _ALLOWED_GAME_SCRIPT_EXTENSIONS:
-        allowed = ", ".join(f"`{ext}`" for ext in (".lua", ".luau", ".txt"))
+        allowed = ", ".join(f"`{ext}`" for ext in (".lua", ".luau", ".txt", ".json"))
         return f"Invalid game script file type. Only {allowed} files are accepted."
 
     return None
@@ -84,7 +84,7 @@ class GameEditModal(discord.ui.Modal, title="Edit Game"):
 
             new_game_id = self.game_id.component.value.strip()
             new_name = self.name.component.value.strip()
-            new_file_name = self.file_name.component.value.strip().lstrip("/")
+            new_file_name = str(self.file_name.component.value or "").strip().lstrip("/")
             # The Script Path is intentionally derived from File Name on submission.
             # This prevents the two fields from becoming mismatched.
             new_script_path = new_file_name
@@ -122,7 +122,7 @@ class GameEditModal(discord.ui.Modal, title="Edit Game"):
             if storage_changed:
                 try:
                     script_bytes = await fetch_game_script_bytes(old_script_path)
-                    await upload_game_script(new_script_path, script_bytes)
+                    await upload_game_script(new_script_path, script_bytes, source_filename=old_script_path)
                     new_uploaded = True
                 except SupabaseStorageError as exc:
                     return await send_error(interaction, f"Failed to move the game script in Storage: {exc}")
@@ -369,7 +369,7 @@ class Database(commands.Cog):
         except SupabaseStorageError as exc:
             return await send_error(
                 interaction,
-                f"The game exists in the database, but its script could not be found in the private `game-scripts` bucket: {exc}",
+                f"The game exists in the database, but its script could not be found at its configured path in the private `game-scripts` bucket: {exc}",
             )
 
         await safe_send_modal(interaction, GameEditModal(game, file_name))
@@ -380,7 +380,7 @@ class Database(commands.Cog):
     @app_commands.describe(
         game_id="The unique game ID to add to the Games database.",
         name="The display name of the game.",
-        script_path="The private Storage object path for the game's script; this also determines the uploaded file name/path.",
+        script_path="The object path for the game's script in the private game-scripts bucket.",
         file="The game script file to upload; it will be stored using Script Path as its name/path.",
     )
     async def games_add(
@@ -423,7 +423,7 @@ class Database(commands.Cog):
             return await send_error(interaction, "The uploaded script file is empty.")
 
         try:
-            await upload_game_script(script_path, data)
+            await upload_game_script(script_path, data, source_filename=file.filename)
         except SupabaseStorageError as exc:
             return await send_error(interaction, f"Failed to upload the game script: {exc}")
 
@@ -551,7 +551,7 @@ class Database(commands.Cog):
         if not game:
             return await send_error(interaction, f"No game with ID `{game_id}` was found in the Games database.")
 
-        script_path = str(game.get("script_path") or "").strip()
+        script_path = str(game.get("script_path") or "").strip().lstrip("/")
         if not script_path:
             return await send_error(interaction, f"Game `{game_id}` does not have a configured script path.")
 
@@ -565,7 +565,7 @@ class Database(commands.Cog):
             return await send_error(interaction, content_error)
 
         try:
-            await upload_game_script(script_path, data)
+            await upload_game_script(script_path, data, source_filename=file.filename)
         except SupabaseStorageError as exc:
             return await send_error(interaction, f"Failed to update the game script: {exc}")
 

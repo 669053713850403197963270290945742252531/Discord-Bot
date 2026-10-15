@@ -170,6 +170,8 @@ local REASONS = {
     execution_token_expired = "The execution authorization expired.",
     execution_token_mismatch = "The execution authorization did not match this session.",
     session_expired = "Your license session expired. Please execute the loader again.",
+    license_disabled = "Your Celestial license is disabled. Please contact Celestial support if this is unexpected.",
+    license_not_found = "Your license record could not be found. Please contact Celestial support if this is unexpected.",
 }
 
 local function reason_text(reason)
@@ -1775,7 +1777,7 @@ local function start_session_heartbeat(sessionId, sessionHwid)
             end
 
             local reason = tostring(heartbeatResponse.reason or "")
-            if reason == "license_disabled" or reason == "key_sharing_detected" or reason == "session_revoked" or reason == "session_expired" then
+            if reason == "license_disabled" or reason == "license_not_found" or reason == "key_sharing_detected" or reason == "session_revoked" or reason == "session_expired" then
                 sessionHeartbeatActive = false
                 reject(reason)
                 break

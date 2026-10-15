@@ -1178,11 +1178,25 @@ def handle_heartbeat_request(raw: bytes, remote: str) -> Tuple[int, str, Dict[st
     if not identifier:
         return 503, json.dumps({"ok": False, "reason": "backend_unavailable"}), {"Content-Type": "application/json"}
     try:
-        entry = _run(get_license_by_key(str(payload.get("key") or "").strip())) if payload.get("key") else _run(get_license_by_identifier(identifier))
-    except Exception:
-        entry = None
-    if not entry or not entry.get("Enabled", True):
-        return 403, json.dumps({"ok": False, "reason": "license_disabled"}), {"Content-Type": "application/json"}
+        entry = _run(get_license_by_identifier(identifier))
+    except Exception as exc:
+        # Do not convert a transient Supabase/backend failure into a permanent
+        # license-disabled signal. The client ignores backend_unavailable and
+        # retries its next heartbeat instead of kicking a valid user.
+        print(f"[License] Heartbeat license lookup failed for identifier {identifier!r}: {type(exc).__name__}: {exc}")
+        return 503, json.dumps({"ok": False, "reason": "backend_unavailable"}), {
+            "Content-Type": "application/json", "Cache-Control": "no-store", "Retry-After": "5"
+        }
+    if entry is None:
+        # A missing row is not proof of an administrative disable. Use a
+        # separate permanent reason so it is diagnosable and never mislabeled.
+        return 403, json.dumps({"ok": False, "reason": "license_not_found"}), {
+            "Content-Type": "application/json", "Cache-Control": "no-store"
+        }
+    if entry.get("Enabled") is False:
+        return 403, json.dumps({"ok": False, "reason": "license_disabled"}), {
+            "Content-Type": "application/json", "Cache-Control": "no-store"
+        }
 
     return 200, json.dumps({"ok": True, "reason": "ok", "last_seen": (session.get("session") or {}).get("last_seen")}), {"Content-Type": "application/json", "Cache-Control": "no-store"}
 

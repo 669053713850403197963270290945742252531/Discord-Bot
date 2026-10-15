@@ -24,25 +24,60 @@ from api.discord_helpers import (
 from obfuscator import obfuscate
 from obfuscator.config import DEFAULT_CONFIG
 from obfuscator.parser import ParserDependencyError, LuauSyntaxError
+from api.protected_artifacts import (
+    ProtectedArtifactError,
+    create_protected_artifact,
+    render_loader,
+    validate_public_endpoint,
+)
 
 GUILD = discord.Object(id=config.GUILD_ID)
 MAX_SOURCE_ATTACHMENT_SIZE = DEFAULT_CONFIG.max_input_bytes
 _USED_OUTPUT_NAMES: set[str] = set()
 
 
-def _random_output_name() -> str:
-    """Return a unique randomized filename for a protected Luau artifact."""
+def _random_output_name(extension: str = ".luau") -> str:
+    """Return a unique randomized filename while preserving the input extension."""
+    extension = str(extension or ".luau").lower()
+    if extension not in {".lua", ".luau", ".txt"}:
+        extension = ".luau"
     for _ in range(32):
-        candidate = f"Celestial_{secrets.token_hex(8)}.luau"
+        candidate = f"Celestial_{secrets.token_hex(8)}{extension}"
         if candidate not in _USED_OUTPUT_NAMES:
             _USED_OUTPUT_NAMES.add(candidate)
             return candidate
 
     # A collision after 32 cryptographically-random attempts is extraordinarily
     # unlikely, but keep the function total rather than failing the command.
-    candidate = f"Celestial_{secrets.token_hex(16)}.luau"
+    candidate = f"Celestial_{secrets.token_hex(16)}{extension}"
     _USED_OUTPUT_NAMES.add(candidate)
     return candidate
+
+
+def _loader_obfuscation_config():
+    """Build a source-transform-only profile for the generated bootstrap.
+
+    The loader must execute directly in the target Luau environment, so it is
+    intentionally not virtualized. Local renaming, encrypted string literals,
+    integer-expression rewriting, and comment stripping obscure the endpoint,
+    per-build ID, bearer token, and loader structure without adding a second VM.
+    """
+    values = {
+        field: getattr(DEFAULT_CONFIG, field)
+        for field in DEFAULT_CONFIG.__dataclass_fields__
+    }
+    values.update(
+        semantic_safe=False,
+        rename_locals=True,
+        encrypt_strings=True,
+        obfuscate_integer_constants=True,
+        scramble_control_flow=False,
+        strip_comments=True,
+        virtualize=False,
+        vm_compression=False,
+        noise_blocks=0,
+    )
+    return DEFAULT_CONFIG.__class__(**values)
 
 
 def _safe_stem(filename: str) -> str:
@@ -90,7 +125,8 @@ async def _run_obfuscation(
             "Falling back safely": "3 / 5",
             "Evaluating VM compression": "4 / 5",
             "Finalizing protected payload": "4 / 5",
-            "Uploading protected file": "5 / 5",
+            "Obfuscating the bootstrap loader": "5 / 5",
+            "Attaching protected loader": "5 / 5",
         }
         return stage_steps.get(stage, "3 / 5")
 
@@ -105,7 +141,7 @@ async def _run_obfuscation(
             title="🛡️ Obfuscating...",
             description=(
                 f"`{original_name}` is being processed by the **Celestial Luau Obfuscator**.\n\n"
-                "This message will update in place as each major stage completes."
+                "This message will update in place as each major stage completes. The delivered file uses server-backed protection and needs network access at runtime."
             ),
             color=discord.Color.blurple(),
             fields=fields,
@@ -181,10 +217,74 @@ async def _run_obfuscation(
         step="4 / 5",
     )
 
-    filename = _random_output_name()
-    output_bytes = bytes(result.source)
-    if not output_bytes:
+    extension = os.path.splitext(os.path.basename(original_filename.replace("\\", "/")))[1].lower()
+    filename = _random_output_name(extension)
+    payload_bytes = bytes(result.source)
+    if not payload_bytes:
         return await edit_or_send_error(interaction, "Obfuscation produced an empty output file.")
+
+    # A server-backed loader is intentionally attached instead of embedding the
+    # encrypted program. The actual VM artifact is encrypted under an HKDF-derived
+    # per-build key and stored in a private bucket; no game/license check is used.
+    try:
+        endpoint_base = validate_public_endpoint(config.LICENSE_SERVER_BASE_URL)
+        await update_progress(
+            "Encrypting & storing build",
+            "Encrypting this universal build with a server-derived per-build key and storing it in private Supabase Storage.",
+            step="4 / 5",
+        )
+        artifact = await asyncio.to_thread(create_protected_artifact, payload_bytes)
+        loader_source = render_loader(endpoint_base, artifact["build_id"], artifact["token"])
+        await update_progress(
+            "Obfuscating the bootstrap loader",
+            "Renaming loader locals, encrypting embedded strings, and rewriting numeric constants before attachment.",
+            step="5 / 5",
+        )
+        loader_result = await asyncio.to_thread(
+            obfuscate,
+            loader_source,
+            config=_loader_obfuscation_config(),
+        )
+        output_bytes = bytes(loader_result.source)
+        if not output_bytes:
+            raise ValueError("Loader obfuscation produced an empty file.")
+
+        # These metadata values must be recoverable at runtime, but should not
+        # remain readable as source literals in the Discord attachment.
+        expected_hidden_values = (
+            artifact["build_id"].encode("utf-8"),
+            artifact["token"].encode("utf-8"),
+            (endpoint_base.rstrip("/") + "/obfuscator/artifact").encode("utf-8"),
+        )
+        if any(value and value in output_bytes for value in expected_hidden_values):
+            raise ValueError("Loader obfuscation left sensitive bootstrap metadata readable.")
+    except ProtectedArtifactError as exc:
+        print(f"/obfuscate artifact protection setup failed for {original_filename!r}: {exc.reason}")
+        if exc.reason == "public_https_artifact_endpoint_required":
+            return await edit_or_send_error(
+                interaction,
+                "Server-protected downloads require `LICENSE_SERVER_BASE_URL` to be set to the public HTTPS URL of this bot (for example, your Render service URL).",
+            )
+        if exc.reason == "artifact_protection_not_configured":
+            return await edit_or_send_error(
+                interaction,
+                "Server-side artifact protection is not configured. Set `CELESTIAL_ARTIFACT_MASTER_KEY` to a high-entropy secret and restart the service.",
+            )
+        if exc.reason == "artifact_storage_not_configured":
+            return await edit_or_send_error(
+                interaction,
+                "Protected artifact storage is not configured. Create the private Supabase Storage bucket named by `SUPABASE_PROTECTED_ARTIFACTS_BUCKET` and verify the server's Supabase credentials.",
+            )
+        return await edit_or_send_error(
+            interaction,
+            "The protected artifact could not be encrypted or saved. Check the bot logs and Supabase Storage configuration.",
+        )
+    except Exception as exc:
+        print(f"/obfuscate artifact protection/loader generation failed for {original_filename!r}: {exc!r}")
+        return await edit_or_send_error(
+            interaction,
+            "The protected build or its obfuscated loader could not be finalized. Check the bot logs for details and retry the build.",
+        )
 
     # Use a real temporary file rather than a shared BytesIO in the interaction
     # response. discord.File objects are single-use, and a retry path can
@@ -192,7 +292,7 @@ async def _run_obfuscation(
     # receive a 0-byte attachment.
     temp_path: str | None = None
     try:
-        fd, temp_path = tempfile.mkstemp(prefix="celestial-obf-", suffix=".luau")
+        fd, temp_path = tempfile.mkstemp(prefix="celestial-obf-", suffix=extension)
         with os.fdopen(fd, "wb") as temp_file:
             temp_file.write(output_bytes)
             temp_file.flush()
@@ -221,8 +321,8 @@ async def _run_obfuscation(
         )
 
     await update_progress(
-        "Uploading protected file",
-        f"`{filename}` is staged ({len(output_bytes):,} bytes) and is being added to this message.",
+        "Attaching protected loader",
+        f"`{filename}` is obfuscated and staged ({len(output_bytes):,} bytes); it is being added to this message.",
         step="5 / 5",
     )
 
@@ -261,18 +361,18 @@ async def _run_obfuscation(
         if baseline_bytes > 0:
             final_delta = (abs(saved_bytes) / baseline_bytes) * 100
             if saved_bytes > 0:
-                final_text = f"Final protected file: {baseline_bytes:,} B → {result.stats.output_bytes:,} B ({final_delta:.1f}% smaller)."
+                final_text = f"Stored obfuscated payload: {baseline_bytes:,} B → {result.stats.output_bytes:,} B ({final_delta:.1f}% smaller)."
             elif saved_bytes < 0:
-                final_text = f"Final protected file: {baseline_bytes:,} B → {result.stats.output_bytes:,} B ({final_delta:.1f}% larger)."
+                final_text = f"Stored obfuscated payload: {baseline_bytes:,} B → {result.stats.output_bytes:,} B ({final_delta:.1f}% larger)."
             else:
-                final_text = f"Final protected file: {result.stats.output_bytes:,} B (no size change)."
+                final_text = f"Stored obfuscated payload: {result.stats.output_bytes:,} B (no size change)."
         else:
-            final_text = f"Final protected file: {result.stats.output_bytes:,} B."
+            final_text = f"Stored obfuscated payload: {result.stats.output_bytes:,} B."
         context = f"This was a {size_class} source ({source_size:,} B) with {complexity_class} structural complexity ({complexity}/100)."
         if saved_bytes > 0:
-            benefit_text = "Compression benefited this build because the complete protected artifact is smaller than the identical uncompressed build."
+            benefit_text = "Compression benefited this build because the stored obfuscated payload is smaller than the identical uncompressed build."
         elif saved_bytes == 0:
-            benefit_text = "Compression did not change the complete protected artifact size for this build."
+            benefit_text = "Compression did not change the stored obfuscated payload size for this build."
         else:
             benefit_text = "Compression did not benefit this build because its runtime/metadata overhead outweighed the payload savings."
         compression_summary = (
@@ -317,7 +417,16 @@ async def _run_obfuscation(
         fields=[
             ("📄 Source File", f"`{original_name}`", True),
             ("📦 Protected File", f"`{filename}`", True),
-            ("📏 Size", f"{result.stats.input_bytes:,} B → {result.stats.output_bytes:,} B", True),
+            ("📏 Source → Protected Payload", f"{result.stats.input_bytes:,} B → {result.stats.output_bytes:,} B", True),
+            ("📎 Attached Loader", f"{len(output_bytes):,} B • obfuscated • requires HTTPS to the Celestial artifact server", True),
+            (
+                "🛡️ Loader Obfuscation",
+                f"{loader_result.stats.renamed_locals:,} locals renamed • "
+                f"{loader_result.stats.encrypted_strings:,} strings encrypted • "
+                f"{loader_result.stats.obfuscated_constants:,} constants rewritten",
+                False,
+            ),
+            ("🔐 Server-Side Protection", "AES-256-GCM encrypted storage • HKDF-derived per-build key • token-gated retrieval • no game/license binding", False),
             ("🧠 Source Complexity", f"{result.stats.source_complexity}/100", True),
             ("⚙️ VM Backend", backend_name, True),
             ("🗜️ VM Compression", compression_summary, False),
@@ -328,16 +437,22 @@ async def _run_obfuscation(
             ("⚙️ VM Instructions", f"{result.stats.vm_instructions:,}", True),
             ("🧩 Runtime Layers", f"{result.stats.runtime_layers:,}", True),
             ("🧾 Bytecode Details", backend_details, False),
-            ("🧬 Decoder Variants", f"{result.stats.decoder_variants:,}", True),
-            ("🕸️ Opaque Edges", f"{result.stats.opaque_edges:,}", True),
-            ("🌐 Control-Flow Decoys", f"{result.stats.control_flow_decoys:,}", True),
-            ("📚 Payload Blocks", f"{result.stats.payload_blocks:,}", True),
-            ("⚡ VM Micro-Ops", f"{result.stats.micro_ops:,}", True),
-            ("🧱 Dead-Code Blocks", f"{result.stats.dead_code_blocks:,}", True),
-            ("🛡️ Anti-Tamper Checks", f"{result.stats.anti_tamper_checks:,}", True),
-            ("🧬 Payload Layers", f"{result.stats.payload_layers:,}", True),
-            ("🔐 String Pool Entries", f"{result.stats.string_pool_parts:,}", True),
-            ("🧪 String Decoders", f"{result.stats.string_decoder_variants:,}", True),
+            (
+                "🧰 Runtime Protection Metrics",
+                (
+                    f"Decoder variants: {result.stats.decoder_variants:,} • "
+                    f"Opaque edges: {result.stats.opaque_edges:,}\n"
+                    f"Control-flow decoys: {result.stats.control_flow_decoys:,} • "
+                    f"Payload blocks: {result.stats.payload_blocks:,}\n"
+                    f"VM micro-ops: {result.stats.micro_ops:,} • "
+                    f"Dead-code blocks: {result.stats.dead_code_blocks:,}\n"
+                    f"Anti-tamper checks: {result.stats.anti_tamper_checks:,} • "
+                    f"Payload layers: {result.stats.payload_layers:,}\n"
+                    f"String pool entries: {result.stats.string_pool_parts:,} • "
+                    f"String decoders: {result.stats.string_decoder_variants:,}"
+                ),
+                False,
+            ),
             (
                 "ℹ️ Option Details",
                 (
@@ -428,8 +543,8 @@ class Obfuscate(commands.Cog):
         vm_compression: bool = False,
     ):
         filename_lower = file.filename.lower()
-        if not filename_lower.endswith((".lua", ".luau")):
-            return await send_error(interaction, "Upload a `.lua` or `.luau` source file.")
+        if not filename_lower.endswith((".lua", ".luau", ".txt")):
+            return await send_error(interaction, "Upload a `.lua`, `.luau`, or `.txt` file containing valid Luau source.")
 
         if file.size > MAX_SOURCE_ATTACHMENT_SIZE:
             return await send_error(
@@ -475,7 +590,7 @@ class Obfuscate(commands.Cog):
         try:
             source = raw.decode("utf-8-sig")
         except UnicodeDecodeError:
-            return await edit_or_send_error(interaction, "The uploaded file is not valid UTF-8 Luau source.")
+            return await edit_or_send_error(interaction, "The uploaded file is not valid UTF-8 source text.")
 
         options = ObfuscationOptions(
             vm_compression=bool(vm_compression),

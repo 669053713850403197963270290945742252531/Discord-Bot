@@ -37,11 +37,19 @@ DISCORD_TOKEN = _require("DISCORD_TOKEN")
 # shouldn't boot into a state where its own default provider is unusable.
 EZ_HOST_API_KEY = _require("EZ_HOST_API_KEY")
 
-# Supabase private storage used for protected game scripts. The secret/service
-# key is server-only and must never be exposed to the Roblox client.
+# Supabase private storage for game scripts. The secret/service key is
+# server-only and must never be exposed to the Roblox client.
 SUPABASE_URL = _require("SUPABASE_URL")
 SUPABASE_SECRET_KEY = _require("SUPABASE_SECRET_KEY")
 SUPABASE_GAME_SCRIPTS_BUCKET = os.getenv("SUPABASE_GAME_SCRIPTS_BUCKET", "game-scripts")
+# Private Storage dedicated to encrypted, universal /obfuscate builds.
+SUPABASE_PROTECTED_ARTIFACTS_BUCKET = os.getenv(
+    "SUPABASE_PROTECTED_ARTIFACTS_BUCKET", "protected-artifacts"
+).strip()
+# High-entropy, server-only root secret used to derive per-build AES-256 keys.
+# Kept optional at bot startup so deployments can configure it without breaking
+# unrelated commands; /obfuscate reports a setup error until it is configured.
+CELESTIAL_ARTIFACT_MASTER_KEY = os.getenv("CELESTIAL_ARTIFACT_MASTER_KEY", "").strip()
 
 # Multi-provider expansion (see api/providers/registry.py) -- every key below
 # is optional, unlike EZ_HOST_API_KEY above. Each backs one non-default

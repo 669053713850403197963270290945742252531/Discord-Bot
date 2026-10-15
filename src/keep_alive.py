@@ -5,11 +5,15 @@
 - `/editwhitelist` -- authorized live JSON editor for the Supabase whitelist.
 - `/whitelist/*` -- public license challenge, check, heartbeat, breach, and
   completion endpoints.
+- `/obfuscator/artifact` -- token-gated delivery for universal per-build artifacts.
 
-There is intentionally no client-shared secret. A public Roblox script cannot
-keep a secret from the user executing it. HTTPS, one-use challenges, rate
-limits, server-side Supabase access, game restrictions, and payload withholding
-are the security boundaries.
+There is intentionally no universal client-shared master secret. The universal
+artifact loader contains only a per-build bearer token; the storage root key and
+per-build encryption key remain server-side. Any public Roblox script can be
+inspected by the user executing it, so HTTPS, token-gated retrieval, rate limits,
+server-side Supabase access, license/game checks where applicable, and withholding
+the obfuscated payload from offline artifacts are barriers, not guarantees against
+runtime capture.
 """
 
 import base64
@@ -32,25 +36,15 @@ from api import config
 app = Flask('')
 
 # OAuth and authenticated editor sessions are intentionally held server-side.
-# The originating Discord interaction is already stored in memory, so this
-# feature follows the same single-process deployment model. Restarting the
+# The project already stores the originating Discord interaction in memory, so
+# this feature follows the same single-process deployment model. Restarting the
 # bot invalidates these short-lived sessions safely.
 _OAUTH_PENDING = {}
 _AUTHENTICATED_EDITOR_SESSIONS = {}
 _OAUTH_LOCK = threading.RLock()
 _OAUTH_STATE_TTL_SECONDS = 10 * 60
-_EDITOR_AUTH_SESSION_TTL_SECONDS = 30 * 60
-_AUTHORIZATION_RECHECK_INTERVAL_SECONDS = 60
 _EDITOR_AUTH_COOKIE = 'celestial_whitelist_auth'
 _OAUTH_STATE_COOKIE = 'celestial_whitelist_oauth_state'
-
-
-class _DiscordOAuthRequestError(RuntimeError):
-    """Discord API failure with an optional HTTP status for authorization decisions."""
-
-    def __init__(self, message, status_code=None):
-        super().__init__(message)
-        self.status_code = status_code
 
 
 def _oauth_configuration():
@@ -139,10 +133,8 @@ def _discord_oauth_request(url, *, method='GET', headers=None, form=None):
     try:
         with urlopen(req, timeout=12) as response:
             payload = response.read(1024 * 1024)
-    except HTTPError as exc:
-        raise _DiscordOAuthRequestError('Discord OAuth request failed.', exc.code) from exc
-    except (URLError, TimeoutError, OSError) as exc:
-        raise _DiscordOAuthRequestError('Discord OAuth could not be reached.', None) from exc
+    except (HTTPError, URLError, TimeoutError) as exc:
+        raise RuntimeError('Discord OAuth request failed.') from exc
     try:
         decoded = json.loads(payload.decode('utf-8'))
     except (UnicodeDecodeError, json.JSONDecodeError) as exc:
@@ -204,13 +196,8 @@ def _check_editor_authorization(editor_session, user_id, access_token):
         member_user = member.get('user') if isinstance(member, dict) else None
         if isinstance(member_user, dict) and str(member_user.get('id') or '') != str(user_id):
             return False, 'Guild membership identity did not match.'
-    except _DiscordOAuthRequestError as exc:
-        # Missing membership and rejected/invalid credentials are definite
-        # denials. Rate limits, server errors, and network outages are transient
-        # verification failures and must not disguise as an expired session.
-        if exc.status_code in (401, 403, 404):
-            return False, 'The Discord account is not currently authorized for the Celestial server.'
-        raise
+    except Exception:
+        return False, 'The Discord account is not a current member of the Celestial server.'
     from api.whitelist_editor import run_on_editor_bot_loop
     return run_on_editor_bot_loop(
         editor_session,
@@ -234,73 +221,23 @@ def _get_authenticated_editor_session(*, recheck=True):
         editor_token = auth.get('editor_token', '')
         user_id = str(auth.get('user_id') or '')
         access_token = auth.get('access_token')
-        last_successful_check = float(auth.get('last_authorized_check_at') or auth.get('created_at') or 0)
-        last_check_attempt = float(auth.get('last_authorization_check_attempt_at') or last_successful_check)
-
     from api.whitelist_editor import get_whitelist_editor_session
     editor_session = get_whitelist_editor_session(editor_token)
     if editor_session is None or str(editor_session.get('user_id')) != user_id:
         with _OAUTH_LOCK:
             _AUTHENTICATED_EDITOR_SESSIONS.pop(auth_id, None)
         return None
-
-    # Avoid calling Discord and Supabase multiple times for the callback, page
-    # load, and initial data request that occur seconds apart. Fresh entitlement
-    # checks still happen at least once per minute during an active session.
-    if recheck and now - last_check_attempt >= _AUTHORIZATION_RECHECK_INTERVAL_SECONDS:
-        with _OAUTH_LOCK:
-            current_auth = _AUTHENTICATED_EDITOR_SESSIONS.get(auth_id)
-            if current_auth is None:
-                return None
-            # Another concurrent request may already have refreshed the check.
-            last_check_attempt = float(current_auth.get('last_authorization_check_attempt_at') or 0)
-            should_check = now - last_check_attempt >= _AUTHORIZATION_RECHECK_INTERVAL_SECONDS
-            if should_check:
-                current_auth['last_authorization_check_attempt_at'] = now
-        if should_check:
-            try:
-                allowed, reason = _check_editor_authorization(editor_session, user_id, access_token)
-            except Exception as exc:
-                # A temporary Discord/Supabase/network outage is not proof that
-                # a user's authorization was revoked. Preserve the last verified
-                # session until its hard expiry; retry after the interval and log.
-                print(f'[Whitelist Editor OAuth] Recheck temporarily unavailable for {user_id}: {exc}')
-            else:
-                if not allowed:
-                    print(f'[Whitelist Editor OAuth] Authorization revoked for {user_id}: {reason}')
-                    with _OAUTH_LOCK:
-                        _AUTHENTICATED_EDITOR_SESSIONS.pop(auth_id, None)
-                    return None
-                with _OAUTH_LOCK:
-                    current_auth = _AUTHENTICATED_EDITOR_SESSIONS.get(auth_id)
-                    if current_auth is None:
-                        return None
-                    current_auth['last_authorized_check_at'] = time.time()
-                    current_auth['last_authorization_check_attempt_at'] = time.time()
+    if recheck:
+        try:
+            allowed, _reason = _check_editor_authorization(editor_session, user_id, access_token)
+        except Exception as exc:
+            print(f'[Whitelist Editor OAuth] Live authorization check failed: {exc}')
+            return None
+        if not allowed:
+            with _OAUTH_LOCK:
+                _AUTHENTICATED_EDITOR_SESSIONS.pop(auth_id, None)
+            return None
     return editor_session
-
-
-def _close_editor_launch_for_token(token, reason):
-    """Best-effort terminal Discord-message update from a Flask request thread."""
-    if not isinstance(token, str) or not token:
-        return False
-    try:
-        from api.whitelist_editor import (
-            close_whitelist_editor_launch,
-            get_whitelist_editor_session,
-            run_on_editor_bot_loop,
-        )
-        editor_session = get_whitelist_editor_session(token)
-        if editor_session is None:
-            return False
-        return run_on_editor_bot_loop(
-            editor_session,
-            close_whitelist_editor_launch(editor_session, reason),
-            timeout=12,
-        )
-    except Exception as exc:
-        print(f'[Whitelist Editor] Could not close launch message ({reason}): {exc}')
-        return False
 
 
 def _authorization_denied_page():
@@ -387,17 +324,9 @@ def whitelist_editor_oauth_start():
     body = request.get_json(silent=True)
     token = body.get('launch_token') if isinstance(body, dict) else None
     from api.whitelist_editor import get_whitelist_editor_session
-    editor_session = get_whitelist_editor_session(token, require_launch_valid=True)
+    editor_session = get_whitelist_editor_session(token)
     if editor_session is None:
-        existing_session = get_whitelist_editor_session(token)
-        reason = "invalidated"
-        if existing_session is not None:
-            if existing_session.get("oauth_completed"):
-                reason = "used"
-            elif existing_session.get("launch_expires_at", 0) <= time.time():
-                reason = "expired"
-        _close_editor_launch_for_token(token, reason)
-        return _editor_api_json({"ok": False, "error": "The temporary editor launch link is expired, already used, or invalid. Run `/whitelist edit` again in Discord."}, 401)
+        return _editor_api_json({"ok": False, "error": "The temporary editor launch link is expired or invalid. Run `/whitelist edit` again in Discord."}, 401)
 
     now = time.time()
     state = secrets.token_urlsafe(32)
@@ -441,16 +370,7 @@ def whitelist_editor_oauth_callback():
     oauth = _oauth_configuration()
     state = request.args.get('state', '')
     state_cookie = request.cookies.get(_OAUTH_STATE_COOKIE, '')
-    state_valid = bool(state and state_cookie and hmac.compare_digest(state, state_cookie))
-    if not state_valid:
-        response = _authorization_denied_page()
-        response.set_cookie(_OAUTH_STATE_COOKIE, '', max_age=0, httponly=True, secure=_cookie_secure(), samesite='Lax', path='/editwhitelist/oauth')
-        return response
-    if request.args.get('error'):
-        with _OAUTH_LOCK:
-            cancelled = _OAUTH_PENDING.pop(state, None)
-        if cancelled:
-            _close_editor_launch_for_token(cancelled.get('editor_token'), "denied")
+    if request.args.get('error') or not state or not state_cookie or not hmac.compare_digest(state, state_cookie):
         response = _authorization_denied_page()
         response.set_cookie(_OAUTH_STATE_COOKIE, '', max_age=0, httponly=True, secure=_cookie_secure(), samesite='Lax', path='/editwhitelist/oauth')
         return response
@@ -484,9 +404,8 @@ def whitelist_editor_oauth_callback():
         discord_user_id = str(discord_user.get('id') or '')
         if not discord_user_id.isdigit() or discord_user_id != str(pending['user_id']):
             raise RuntimeError('The authenticated Discord account does not match the account that opened the editor.')
-        # The current membership and license are checked here; ongoing sessions
-        # periodically recheck rather than hitting Discord and Supabase on every
-        # page/API request.
+        # The same live membership check is repeated on every protected page/API
+        # request using this short-lived server-side OAuth token.
         allowed, _reason = _check_editor_authorization(editor_session, discord_user_id, access_token)
         if not allowed:
             raise RuntimeError('Discord account failed the server membership/license/rank checks.')
@@ -495,7 +414,7 @@ def whitelist_editor_oauth_callback():
         if isinstance(token_lifetime, bool) or not isinstance(token_lifetime, (int, float)) or token_lifetime <= 30:
             raise RuntimeError('Discord returned an invalid or too-short access-token lifetime.')
         auth_id = secrets.token_urlsafe(32)
-        session_lifetime = min(_EDITOR_AUTH_SESSION_TTL_SECONDS, int(token_lifetime) - 30)
+        session_lifetime = min(13 * 60, int(token_lifetime) - 30)
         expires_at = min(float(editor_session.get('expires_at') or 0), time.time() + session_lifetime)
         if expires_at <= time.time():
             raise RuntimeError('The temporary editor link expired during sign-in.')
@@ -506,13 +425,8 @@ def whitelist_editor_oauth_callback():
                 'user_id': discord_user_id,
                 'access_token': access_token,  # server-side only; never written to a cookie or sent to JavaScript
                 'created_at': time.time(),
-                'last_authorized_check_at': time.time(),
-                'last_authorization_check_attempt_at': time.time(),
                 'expires_at': expires_at,
             }
-        # The one-time launch URL has now been consumed successfully. Make the
-        # original bot response terminal before later save callbacks can update it.
-        _close_editor_launch_for_token(pending['editor_token'], "used")
         response = redirect('/editwhitelist', code=303)
         response.headers['Cache-Control'] = 'no-store, no-cache, must-revalidate, max-age=0'
         response.headers['Pragma'] = 'no-cache'
@@ -525,7 +439,6 @@ def whitelist_editor_oauth_callback():
         return response
     except Exception as exc:
         print(f'[Whitelist Editor OAuth] Authorization rejected: {exc}')
-        _close_editor_launch_for_token(pending.get('editor_token'), "denied")
         response = _authorization_denied_page()
         response.set_cookie(_OAUTH_STATE_COOKIE, '', max_age=0, httponly=True, secure=_cookie_secure(), samesite='Lax', path='/editwhitelist/oauth')
         return response
@@ -903,6 +816,56 @@ pre {{ margin: 24px; white-space: pre-wrap; }}
             "X-Content-Type-Options": "nosniff",
         },
     )
+
+
+@app.route('/obfuscator/artifact', methods=['POST'])
+def protected_artifact_fetch():
+    from api.protected_artifacts import ProtectedArtifactError, fetch_protected_artifact
+
+    if request.content_length is not None and request.content_length > 4096:
+        return Response(
+            json.dumps({"ok": False, "reason": "request_too_large"}),
+            status=413,
+            mimetype='application/json',
+            headers={'Cache-Control': 'no-store', 'X-Content-Type-Options': 'nosniff'},
+        )
+    raw_request = request.get_data(cache=False)
+    if len(raw_request) > 4096:
+        return Response(
+            json.dumps({"ok": False, "reason": "request_too_large"}),
+            status=413,
+            mimetype='application/json',
+            headers={'Cache-Control': 'no-store', 'X-Content-Type-Options': 'nosniff'},
+        )
+    try:
+        payload = json.loads(raw_request.decode('utf-8'))
+        source = fetch_protected_artifact(payload, request.remote_addr or 'unknown')
+        return Response(
+            source,
+            status=200,
+            mimetype='text/plain',
+            headers={
+                'Cache-Control': 'no-store, no-cache, must-revalidate, max-age=0',
+                'Pragma': 'no-cache',
+                'X-Content-Type-Options': 'nosniff',
+                'Referrer-Policy': 'no-referrer',
+            },
+        )
+    except ProtectedArtifactError as exc:
+        return Response(
+            json.dumps({"ok": False, "reason": exc.reason}),
+            status=exc.status,
+            mimetype='application/json',
+            headers={'Cache-Control': 'no-store', 'X-Content-Type-Options': 'nosniff'},
+        )
+    except Exception as exc:
+        print(f"[ProtectedArtifact] Unexpected fetch failure: {type(exc).__name__}: {exc}")
+        return Response(
+            json.dumps({"ok": False, "reason": "artifact_service_unavailable"}),
+            status=503,
+            mimetype='application/json',
+            headers={'Cache-Control': 'no-store', 'X-Content-Type-Options': 'nosniff'},
+        )
 
 
 @app.route('/whitelist/challenge', methods=['POST'])

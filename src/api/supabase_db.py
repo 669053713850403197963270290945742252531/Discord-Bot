@@ -21,6 +21,8 @@ _TRANSIENT_SUPABASE_CODES = {"408", "425", "429", "500", "502", "503", "504"}
 _TRANSIENT_SUPABASE_RETRIES = 3
 
 
+
+
 def _is_transient_supabase_error(exc: BaseException) -> bool:
     """Return True for temporary Supabase/PostgREST gateway failures."""
     code = str(getattr(exc, "code", "") or "")
@@ -107,7 +109,10 @@ def _record_from_db(row: Dict[str, Any], game_ids: Optional[List[str]] = None) -
         "Rank": row.get("rank") or "User",
         "Notes": row.get("notes"),
         "Games": games or [],
-        "Enabled": bool(row.get("enabled", True)),
+        # Normalize nullable/stringified database booleans consistently with
+        # imports and API records. In particular, SQL NULL must not become
+        # False via bool(None), which would falsely disable a valid license.
+        "Enabled": _parse_bool(row.get("enabled", True), default=True),
         "ExpiresAt": _iso(row.get("expires_at")),
         "CreatedAt": _iso(row.get("created_at")),
         "UpdatedAt": _iso(row.get("updated_at")),
@@ -927,16 +932,17 @@ async def fetch_users_for_export() -> List[Dict[str, Any]]:
 
 
 async def list_games() -> List[Dict[str, Any]]:
-    return await _retry_supabase_read(
+    rows = await _retry_supabase_read(
         lambda: asyncio.to_thread(lambda: (_client_sync().table("games").select("*").order("id").execute()).data or []),
         "list games",
     )
+    return [dict(row) for row in rows]
 
 
 async def get_game(game_id: str) -> Optional[Dict[str, Any]]:
     def _get():
         rows = (_client_sync().table("games").select("*").eq("id", str(game_id)).limit(1).execute()).data or []
-        return rows[0] if rows else None
+        return dict(rows[0]) if rows else None
     return await _retry_supabase_read(lambda: asyncio.to_thread(_get), "get game")
 
 
@@ -986,7 +992,7 @@ def _delete_game_sync(game_id: str) -> Optional[Dict[str, Any]]:
 
     result = client.table("games").delete().eq("id", game_id).execute()
     deleted = result.data or []
-    return deleted[0] if deleted else existing[0]
+    return dict(deleted[0] if deleted else existing[0])
 
 
 async def delete_game(game_id: str) -> Optional[Dict[str, Any]]:
@@ -1053,7 +1059,7 @@ def _update_game_sync(
     rows = result.data or []
     if not rows:
         raise RuntimeError("Supabase did not return the updated game record")
-    return rows[0]
+    return dict(rows[0])
 
 
 async def update_game(

@@ -1,4 +1,4 @@
-"""Supabase Storage access for protected game scripts.
+"""Supabase Storage access for game scripts.
 
 The bucket is private. This module is server-only and uses the Supabase
 secret key configured in the environment. The Roblox client never talks
@@ -21,7 +21,7 @@ from . import config
 
 
 class SupabaseStorageError(RuntimeError):
-    """Raised when a protected game script cannot be retrieved or updated."""
+    """Raised when a game script cannot be retrieved or updated."""
 
 
 @lru_cache(maxsize=1)
@@ -46,7 +46,7 @@ def _download_sync(path: str) -> bytes:
         data = _get_client().storage.from_(config.SUPABASE_GAME_SCRIPTS_BUCKET).download(path)
     except Exception as exc:
         raise SupabaseStorageError(
-            f"Failed to download protected game script from Supabase Storage: {path!r}"
+            f"Failed to download game script from Supabase Storage: {path!r}"
         ) from exc
 
     if not isinstance(data, (bytes, bytearray)) or not data:
@@ -77,7 +77,7 @@ async def fetch_game_script(path: str) -> str:
     try:
         return data.decode("utf-8")
     except UnicodeDecodeError as exc:
-        raise SupabaseStorageError("Protected game script is not valid UTF-8") from exc
+        raise SupabaseStorageError("Game script is not valid UTF-8") from exc
 
 
 def _list_sync(path: str = "") -> list[dict]:
@@ -88,7 +88,7 @@ def _list_sync(path: str = "") -> list[dict]:
         data = _get_client().storage.from_(config.SUPABASE_GAME_SCRIPTS_BUCKET).list(path, options)
     except Exception as exc:
         raise SupabaseStorageError(
-            f"Failed to list protected game scripts in Supabase Storage under {path or '<root>'!r}"
+            f"Failed to list game scripts in Supabase Storage under {path or '<root>'!r}"
         ) from exc
 
     if not isinstance(data, list):
@@ -144,7 +144,36 @@ def _format_http_error(exc: HTTPError) -> str:
         return f"HTTP {exc.code}: {exc.reason}"
 
 
-def _upload_sync(path: str, data: bytes) -> None:
+
+def _resolve_game_script_content_type(path: str, source_filename: str | None = None) -> str:
+    """Choose an allowed MIME type without requiring an extension on the object path."""
+    mime_types = {
+        ".luau": "text/x-luau",
+        ".lua": "text/x-lua",
+        ".txt": "text/plain",
+        ".json": "application/json",
+    }
+    destination_suffix = PurePosixPath(str(path or "")).suffix.lower()
+    if destination_suffix in mime_types:
+        return mime_types[destination_suffix]
+
+    source_suffix = PurePosixPath(str(source_filename or "")).suffix.lower()
+    if source_suffix in mime_types:
+        return mime_types[source_suffix]
+
+    # Existing extensionless game-script objects may be moved by /games edit,
+    # where no attachment filename is available. These objects are source code;
+    # use the bucket's allowed Luau MIME type rather than rejecting the path.
+    if not destination_suffix and not source_suffix:
+        return "text/x-luau"
+
+    unsupported_suffix = source_suffix or destination_suffix
+    raise SupabaseStorageError(
+        f"Unsupported game script file type {unsupported_suffix!r}; "
+        "expected .luau, .lua, .txt, or .json"
+    )
+
+def _upload_sync(path: str, data: bytes, source_filename: str | None = None) -> None:
     """Replace/create a Storage object using Supabase's documented x-upsert path.
 
     The Python Storage client has changed option/exception behavior across
@@ -160,21 +189,9 @@ def _upload_sync(path: str, data: bytes) -> None:
     payload = bytes(data)
 
     # Match the MIME types explicitly allowed by the game-scripts bucket.
-    # In particular, .luau must be uploaded as text/x-luau rather than
-    # application/octet-stream or text/plain.
-    suffix = PurePosixPath(path).suffix.lower()
-    mime_types = {
-        ".luau": "text/x-luau",
-        ".lua": "text/x-lua",
-        ".txt": "text/plain",
-        ".json": "application/json",
-    }
-    content_type = mime_types.get(suffix)
-    if content_type is None:
-        raise SupabaseStorageError(
-            f"Unsupported game script file type {suffix or '<none>'!r}; "
-            "expected .luau, .lua, .txt, or .json"
-        )
+    # The destination object name is independent from its MIME type: when it has
+    # no recognized extension, use the uploaded/original filename instead.
+    content_type = _resolve_game_script_content_type(path, source_filename)
 
     headers = {
         "Authorization": f"Bearer {config.SUPABASE_SECRET_KEY}",
@@ -211,10 +228,12 @@ def _upload_sync(path: str, data: bytes) -> None:
     )
 
 
-async def upload_game_script(path: str, data: bytes) -> None:
-    """Upload/replace an object in the private game-scripts bucket."""
+async def upload_game_script(
+    path: str, data: bytes, *, source_filename: str | None = None
+) -> None:
+    """Upload/replace an object without requiring its Storage path to have an extension."""
     try:
-        await asyncio.to_thread(_upload_sync, path, data)
+        await asyncio.to_thread(_upload_sync, path, data, source_filename)
     except SupabaseStorageError:
         raise
     except Exception as exc:
